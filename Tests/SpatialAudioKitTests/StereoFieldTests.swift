@@ -43,3 +43,31 @@ private func isClose(_ a: Double, _ b: Double, tolerance: Double = 1e-9) -> Bool
   #expect(isClose(collapsed.left.azimuth, 0))
   #expect(isClose(collapsed.right.azimuth, 0))
 }
+
+@Test func theDefaultFieldIsLevel() {
+  // 既定は水平（傾きなし）。勝手に上下へ振らない。
+  #expect(StereoField().elevation == 0)
+  #expect(StereoField().left.elevation == 0)
+}
+
+@Test func raisingTheFieldLiftsBothSpeakers() {
+  // 仰角は音場全体を上下に傾ける。左右そろって同じ高さになる。
+  let raised = StereoField(spread: .pi / 6, elevation: .pi / 6, distance: 1)
+  #expect(isClose(raised.left.elevation, .pi / 6))
+  #expect(isClose(raised.right.elevation, .pi / 6))
+  // 左右の開きは仰角と独立に保たれる。
+  #expect(isClose(raised.left.azimuth, -.pi / 6))
+  #expect(isClose(raised.right.azimuth, .pi / 6))
+}
+
+@Test func elevationBeyondStraightUpIsClampedToOverhead() {
+  // 真上（π/2）を超える入力は真上に丸める。
+  let tooHigh = StereoField(spread: .pi / 6, elevation: .pi, distance: 1)
+  #expect(isClose(tooHigh.elevation, .pi / 2))
+}
+
+@Test func elevationBelowStraightDownIsClamped() {
+  // 真下（-π/2）を下回る入力は真下に丸める。
+  let tooLow = StereoField(spread: .pi / 6, elevation: -.pi, distance: 1)
+  #expect(isClose(tooLow.elevation, -.pi / 2))
+}
