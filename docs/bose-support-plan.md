@@ -187,10 +187,12 @@ Sony は「device 申告からの feature inventory」と「verified profile に
 | **新規** | `BoseCore` | BMAP フレーム encode/decode/連結分割(`TandemFrame` の対置、より単純)+ ERROR 型。機能ビルダ/パーサ(NC/EQ/バッテリ/モード/ボタン/サイドトーン)。機種カタログ。BLE セグメンタ/リアセンブラ。 |
 | **新規** | BLE トランスポート | `CBCentralManager` ベース。`0xFEBE`+secure/unsecure。§3.2 の isolation/backpressure/notify 完了要件を満たし、Tandem の `OpenedChannel`(write/close/inbound AsyncStream/MTU)抽象に載せる。 |
 | **一般化して流用** | RFCOMM トランスポート | サービス探索は任意クロージャではなく **`RFCOMMServiceLocator` 相当の strategy を target 内に閉じ込める**(Swift 6 concurrency 安全性、Codex #4)。BMAP marker で対応判定し、どの SDP record から SPP チャンネルを確定するかまで定義。**前提: `RFCOMMChannelHost` の `.bufferingNewest(256)` によるサイレント chunk drop を先に修正**(unbounded / 明示 overflow failure / byte-count 付き bounded queue へ)。チェックサム無しの BMAP では 1 バイト欠落で framing が恒久崩壊する(Codex #7、v1.0.0 レビュー H-01 と同一の穴)。 |
-| **新規(設計は §5.1)** | `BoseSession` | actor。トランスポート選択(§3.3 の限定降格)・接続手順(init/CONNECT 再送)・§5.1 の operation 種別・set→poll 確認・単一セッション arbiter。 |
-| **新規** | 共通抽象 `DeviceControl` | Sony/Bose を UI から透過的に扱う共通コマンド/snapshot/capability/接続状態の型。**Sony 固有型(`TandemNoiseControlState` 等)を UI が直接触っている現状の結合を、この抽象へ移す作業を伴う(コストは過小評価しない、Codex #2)**。 |
-| **共通 module** | `TransportPreferenceStore` protocol | 有効トランスポートの永続化。executable target の `AppSettingsStore` は BoseSession から参照不可のため protocol を共通 module に置き、Perch 側で UserDefaults adapter を注入(Codex #11)。 |
-| **射影** | UI(NotchKit/Perch) | Bose の機能を `DeviceControl` 経由で描く。capability の有無で出し分け。 |
+| **新規(設計は §5.1)** | `BoseSession` | actor。トランスポート選択(§3.3 の限定降格)・接続手順(init/CONNECT 再送)・§5.1 の operation 種別・set→poll 確認。 |
+| **薄い共有** | `DeviceContract` | 閉じたバー/メニュー用の `DeviceBrand`/`BatteryReading`/`DeviceHeadline` のみ。**フィーチャは共有しない**([bose-device-contract.md](bose-device-contract.md))。 |
+| **Bose 独自** | Bose パネル UI | CNC 連続スライダー・独立 ANC/wind・3-band EQ 等を Bose の形のまま描く。Sony のページ構成に合わせない。 |
+| **Perch(アプリ層)** | 単一セッション監督 | ブランド判定 → 旧 close → 新 start。展開パネルをブランドで切替。Sony 側は無変更。 |
+
+> **方針(分離 UI)**: Sony と Bose は共通 UI を使わず、各々独自のパネルを持つ。共有は「殻・閉じたバー・セッション1本」だけ。当初のリッチな共通抽象(`DeviceControl`/フィーチャ snapshot/command)は、両機器を1型に押し込む複雑さが後で辛くなるため**破棄**した(詳細は bose-device-contract.md の方針転換記録)。
 
 ---
 
@@ -199,12 +201,12 @@ Sony は「device 申告からの feature inventory」と「verified profile に
 横に長いレイヤ順(protocol→rfcomm→ble→session→…)は、最も不確実な BLE identity と共通型が後回しで実機失敗リスクが高い。**共通契約 + 縦切り**へ組み替える。各段階の**完了条件にテストと由来表記(MIT notice)を含める**(後段に送らない)。支流は `feature/bose-support` から切る。
 
 1. **spec-freeze** ✅ 完了 → [bose-frozen-spec.md](bose-frozen-spec.md)。BMAP の矛盾を実コード+実機キャプチャで裁定(CNC バイト順・CONNECT/ACK・ModeConfig offset・モードスロット・バッテリ形状・ANR ワイヤ値・config 軸)。fixture 由来 commit と PII 置換要件、第一段階の実装対象機種(wolverine 0x4082 / qc35 系)を確定。
-2. **device-contract**(`bose/device-abstraction` を前倒し)— 共通 snapshot/capability/command、接続状態、write trust、shared transport target のグラフを確定。**API を先に決める**。
-3. **protocol-core**(`bose/protocol-core`)— フレーム codec / stream parser / ERROR / BLE segmenter。**純粋テストをここで実施**。※ 矛盾した capture から機能 parser/catalog を作り込むのは spec-freeze 完了後。
+2. **device-contract** ✅ 完了 → [bose-device-contract.md](bose-device-contract.md)。**分離 UI 方針**に確定。共有は閉じたバー/メニュー用の薄い `DeviceContract`(`DeviceBrand`/`BatteryReading`/`DeviceHeadline`)だけ。フィーチャは共有せず各ブランド独自 UI。リッチな共通抽象は破棄。
+3. **protocol-core**(`bose/protocol-core`)— `BoseCore`: BMAP フレーム codec / stream parser / ERROR / BLE segmenter。**純粋テストをここで実施**。frozen-spec に沿って機能 parser/builder。
 4. **scripted-session** — mock channel + injected clock で single/multi/set→poll/cancellation を完成。**実機なしで可**。
-5. **RFCOMM 縦切り** — SDP 判定→接続→identity/battery→1機能の SETGET/read-back。**実機必要**(`control-lock.sh` 配下)。
-6. **共通 UI 縦切り** — **Sony の回帰を保ちつつ** battery+NC など1機能を両ブランドで通す。
-7. **機能拡張** — EQ/モード/サイドトーン等を順次。
+5. **RFCOMM 縦切り** — SDP 判定→接続→identity/battery。閉じたバーに `DeviceHeadline` を出す。**実機必要**(`control-lock.sh` 配下)。
+6. **Bose パネル UI + セッション監督** — Bose 専用パネルを作り、Perch で「ブランド判定→対応パネル切替」を配線。**Sony は無変更**。NC など1機能を Bose の形のまま通す。
+7. **機能拡張** — EQ/モード/サイドトーン等を Bose UI に順次。
 8. **BLE** — target correlation 解決後。**RFCOMM 対応機種のリリースを BLE 待ちにしない**。
 9. **release hardening** — 匿名化 validator、公証、README。
 

@@ -23,10 +23,17 @@ let package = Package(
   ],
   products: [
     .library(name: "TandemCore", targets: ["TandemCore"]),
+    .library(name: "DeviceContract", targets: ["DeviceContract"]),
     .executable(name: "Perch", targets: ["Perch"]),
     .executable(name: "perch-probe", targets: ["PerchProbe"]),
   ],
   targets: [
+    // Brand-neutral vocabulary shared by every headset. Pure value types, no
+    // dependencies — the seam Sony and Bose adapters project onto.
+    .target(
+      name: "DeviceContract",
+      exclude: agentNotes("Sources/DeviceContract")
+    ),
     .target(
       name: "TandemCore",
       exclude: agentNotes("Sources/TandemCore")
@@ -65,6 +72,11 @@ let package = Package(
       name: "PerchProbe",
       dependencies: ["TandemCore", "TandemSession"],
       exclude: agentNotes("Sources/PerchProbe")
+    ),
+    .testTarget(
+      name: "DeviceContractTests",
+      dependencies: ["DeviceContract"],
+      exclude: agentNotes("Tests/DeviceContractTests")
     ),
     .testTarget(
       name: "TandemCoreTests",
