@@ -1,5 +1,6 @@
 import AVFoundation
 import CoreAudio
+import Foundation
 
 /// マルチバンド + ミッド/サイドの設定。
 public struct MultibandConfig: Sendable, Equatable {
@@ -69,6 +70,12 @@ public final class MultibandSpatializer: @unchecked Sendable {
   private let wander: PositionWander
   private var elapsedTime: Double = 0
 
+  // 拍リアクティブ: 低音のオンセットで音場をパルス状に動かす。
+  private var beatDetector: BeatDetector?
+  private var beatLevel: Double = 0
+  private let beatAmplitude: Double  // ラジアン。0 なら拍リアクティブ無効。
+  private static let beatDecayTimeConstant = 0.12
+
   // オーディオスレッドから読む可変ゲイン（耳合わせ用。単純なFloatなので競合は軽微）。
   public var lowGain: Float
   public var midGain: Float
@@ -85,6 +92,7 @@ public final class MultibandSpatializer: @unchecked Sendable {
     muteOriginal: Bool = true,
     autoBalance: Bool = false,
     wanderDegrees: Double = 6,
+    beatDegrees: Double = 0,
     sampleRate: Double = 48_000
   ) throws {
     self.muteOriginal = muteOriginal
@@ -94,10 +102,14 @@ public final class MultibandSpatializer: @unchecked Sendable {
     sideWidth = config.sideWidth
     sideSpread = config.sideSpreadDegrees * .pi / 180
     wander = PositionWander(degrees: wanderDegrees)
+    beatAmplitude = max(0, beatDegrees) * .pi / 180
     crossoverLeft = Crossover(cutoff: config.crossover, sampleRate: sampleRate)
     crossoverRight = Crossover(cutoff: config.crossover, sampleRate: sampleRate)
     if autoBalance {
       analyzer = BalanceAnalyzer(baselineLowGain: config.lowGain, baselineWidth: config.sideWidth)
+    }
+    if beatAmplitude > 0 {
+      beatDetector = BeatDetector()
     }
 
     centerBase = SphericalDirection(azimuth: 0, elevation: 0, distance: config.centerDistance)
@@ -141,23 +153,35 @@ public final class MultibandSpatializer: @unchecked Sendable {
     graph.setPosition(SourceIndex.right, rightBase)
   }
 
-  /// 各音源を基準位置＋揺らぎの位置へ更新する。
-  private func applyWander(time: Double) {
+  /// 各音源を「基準位置 ＋ ゆっくりの揺らぎ ＋ 拍のパルス」へ更新する。
+  private func applyMovement(time: Double) {
     reposition(SourceIndex.center, base: centerBase, source: 0, time: time)
     reposition(SourceIndex.left, base: leftBase, source: 1, time: time)
     reposition(SourceIndex.right, base: rightBase, source: 2, time: time)
   }
 
   private func reposition(_ index: Int, base: SphericalDirection, source: Int, time: Double) {
-    let offset = wander.offset(source: source, time: time)
+    let drift = wander.offset(source: source, time: time)
+    let beat = beatOffset(source: source)
     graph.setPosition(
       index,
       SphericalDirection(
-        azimuth: base.azimuth + offset.azimuth,
-        elevation: base.elevation + offset.elevation,
+        azimuth: base.azimuth + drift.azimuth + beat.azimuth,
+        elevation: base.elevation + drift.elevation + beat.elevation,
         distance: base.distance
       )
     )
+  }
+
+  /// 拍のパルスによる位置オフセット。拍で左右が外へ開き、中央は軽く上へ跳ねる。
+  private func beatOffset(source: Int) -> (azimuth: Double, elevation: Double) {
+    guard beatAmplitude > 0, beatLevel > 0 else { return (0, 0) }
+    let push = beatAmplitude * beatLevel
+    switch source {
+    case SourceIndex.left: return (-push, 0)
+    case SourceIndex.right: return (push, 0)
+    default: return (0, push * 0.4)
+    }
   }
 
   public func stop() {
@@ -176,11 +200,13 @@ public final class MultibandSpatializer: @unchecked Sendable {
     if count > 0 {
       let dt = Double(count) / sampleRate
       elapsedTime += dt
+      let lowRMS = (analyzer != nil || beatDetector != nil)
+        ? Self.rmsOfMean(lowLeft, lowRight, count: count) : 0
 
       // 自動バランス: 各帯域のレベルを測り、低音ゲインと幅をゆっくり追従させる。
       if analyzer != nil {
         analyzer!.observe(
-          lowRMS: Self.rmsOfMean(lowLeft, lowRight, count: count),
+          lowRMS: lowRMS,
           midRMS: Self.rmsOfMean(highLeft, highRight, count: count),
           sideRMS: Self.rmsOfDifference(highLeft, highRight, count: count),
           dt: dt
@@ -189,9 +215,16 @@ public final class MultibandSpatializer: @unchecked Sendable {
         sideWidth = analyzer!.sideWidth
       }
 
-      // 音源をゆっくり漂わせる（外在化を強める）。
-      if wander.amplitude > 0 {
-        applyWander(time: elapsedTime)
+      // 拍リアクティブ: 低音のオンセットでパルスを立て、拍ごとに減衰させる。
+      if beatDetector != nil {
+        let strength = beatDetector!.observe(level: lowRMS, dt: dt)
+        beatLevel *= exp(-dt / Self.beatDecayTimeConstant)
+        if strength > beatLevel { beatLevel = strength }
+      }
+
+      // ゆっくりの揺らぎ ＋ 拍のパルスで音源を動かす。
+      if wander.amplitude > 0 || beatLevel > 0.001 {
+        applyMovement(time: elapsedTime)
       }
     }
 

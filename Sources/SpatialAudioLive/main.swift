@@ -9,6 +9,7 @@ import SpatialAudioKit
 //   引数 auto      : multiband に自動バランスを重ねる。直近の音を測り、低音ゲインと
 //                    幅をゆっくり自動追従（曲が変わっても数秒で馴染む）。
 //   引数 wanderNN  : 音源をゆっくり漂わせる振れ幅（度）。既定6。例 wander10。nowander で無効。
+//   引数 beat[NN]  : 拍（低音のオンセット）に反応して音場をパルスさせる。既定5度。例 beat8。
 //   引数 tune     : 対話調整モード。再生しながらキー操作で音場を追い込む。
 //   引数 rotate   : リスナーの向きをゆっくり回す効果デモ。
 //   引数 nomute   : 原音をミュートしない（原音＋空間化版を同時に鳴らして比較）。
@@ -57,8 +58,21 @@ func runLive() -> Never {
     wanderDegrees = value
   }
 
+  // 拍リアクティブの振れ幅（度）。既定0（無効）、beat で5、beatNN で指定。
+  var beatDegrees = 0.0
+  if let token = arguments.first(where: { $0.hasPrefix("beat") }) {
+    if token == "beat" {
+      beatDegrees = 5
+    } else if let value = Double(token.dropFirst("beat".count)), value >= 0, value <= 30 {
+      beatDegrees = value
+    }
+  }
+
   if multiband {
-    runMultiband(muteOriginal: muteOriginal, autoBalance: auto, wanderDegrees: wanderDegrees)
+    runMultiband(
+      muteOriginal: muteOriginal, autoBalance: auto,
+      wanderDegrees: wanderDegrees, beatDegrees: beatDegrees
+    )
   }
 
   let live: LiveSpatializer
@@ -97,11 +111,12 @@ func runLive() -> Never {
 }
 
 @available(macOS 14.4, *)
-func runMultiband(muteOriginal: Bool, autoBalance: Bool, wanderDegrees: Double) -> Never {
+func runMultiband(muteOriginal: Bool, autoBalance: Bool, wanderDegrees: Double, beatDegrees: Double) -> Never {
   let spatializer: MultibandSpatializer
   do {
     spatializer = try MultibandSpatializer(
-      muteOriginal: muteOriginal, autoBalance: autoBalance, wanderDegrees: wanderDegrees
+      muteOriginal: muteOriginal, autoBalance: autoBalance,
+      wanderDegrees: wanderDegrees, beatDegrees: beatDegrees
     )
   } catch {
     fail("マルチバンド初期化に失敗: \(error)")
@@ -120,6 +135,9 @@ func runMultiband(muteOriginal: Bool, autoBalance: Bool, wanderDegrees: Double) 
   }
   if wanderDegrees > 0 {
     print(String(format: "  揺らぎ: ±%.0f° で音源をゆっくり漂わせています。", wanderDegrees))
+  }
+  if beatDegrees > 0 {
+    print(String(format: "  拍リアクティブ: ON（±%.0f°）。低音の拍で音場がパルスします。", beatDegrees))
   }
   if !muteOriginal {
     print("  原音ミュートなし（原音＋空間化版）。")
