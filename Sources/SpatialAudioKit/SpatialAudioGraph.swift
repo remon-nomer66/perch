@@ -10,8 +10,12 @@ public enum SpatialAudioGraphError: Error, Equatable {
 /// 頭の向きは `updateListener(_:)` → `listenerAngularOrientation` で反映する
 /// （フェーズ2のカメラ由来の値も同じ経路に流す）。オーディオ出力を伴うため、
 /// 発音そのものは実機でのみ確認でき、CI/ヘッドレス環境ではグラフ構成のコンパイル
-/// 検証までとなる。単一スレッド（呼び出し側）から使う前提。
-public final class SpatialAudioGraph {
+/// 検証までとなる。
+///
+/// `scheduleBuffer` と 3D ミキシングのプロパティ設定は任意スレッドから呼べる
+/// （AVAudioEngine が保証）ため、ライブ供給（タップのオーディオスレッドから
+/// `schedule`、メインから `updateListener`）を許すべく `@unchecked Sendable` とする。
+public final class SpatialAudioGraph: @unchecked Sendable {
   private let engine = AVAudioEngine()
   private let environment = AVAudioEnvironmentNode()
   private let playerLeft = AVAudioPlayerNode()
@@ -71,6 +75,13 @@ public final class SpatialAudioGraph {
   public func scheduleLooping(left: AVAudioPCMBuffer, right: AVAudioPCMBuffer) {
     playerLeft.scheduleBuffer(left, at: nil, options: .loops, completionHandler: nil)
     playerRight.scheduleBuffer(right, at: nil, options: .loops, completionHandler: nil)
+  }
+
+  /// 左右のモノバッファを1回ぶんスケジュールする（ライブ供給用）。同じ長さの
+  /// L/R を対で渡すことで、両プレイヤーが同じクロックで同期再生される。
+  public func schedule(left: AVAudioPCMBuffer, right: AVAudioPCMBuffer) {
+    playerLeft.scheduleBuffer(left, completionHandler: nil)
+    playerRight.scheduleBuffer(right, completionHandler: nil)
   }
 
   /// モノの Float サンプル列から、このグラフの形式のバッファを作る。

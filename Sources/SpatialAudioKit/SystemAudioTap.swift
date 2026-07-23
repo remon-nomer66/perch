@@ -25,6 +25,8 @@ public final class SystemAudioTap {
   public typealias AudioHandler = @Sendable (UnsafePointer<AudioBufferList>) -> Void
 
   private let handler: AudioHandler
+  private let muteOriginal: Bool
+  private let excludeCurrentProcess: Bool
   private let queue = DispatchQueue(label: "app.perch.spatial.systemtap", qos: .userInteractive)
 
   private var tapID = AudioObjectID(kAudioObjectUnknown)
@@ -35,15 +37,29 @@ public final class SystemAudioTap {
   /// 取得音声のフォーマット（`start()` 成功後に有効）。
   public private(set) var streamFormat = AudioStreamBasicDescription()
 
-  public init(handler: @escaping AudioHandler) {
+  /// - Parameters:
+  ///   - muteOriginal: 原音を出力経路から消すか（空間化版を代わりに流すときは true）。
+  ///   - excludeCurrentProcess: 自プロセスをタップ対象から除く（自分の出力を取り込む
+  ///     フィードバックを防ぐ。空間化して出力するときは true）。
+  public init(
+    muteOriginal: Bool = false,
+    excludeCurrentProcess: Bool = false,
+    handler: @escaping AudioHandler
+  ) {
+    self.muteOriginal = muteOriginal
+    self.excludeCurrentProcess = excludeCurrentProcess
     self.handler = handler
   }
 
   public func start() throws {
-    // 1. タップ記述。システム全体を取得（除外プロセスなし）、原音はミュートしない。
-    let description = CATapDescription(stereoGlobalTapButExcludeProcesses: [])
+    // 1. タップ記述。システム全体を取得（必要なら自プロセスを除外）。
+    var excluded: [AudioObjectID] = []
+    if excludeCurrentProcess, let ownObject = Self.currentProcessObjectID() {
+      excluded = [ownObject]
+    }
+    let description = CATapDescription(stereoGlobalTapButExcludeProcesses: excluded)
     description.isPrivate = true
-    description.muteBehavior = .unmuted
+    description.muteBehavior = muteOriginal ? .muted : .unmuted
 
     var newTap = AudioObjectID(kAudioObjectUnknown)
     let tapStatus = AudioHardwareCreateProcessTap(description, &newTap)
@@ -140,5 +156,29 @@ public final class SystemAudioTap {
 
   deinit {
     cleanUp()
+  }
+
+  /// 自プロセスの pid を Core Audio のプロセスオブジェクトIDへ変換する。
+  /// タップから自分の出力を除外するために使う。
+  private static func currentProcessObjectID() -> AudioObjectID? {
+    var pid = getpid()
+    var address = AudioObjectPropertyAddress(
+      mSelector: kAudioHardwarePropertyTranslatePIDToProcessObject,
+      mScope: kAudioObjectPropertyScopeGlobal,
+      mElement: kAudioObjectPropertyElementMain
+    )
+    var objectID = AudioObjectID(kAudioObjectUnknown)
+    var size = UInt32(MemoryLayout<AudioObjectID>.size)
+    let status = withUnsafeMutablePointer(to: &pid) { pidPointer -> OSStatus in
+      AudioObjectGetPropertyData(
+        AudioObjectID(kAudioObjectSystemObject),
+        &address,
+        UInt32(MemoryLayout<pid_t>.size),
+        pidPointer,
+        &size,
+        &objectID
+      )
+    }
+    return status == noErr && objectID != AudioObjectID(kAudioObjectUnknown) ? objectID : nil
   }
 }

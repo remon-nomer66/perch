@@ -27,6 +27,7 @@ let package = Package(
     .executable(name: "perch-probe", targets: ["PerchProbe"]),
     .executable(name: "spatial-audio-probe", targets: ["SpatialAudioProbe"]),
     .executable(name: "system-audio-probe", targets: ["SystemAudioProbe"]),
+    .executable(name: "spatial-audio-live", targets: ["SpatialAudioLive"]),
   ],
   targets: [
     .target(
@@ -81,6 +82,11 @@ let package = Package(
       name: "SystemAudioProbe",
       dependencies: ["SpatialAudioKit"],
       exclude: agentNotes("Sources/SystemAudioProbe")
+    ),
+    .executableTarget(
+      name: "SpatialAudioLive",
+      dependencies: ["SpatialAudioKit"],
+      exclude: agentNotes("Sources/SpatialAudioLive")
     ),
     .testTarget(
       name: "TandemCoreTests",
