@@ -10,13 +10,20 @@ public final class PositionedSourceGraph: @unchecked Sendable {
   private let engine = AVAudioEngine()
   private let environment = AVAudioEnvironmentNode()
   private let players: [AVAudioPlayerNode]
+  /// HRTF を通さず、両耳へ直接流すステレオ経路（低音用）。無指向性の低域は空間化
+  /// せずフルレベルで両耳に届ける方が力強い。
+  private let directPlayer = AVAudioPlayerNode()
   private let monoFormat: AVAudioFormat
+  private let stereoFormat: AVAudioFormat
 
   public init(sampleRate: Double = 48_000, sourceCount: Int) throws {
-    guard let mono = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 1) else {
+    guard let mono = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 1),
+      let stereo = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 2)
+    else {
       throw SpatialAudioGraphError.unsupportedFormat(sampleRate: sampleRate)
     }
     monoFormat = mono
+    stereoFormat = stereo
     players = (0..<max(1, sourceCount)).map { _ in AVAudioPlayerNode() }
 
     engine.attach(environment)
@@ -25,6 +32,10 @@ public final class PositionedSourceGraph: @unchecked Sendable {
       engine.connect(player, to: environment, format: monoFormat)
     }
     engine.connect(environment, to: engine.mainMixerNode, format: nil)
+
+    // 低音の直通路: 環境ノード（HRTF）を経由せず直接ミキサへ。
+    engine.attach(directPlayer)
+    engine.connect(directPlayer, to: engine.mainMixerNode, format: stereoFormat)
 
     environment.outputType = .headphones
     environment.listenerPosition = AVAudio3DPoint(x: 0, y: 0, z: 0)
@@ -52,16 +63,46 @@ public final class PositionedSourceGraph: @unchecked Sendable {
     engine.prepare()
     try engine.start()
     for player in players { player.play() }
+    directPlayer.play()
   }
 
   public func stop() {
     for player in players { player.stop() }
+    directPlayer.stop()
     engine.stop()
   }
 
   public func schedule(index: Int, buffer: AVAudioPCMBuffer) {
     guard players.indices.contains(index) else { return }
     players[index].scheduleBuffer(buffer, completionHandler: nil)
+  }
+
+  /// HRTF を通さない直通路（低音）へステレオバッファをスケジュールする。
+  public func scheduleDirect(buffer: AVAudioPCMBuffer) {
+    directPlayer.scheduleBuffer(buffer, completionHandler: nil)
+  }
+
+  /// 全体の出力音量（メイクアップゲイン）。
+  public func setOutputVolume(_ volume: Float) {
+    engine.mainMixerNode.outputVolume = volume
+  }
+
+  /// 左右のモノ列から2chステレオバッファを作る（直通路用）。
+  public func makeStereoBuffer(left: [Float], right: [Float]) -> AVAudioPCMBuffer? {
+    let count = min(left.count, right.count)
+    guard count > 0,
+      let buffer = AVAudioPCMBuffer(
+        pcmFormat: stereoFormat,
+        frameCapacity: AVAudioFrameCount(count)
+      ),
+      let channels = buffer.floatChannelData
+    else { return nil }
+    buffer.frameLength = AVAudioFrameCount(count)
+    for index in 0..<count {
+      channels[0][index] = left[index]
+      channels[1][index] = right[index]
+    }
+    return buffer
   }
 
   public func makeMonoBuffer(_ samples: [Float]) -> AVAudioPCMBuffer? {
