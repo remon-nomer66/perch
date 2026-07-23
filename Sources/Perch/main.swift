@@ -434,7 +434,7 @@ final class AppModel: ObservableObject {
     if let preset = rule.equalizerPreset, let reading = panel.equalizer {
       sawRequestedReading = true
       if reading.presets.contains(where: { $0.identifier == preset }),
-        !equalizerBlocked(by: rule),
+        !equalizerBlocked(by: rule, replacing: replaced),
         let previous = replaced?.equalizer?.previous ?? reading.selectedPreset,
         previous != preset
       {
@@ -473,11 +473,19 @@ final class AppModel: ObservableObject {
   /// The device switches its equaliser off while a listening mode runs, so a rule's
   /// preset only lands when the mode the rule leaves the device in is standard. The
   /// editor refuses the combination; this also guards rules stored before it did.
-  private func equalizerBlocked(by rule: SoundRule) -> Bool {
+  ///
+  /// "Keep" is judged against the mode the device is *headed for*, not the one the
+  /// panel shows: when this rule replaces one that held the listening mode, the
+  /// restore write is still in flight, and judging by the panel's stale mode skips
+  /// the preset for the whole life of the new hold (a cinema site straight into a
+  /// music app was exactly the miss).
+  private func equalizerBlocked(by rule: SoundRule, replacing replaced: RuleHold?) -> Bool {
     switch rule.listening {
-    case .backgroundMusic, .cinema: true
-    case .standard: false
-    case .keep: panel.listeningMode?.disablesEqualizer ?? false
+    case .backgroundMusic, .cinema: return true
+    case .standard: return false
+    case .keep:
+      let selection = replaced?.listening?.previous ?? panel.listeningMode?.selection
+      return selection.map { $0 != .standard } ?? false
     }
   }
 
