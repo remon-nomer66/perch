@@ -1,3 +1,4 @@
+import AppKit
 import NotchKit
 import SwiftUI
 
@@ -11,9 +12,30 @@ struct NotchSettingsView: View {
   @ObservedObject var settings: AppSettingsStore
 
   private let limits = NotchAppearance.limits
+  /// Whether any screen actually has a notch right now. On a Mac without one these
+  /// settings silently do nothing, and saying so beats letting the sliders feel
+  /// broken. Kept fresh across display changes — docking, lids, hot-plugs.
+  @State private var hasNotch = NSScreen.withNotch != nil
 
   var body: some View {
     Form {
+      if !hasNotch {
+        Section {
+          Text(
+            L(
+              "現在、ノッチのある画面が接続されていないため、ノッチは表示されません。"
+                + "機器の操作は「一般」タブから行えます。ここの設定は、ノッチのある画面が"
+                + "使われるようになった時に反映されます。",
+              "No screen with a notch is connected right now, so the notch is not shown. "
+                + "The device can be controlled from the “General” tab. These settings take "
+                + "effect once a notched screen is in use."
+            )
+          )
+          .font(.system(size: 11))
+          .foregroundStyle(.orange)
+        }
+      }
+
       Section(L("ノッチ", "Notch")) {
         Toggle(L("ノッチに表示", "Show in the notch"), isOn: $settings.isNotchEnabled)
         Text(
@@ -107,6 +129,13 @@ struct NotchSettingsView: View {
       }
     }
     .formStyle(.grouped)
+    .onReceive(
+      NotificationCenter.default.publisher(
+        for: NSApplication.didChangeScreenParametersNotification
+      )
+    ) { _ in
+      hasNotch = NSScreen.withNotch != nil
+    }
   }
 
   private func binding(_ path: WritableKeyPath<NotchAppearance, CGFloat>) -> Binding<Double> {
