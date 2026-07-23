@@ -1,0 +1,94 @@
+# 実装計画: 空間オーディオ（HRTF ヘッドトラッキング空間化）
+
+> 実現可能性調査（4領域）の結論に基づく設計計画。device 非依存の全体横断機能のため、
+> `feature/spatial-audio`（`main` 起点）で進める。sony/bose 系ブランチとは独立。
+
+## 目的
+イヤホン／ヘッドホンで再生されるシステム音声を、リアルタイムに **HRTF バイノーラル空間化**して
+「頭の外側に音場が広がる」体験を提供する。最終的にはカメラで顔の向きを追い、音源を空間上に
+固定する（頭を動かしても音源位置が動かない＝ワールドロック）ことを目指す。
+
+## スコープと段階（重要）
+本機能は **2 段階**に分ける。**まずフェーズ1（空間化のみ）を完成させて確実な価値を出し**、
+頭部追従は後段に回す（計画には残す）。
+
+- **フェーズ1 — 空間化のみ（今回の焦点）**: 音源を前方など固定位置に置いた HRTF 空間化。
+  頭の向きは追わない（音場は端末＝画面に対して固定）。Bluetooth 遅延の影響を受けない
+  （一律遅延は音楽用途で知覚されない）ため、**どの接続でも高品質に成立する**。
+- **フェーズ2 — 頭部追従（後日）**: MacBook カメラで顔向きを推定し `listenerAngularOrientation`
+  を更新。**Sony 等の一般 Bluetooth 機では Apple の頭部姿勢 API が使えず、カメラが必須**。
+  ただし後述の Bluetooth 遅延が体感を左右するため、**低遅延コーデック前提の実験機能**として扱う。
+
+## 対応 OS / 前提
+- **音声取得は macOS 14.4+ が前提**（Core Audio Process Taps）。14.4 未満は BlackHole 等の
+  仮想デバイスをフォールバックにするか、非対応とする（実装時に決定）。
+- 署名（Developer ID）＋ notarization が必要。**Mac App Store 経路は現状不可**（tap 系の制約）。
+- `NSAudioCaptureUsageDescription`（システムオーディオ録音）が必要。フェーズ2では
+  `NSCameraUsageDescription`（カメラ）も追加。
+
+## アーキテクチャ（確定方針）
+```
+[システム/アプリ再生音]
+   │ ① Core Audio Process Tap（ドライバ不要, Mac内部往復 ~10ms）
+   ▼
+[加工] ─ ② AVAudioEnvironmentNode で HRTF 空間化（Apple純正・無料・依存ゼロ）
+   │        ・入力はモノ化必須（ステレオは素通し）→ L/R を ±30° の 2 モノ仮想音源に分割
+   │        ・renderingAlgorithm = .HRTF（品質重視なら .HRTFHQ、負荷とトレードオフ）
+   │        ・フェーズ2で listenerAngularOrientation に頭の向きを注入
+   ▼
+[実ヘッドホンへ出力]（ミュート global tap + 実出力を含む private aggregate device で透過的に往復）
+```
+- **音声取得**: `AudioHardwareCreateProcessTap`（`CATapDescription` をミュート global tap）＋
+  実出力デバイスを main sub-device とした private aggregate device ＋ `AudioDeviceCreateIOProcIDWithBlock`。
+  ユーザーの既定出力切替は不要（透過）。`AVAudioEngine` は tap デバイスに retarget できないため、
+  取得は直接 IOProc で行う（この層はレンダラの AVAudioEngine とは分離）。
+- **レンダリング**: `AVAudioEnvironmentNode`。カスタム HRTF や更なる品質が必要になったら
+  Steam Audio（Apache-2.0）または 3D Tune-In（LGPL）へ差し替え可能な抽象境界を設ける。
+- **設計原則の順守**: 機種依存の ID・バイト列を焼き付けない。音声処理は HRTF という汎用手法のみで、
+  特定機種の申告に依存しない。ログ・コードに Bluetooth アドレス等の個人情報を残さない。
+
+## Bluetooth 遅延という制約（フェーズ2で設計に織り込む）
+頭を動かすと、新しい向きで再レンダした音が **再び Bluetooth を通って**耳に届く。
+
+| 遅延 | 目安 | 影響 |
+|---|---|---|
+| 音声の再生遅延（全体一律） | +100〜300ms（SBC/AAC） | 音楽は無問題／動画はリップシンクずれ |
+| motion-to-sound（頭→音像） | カメラ ~33ms + 推論 ~20ms + **BT 100〜300ms** | **標準 BT では追従がもたつく** |
+
+- 頭部追従の知覚許容は **≈45〜60ms**。標準 BT では大きく超える。
+- 緩和策: **LC3 / LE Audio・低遅延コーデック**（対応機なら大幅改善の可能性・要実測）、有線接続、
+  もしくは **フェーズ1（空間化のみ）を既定モード**にし頭追従は任意の実験機能とする。
+- フェーズ1 はこの制約と無関係に成立する（一律遅延のため）。
+
+## 商標・知財の切り分け（非生成の原則）
+- **「Dolby Atmos」「360 Reality Audio」を生成・エンコードしない**（個人開発ではライセンス上不可）。
+  入力も出力も普通のステレオ PCM に留め、公開 HRTF（MIT KEMAR 等の SOFA）を畳み込むのみ。
+- UI・名称・ドキュメントに「Dolby」「360 Reality Audio」「Apple Spatial Audio」等の商標を使わない。
+  自機能は「HRTF ヘッドトラッキング空間化」と表現する。既存の `TRADEMARK.md` の方針と整合させる。
+
+## モジュール構成案（暫定）
+- 新規 `SpatialAudioKit`（仮）: 音声取得（Core Audio Tap）＋ AVAudioEngine レンダリンググラフ。
+  HRTF レンダラは protocol 越しに差し替え可能に。
+- 既存 UI（NotchKit / Perch）から ON/OFF・音場の広さ等を制御。フェーズ2でカメラ追従トグルを追加。
+- レンダラ抽象は「listener の向き（yaw/pitch/roll）を受け取る」インターフェースにし、フェーズ1では
+  固定値、フェーズ2でカメラ由来の値を流す（フェーズ間の差分を最小化）。
+
+## 実装時に実機検証する未確定事項
+- `AVAudioEnvironmentNode` の HRTF 品質と `.HRTFHQ` の実効レイテンシ／CPU 負荷。
+- macOS 15/26 での Core Audio Tap の権限挙動・取りこぼしの有無（Sequoia で挙動変化の報告あり）。
+- ステレオ→2モノ仮想音源化 vs 直接 2ch HRTF 畳み込みの音質比較。
+- （フェーズ2）Vision `VNDetectFaceRectanglesRequest`(rev3) の実用可動範囲と実効レイテンシ、
+  One Euro フィルタのパラメータ、顔喪失時のフォールバック（最後の向きを保持し正面へ緩やかに復帰）。
+- 対象機のコーデック遅延の実測（頭追従が実用に耐えるかの判断材料）。
+
+## 非目標
+- Dolby Atmos / 360 Reality Audio / MPEG-H のエンコード・デコード・商標利用。
+- 個人化 HRTF（耳画像等）の生成。まずは公開 HRTF で成立させる。
+- フェーズ1 での頭部追従（後段）。
+
+## 参照した既存実装・ライブラリ
+- 音声往復加工: `zollans/OnlyEQ`（Unlicense, 参照実装）／`insidegui/AudioCap`（BSD-2, API 教科書）。
+- 仮想デバイス（代替）: `ExistentialAudio/BlackHole`（GPL-3.0）。
+- レンダラ差し替え候補: `ValveSoftware/steam-audio`（Apache-2.0）／`3DTune-In/3dti_AudioToolkit`（LGPL-3.0）。
+- HRTF データ: MIT KEMAR ほか公開 SOFA（sofaconventions.org）。
+- 先行事例: Waves Nx デスクトップ（システム音全取り + webカメラ頭部追従。2021 に消費者版撤退）。
