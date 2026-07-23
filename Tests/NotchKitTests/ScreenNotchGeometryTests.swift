@@ -85,3 +85,59 @@ private let builtIn = CGRect(x: 0, y: 0, width: 1512, height: 982)
 
   #expect(geometry == nil)
 }
+
+// MARK: - Synthesised (virtual) notch
+
+private let plainDisplay = CGRect(x: 0, y: 0, width: 1440, height: 900)
+
+@Test func aSynthesisedNotchSitsAtTheTopCentreOverTheMenuBar() {
+  let geometry = ScreenNotchGeometry.synthesized(
+    screenFrame: plainDisplay,
+    menuBarHeight: 24,
+    width: 220
+  )
+
+  // Centred horizontally, hugging the top, as tall as the menu bar it overlays.
+  #expect(geometry?.rect == CGRect(x: 610, y: 876, width: 220, height: 24))
+  #expect(geometry?.isVirtual == true)
+}
+
+@Test func aResolvedNotchIsNotMarkedVirtual() {
+  let geometry = ScreenNotchGeometry.resolve(
+    screenFrame: builtIn,
+    safeAreaTop: 32,
+    leftArea: CGRect(x: 0, y: 950, width: 620, height: 32),
+    rightArea: CGRect(x: 892, y: 950, width: 620, height: 32)
+  )
+
+  #expect(geometry?.isVirtual == false)
+}
+
+@Test func aSynthesisedNotchFollowsAScreenWhoseOriginIsNotZero() {
+  let shifted = CGRect(x: -1440, y: 120, width: 1440, height: 900)
+  let geometry = ScreenNotchGeometry.synthesized(
+    screenFrame: shifted,
+    menuBarHeight: 24,
+    width: 220
+  )
+
+  #expect(geometry?.rect == CGRect(x: -830, y: 996, width: 220, height: 24))
+}
+
+@Test func aSynthesisedNotchIsRefusedWhenItCannotFit() {
+  let cases: [(CGFloat, CGFloat, String)] = [
+    (0, 220, "no menu bar height"),
+    (-5, 220, "negative menu bar height"),
+    (24, 0, "no width"),
+    (24, 2000, "wider than the screen"),
+  ]
+
+  for (menuBarHeight, width, label) in cases {
+    let geometry = ScreenNotchGeometry.synthesized(
+      screenFrame: plainDisplay,
+      menuBarHeight: menuBarHeight,
+      width: width
+    )
+    #expect(geometry == nil, "\(label) produced a notch")
+  }
+}

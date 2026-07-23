@@ -19,6 +19,7 @@ func settingsPersistAcrossStores() {
   withDefaults { defaults in
     let store = AppSettingsStore(defaults: defaults)
     store.isNotchEnabled = false
+    store.isVirtualNotchEnabled = false
     store.notchDisplayMode = .onHover
     store.isRulesEnabled = true
     var rule = SoundRule(trigger: .site("example.com"))
@@ -28,6 +29,7 @@ func settingsPersistAcrossStores() {
 
     let reloaded = AppSettingsStore(defaults: defaults)
     #expect(reloaded.isNotchEnabled == false)
+    #expect(reloaded.isVirtualNotchEnabled == false)
     #expect(reloaded.notchDisplayMode == .onHover)
     #expect(reloaded.isRulesEnabled)
     #expect(reloaded.rules == [rule])
@@ -41,6 +43,9 @@ func firstLaunchDefaults() {
   withDefaults { defaults in
     let store = AppSettingsStore(defaults: defaults)
     #expect(store.isNotchEnabled)
+    // A Mac with no cutout gets a virtual one by default; the interface is meant for
+    // everyone, not only notched hardware.
+    #expect(store.isVirtualNotchEnabled)
     #expect(store.hidesNotchInFullScreen)
     #expect(store.notchDisplayMode == .always)
     #expect(!store.isRulesEnabled)

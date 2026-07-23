@@ -62,6 +62,10 @@ struct NotchPanelView: View {
   /// Only its size may be read directly; a position must first be shifted into the
   /// hosting window's space — see `notchMidXInWindow`.
   let notchRect: CGRect
+  /// True when the notch was synthesised on a screen with no cutout of its own. Such a
+  /// notch rests as a thin sliver and is quiet by nature, showing its bar only while
+  /// looked at or just after a device arrives.
+  var isVirtual: Bool = false
   let appearance: NotchAppearance
   let displayMode: NotchDisplayMode
   let model: PanelModel
@@ -111,7 +115,12 @@ struct NotchPanelView: View {
   /// bar displaced, or past the window's edge entirely, while hover kept answering
   /// (the hit testing compares global against global and never notices).
   private var notchMidXInWindow: CGFloat {
-    notchRect.midX - (NSScreen.withNotch?.frame.minX ?? 0)
+    // The strip window starts at the notch screen's own minX. A virtual notch lives on
+    // a screen `NSScreen.withNotch` cannot name, so the screen is found by the cutout
+    // it sits on — which resolves to the same screen for a real notch too.
+    let point = CGPoint(x: notchRect.midX, y: notchRect.maxY - 1)
+    let screenMinX = NSScreen.screens.first { $0.frame.contains(point) }?.frame.minX ?? 0
+    return notchRect.midX - screenMinX
   }
 
   /// The bar widens only when it actually has something to carry. Being controllable
@@ -128,6 +137,9 @@ struct NotchPanelView: View {
   /// seconds after a device connects.
   private var isExtended: Bool {
     guard hasContent else { return false }
+    // A virtual notch is quiet whatever the display mode says: it rests as a sliver and
+    // only shows its bar while looked at or just after a device connects.
+    if isVirtual { return presentation != .closed || model.announcesArrival }
     switch displayMode {
     case .always: return true
     case .onHover: return presentation != .closed || model.announcesArrival
@@ -136,7 +148,16 @@ struct NotchPanelView: View {
 
   private var size: CGSize {
     guard !isOpen else { return appearance.expandedSize }
-    let base = isExtended ? appearance.closedRect(around: notchRect).size : notchRect.size
+    let base: CGSize
+    if isExtended {
+      base = appearance.closedRect(around: notchRect).size
+    } else if isVirtual && presentation == .closed {
+      // At rest, with nothing to carry and no pointer on it, the virtual notch is only
+      // the sliver: a couple of millimetres of edge, not a menu-bar-tall slab.
+      base = appearance.restingSliver(in: notchRect).size
+    } else {
+      base = notchRect.size
+    }
     // The hint is a couple of points of growth, the same gesture NotchDrop makes.
     let extra: CGFloat = presentation == .popping ? 2 : 0
     return CGSize(width: base.width + extra, height: base.height + extra)

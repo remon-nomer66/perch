@@ -39,7 +39,7 @@ private let notch = CGRect(x: 620, y: 950, width: 272, height: 32)
 
 @Test func theHoverTargetIsTheWidenedBarWhileItIsVisible() {
   let target = NotchController.hoverTarget(
-    barVisible: true, notch: notch, appearance: .default
+    barVisible: true, notch: notch, isVirtual: false, appearance: .default
   )
 
   #expect(target == NotchAppearance.default.closedRect(around: notch))
@@ -49,8 +49,19 @@ private let notch = CGRect(x: 620, y: 950, width: 272, height: 32)
   // With the bar hidden there is nothing beside the cutout to point at; the side
   // reaches of the invisible bar must not react to the pointer.
   let target = NotchController.hoverTarget(
-    barVisible: false, notch: notch, appearance: .default
+    barVisible: false, notch: notch, isVirtual: false, appearance: .default
   )
 
   #expect(target == notch)
+}
+
+@Test func theHoverTargetForAVirtualNotchIsItsRestingSliver() {
+  // A virtual notch rests as a thin sliver, so that sliver — not a bar, not a full
+  // cutout — is what the pointer must reach to wake it. The visible-bar flag does not
+  // apply: at rest there is only ever the sliver to point at.
+  let target = NotchController.hoverTarget(
+    barVisible: true, notch: notch, isVirtual: true, appearance: .default
+  )
+
+  #expect(target == NotchAppearance.default.restingSliver(in: notch))
 }

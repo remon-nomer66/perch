@@ -8,9 +8,15 @@ import CoreGraphics
 /// it on a screen whose origin is not zero, or whose two areas are not symmetric.
 public struct ScreenNotchGeometry: Equatable, Sendable {
   public let rect: CGRect
+  /// True when this notch was synthesised on a screen that has no cutout of its own,
+  /// so the app's notch interface is reachable there too. A virtual notch rests as a
+  /// thin sliver rather than always showing a bar, which is the one behaviour that
+  /// separates it from a real one.
+  public let isVirtual: Bool
 
-  public init(rect: CGRect) {
+  public init(rect: CGRect, isVirtual: Bool = false) {
     self.rect = rect
+    self.isVirtual = isVirtual
   }
 
   /// Returns the notch rectangle, or `nil` when this screen has no usable notch.
@@ -39,5 +45,29 @@ public struct ScreenNotchGeometry: Equatable, Sendable {
     // and a misplaced rectangle would swallow clicks meant for the menu bar.
     guard screenFrame.contains(rect) else { return nil }
     return ScreenNotchGeometry(rect: rect)
+  }
+
+  /// A notch made up at the top-centre of a screen that has none.
+  ///
+  /// On a Mac with no cutout the app would otherwise have no notch to live in, so one
+  /// is placed over the menu bar: as wide as `width` (nominal — there is no real notch
+  /// to measure), as tall as the menu bar it overlays. The caller supplies the menu
+  /// bar height because a screen with no notch reports no safe-area inset to read it
+  /// from. Returns `nil` when the inputs cannot make a rectangle that fits the screen.
+  public static func synthesized(
+    screenFrame: CGRect,
+    menuBarHeight: CGFloat,
+    width: CGFloat
+  ) -> ScreenNotchGeometry? {
+    guard menuBarHeight > 0, width > 0, width <= screenFrame.width else { return nil }
+
+    let rect = CGRect(
+      x: screenFrame.midX - width / 2,
+      y: screenFrame.maxY - menuBarHeight,
+      width: width,
+      height: menuBarHeight
+    )
+    guard screenFrame.contains(rect) else { return nil }
+    return ScreenNotchGeometry(rect: rect, isVirtual: true)
   }
 }
