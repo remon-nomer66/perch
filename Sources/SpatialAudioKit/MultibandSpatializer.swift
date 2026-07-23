@@ -62,6 +62,13 @@ public final class MultibandSpatializer: @unchecked Sendable {
   private var tap: SystemAudioTap?
   private let muteOriginal: Bool
 
+  // 音源の基準位置（揺らぎはこれに加算する）と、ゆっくり漂わせる揺らぎ。
+  private var centerBase: SphericalDirection
+  private var leftBase: SphericalDirection
+  private var rightBase: SphericalDirection
+  private let wander: PositionWander
+  private var elapsedTime: Double = 0
+
   // オーディオスレッドから読む可変ゲイン（耳合わせ用。単純なFloatなので競合は軽微）。
   public var lowGain: Float
   public var midGain: Float
@@ -77,6 +84,7 @@ public final class MultibandSpatializer: @unchecked Sendable {
     config: MultibandConfig = MultibandConfig(),
     muteOriginal: Bool = true,
     autoBalance: Bool = false,
+    wanderDegrees: Double = 6,
     sampleRate: Double = 48_000
   ) throws {
     self.muteOriginal = muteOriginal
@@ -85,18 +93,23 @@ public final class MultibandSpatializer: @unchecked Sendable {
     midGain = config.midGain
     sideWidth = config.sideWidth
     sideSpread = config.sideSpreadDegrees * .pi / 180
+    wander = PositionWander(degrees: wanderDegrees)
     crossoverLeft = Crossover(cutoff: config.crossover, sampleRate: sampleRate)
     crossoverRight = Crossover(cutoff: config.crossover, sampleRate: sampleRate)
     if autoBalance {
       analyzer = BalanceAnalyzer(baselineLowGain: config.lowGain, baselineWidth: config.sideWidth)
     }
 
+    centerBase = SphericalDirection(azimuth: 0, elevation: 0, distance: config.centerDistance)
+    leftBase = SphericalDirection(azimuth: -sideSpread, elevation: 0, distance: config.sideDistance)
+    rightBase = SphericalDirection(azimuth: sideSpread, elevation: 0, distance: config.sideDistance)
+
     graph = try PositionedSourceGraph(sampleRate: sampleRate, sourceCount: 3)
     graph.setAlgorithm(config.quality)
     graph.setOutputVolume(config.masterGain)
-    graph.setPosition(SourceIndex.center, SphericalDirection(azimuth: 0, elevation: 0, distance: config.centerDistance))
-    graph.setPosition(SourceIndex.left, SphericalDirection(azimuth: -sideSpread, elevation: 0, distance: config.sideDistance))
-    graph.setPosition(SourceIndex.right, SphericalDirection(azimuth: sideSpread, elevation: 0, distance: config.sideDistance))
+    graph.setPosition(SourceIndex.center, centerBase)
+    graph.setPosition(SourceIndex.left, leftBase)
+    graph.setPosition(SourceIndex.right, rightBase)
   }
 
   public func start() throws {
@@ -118,11 +131,33 @@ public final class MultibandSpatializer: @unchecked Sendable {
 
   public func setMasterGain(_ gain: Float) { graph.setOutputVolume(gain) }
   public func setCenterDistance(_ distance: Double) {
-    graph.setPosition(SourceIndex.center, SphericalDirection(azimuth: 0, elevation: 0, distance: distance))
+    centerBase = SphericalDirection(azimuth: 0, elevation: 0, distance: distance)
+    graph.setPosition(SourceIndex.center, centerBase)
   }
   public func setSideDistance(_ distance: Double) {
-    graph.setPosition(SourceIndex.left, SphericalDirection(azimuth: -sideSpread, elevation: 0, distance: distance))
-    graph.setPosition(SourceIndex.right, SphericalDirection(azimuth: sideSpread, elevation: 0, distance: distance))
+    leftBase = SphericalDirection(azimuth: -sideSpread, elevation: 0, distance: distance)
+    rightBase = SphericalDirection(azimuth: sideSpread, elevation: 0, distance: distance)
+    graph.setPosition(SourceIndex.left, leftBase)
+    graph.setPosition(SourceIndex.right, rightBase)
+  }
+
+  /// 各音源を基準位置＋揺らぎの位置へ更新する。
+  private func applyWander(time: Double) {
+    reposition(SourceIndex.center, base: centerBase, source: 0, time: time)
+    reposition(SourceIndex.left, base: leftBase, source: 1, time: time)
+    reposition(SourceIndex.right, base: rightBase, source: 2, time: time)
+  }
+
+  private func reposition(_ index: Int, base: SphericalDirection, source: Int, time: Double) {
+    let offset = wander.offset(source: source, time: time)
+    graph.setPosition(
+      index,
+      SphericalDirection(
+        azimuth: base.azimuth + offset.azimuth,
+        elevation: base.elevation + offset.elevation,
+        distance: base.distance
+      )
+    )
   }
 
   public func stop() {
@@ -137,18 +172,26 @@ public final class MultibandSpatializer: @unchecked Sendable {
     let (lowLeft, highLeft) = crossoverLeft.split(left)
     let (lowRight, highRight) = crossoverRight.split(right)
 
-    // 自動バランス: 各帯域のレベルを測り、低音ゲインと幅をゆっくり追従させる。
-    if analyzer != nil {
-      let count = min(lowLeft.count, lowRight.count, highLeft.count, highRight.count)
-      if count > 0 {
+    let count = min(lowLeft.count, lowRight.count, highLeft.count, highRight.count)
+    if count > 0 {
+      let dt = Double(count) / sampleRate
+      elapsedTime += dt
+
+      // 自動バランス: 各帯域のレベルを測り、低音ゲインと幅をゆっくり追従させる。
+      if analyzer != nil {
         analyzer!.observe(
           lowRMS: Self.rmsOfMean(lowLeft, lowRight, count: count),
           midRMS: Self.rmsOfMean(highLeft, highRight, count: count),
           sideRMS: Self.rmsOfDifference(highLeft, highRight, count: count),
-          dt: Double(count) / sampleRate
+          dt: dt
         )
         lowGain = analyzer!.lowGain
         sideWidth = analyzer!.sideWidth
+      }
+
+      // 音源をゆっくり漂わせる（外在化を強める）。
+      if wander.amplitude > 0 {
+        applyWander(time: elapsedTime)
       }
     }
 

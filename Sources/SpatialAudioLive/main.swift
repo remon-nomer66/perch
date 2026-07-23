@@ -8,6 +8,7 @@ import SpatialAudioKit
 //   引数 multiband : マルチバンド+M/S 空間化（本命）。低音は両耳へ直通、中高域を空間化。
 //   引数 auto      : multiband に自動バランスを重ねる。直近の音を測り、低音ゲインと
 //                    幅をゆっくり自動追従（曲が変わっても数秒で馴染む）。
+//   引数 wanderNN  : 音源をゆっくり漂わせる振れ幅（度）。既定6。例 wander10。nowander で無効。
 //   引数 tune     : 対話調整モード。再生しながらキー操作で音場を追い込む。
 //   引数 rotate   : リスナーの向きをゆっくり回す効果デモ。
 //   引数 nomute   : 原音をミュートしない（原音＋空間化版を同時に鳴らして比較）。
@@ -47,8 +48,17 @@ func runLive() -> Never {
   // 既定は空間化版だけを流す（調整・本番とも耳で判断しやすい）。nomute で無効化。
   let muteOriginal = !arguments.contains("nomute")
 
+  // 揺らぎの振れ幅（度）。既定6、nowander で0、wanderNN で指定。
+  var wanderDegrees = 6.0
+  if arguments.contains("nowander") {
+    wanderDegrees = 0
+  } else if let token = arguments.first(where: { $0.hasPrefix("wander") && $0 != "wander" }),
+    let value = Double(token.dropFirst("wander".count)), value >= 0, value <= 30 {
+    wanderDegrees = value
+  }
+
   if multiband {
-    runMultiband(muteOriginal: muteOriginal, autoBalance: auto)
+    runMultiband(muteOriginal: muteOriginal, autoBalance: auto, wanderDegrees: wanderDegrees)
   }
 
   let live: LiveSpatializer
@@ -87,10 +97,12 @@ func runLive() -> Never {
 }
 
 @available(macOS 14.4, *)
-func runMultiband(muteOriginal: Bool, autoBalance: Bool) -> Never {
+func runMultiband(muteOriginal: Bool, autoBalance: Bool, wanderDegrees: Double) -> Never {
   let spatializer: MultibandSpatializer
   do {
-    spatializer = try MultibandSpatializer(muteOriginal: muteOriginal, autoBalance: autoBalance)
+    spatializer = try MultibandSpatializer(
+      muteOriginal: muteOriginal, autoBalance: autoBalance, wanderDegrees: wanderDegrees
+    )
   } catch {
     fail("マルチバンド初期化に失敗: \(error)")
   }
@@ -105,6 +117,9 @@ func runMultiband(muteOriginal: Bool, autoBalance: Bool) -> Never {
   print(String(format: "  取得フォーマット: %.0f Hz / %u ch", format.mSampleRate, format.mChannelsPerFrame))
   if autoBalance {
     print("  自動バランス: ON。直近の音を測り、低音ゲインと幅をゆっくり追従します。")
+  }
+  if wanderDegrees > 0 {
+    print(String(format: "  揺らぎ: ±%.0f° で音源をゆっくり漂わせています。", wanderDegrees))
   }
   if !muteOriginal {
     print("  原音ミュートなし（原音＋空間化版）。")
