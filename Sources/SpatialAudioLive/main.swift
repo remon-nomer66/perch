@@ -5,9 +5,11 @@ import SpatialAudioKit
 
 // システム音のリアルタイム空間化（本命）。
 //
-//   引数 tune   : 対話調整モード。再生しながらキー操作で音場を追い込む（推奨）。
-//   引数 rotate : リスナーの向きをゆっくり回す効果デモ。
-//   引数 nomute : 原音をミュートしない（原音＋空間化版を同時に鳴らして比較）。
+//   引数 multiband : マルチバンド+M/S 空間化（本命）。低音は中央で固く、中高域の
+//                    左右成分を広げる。ミックスの楽器パンを尊重して立体化。
+//   引数 tune     : 対話調整モード。再生しながらキー操作で音場を追い込む。
+//   引数 rotate   : リスナーの向きをゆっくり回す効果デモ。
+//   引数 nomute   : 原音をミュートしない（原音＋空間化版を同時に鳴らして比較）。
 // 実機・ヘッドホンで実行する。
 
 func fail(_ message: String) -> Never {
@@ -37,10 +39,15 @@ func disableRawInput() {
 @available(macOS 14.4, *)
 func runLive() -> Never {
   let arguments = Set(CommandLine.arguments.dropFirst())
+  let multiband = arguments.contains("multiband")
   let tune = arguments.contains("tune")
   let rotate = arguments.contains("rotate")
   // 既定は空間化版だけを流す（調整・本番とも耳で判断しやすい）。nomute で無効化。
   let muteOriginal = !arguments.contains("nomute")
+
+  if multiband {
+    runMultiband(muteOriginal: muteOriginal)
+  }
 
   let live: LiveSpatializer
   do {
@@ -75,6 +82,32 @@ func runLive() -> Never {
     print("正面固定で空間化中。Ctrl-C で停止。")
     while true { Thread.sleep(forTimeInterval: 1.0) }
   }
+}
+
+@available(macOS 14.4, *)
+func runMultiband(muteOriginal: Bool) -> Never {
+  let spatializer: MultibandSpatializer
+  do {
+    spatializer = try MultibandSpatializer(muteOriginal: muteOriginal)
+  } catch {
+    fail("マルチバンド初期化に失敗: \(error)")
+  }
+  do {
+    try spatializer.start()
+  } catch {
+    fail("開始に失敗: \(error)")
+  }
+
+  let format = spatializer.captureFormat
+  print("マルチバンド + M/S 空間化中。")
+  print(String(format: "  取得フォーマット: %.0f Hz / %u ch", format.mSampleRate, format.mChannelsPerFrame))
+  if muteOriginal {
+    print("  原音はミュート中。低音は中央で固く、中高域の左右成分を広げています。")
+  } else {
+    print("  原音ミュートなし（原音＋空間化版）。")
+  }
+  print("何か音楽を再生してください。Ctrl-C で停止。")
+  while true { Thread.sleep(forTimeInterval: 1.0) }
 }
 
 @available(macOS 14.4, *)
