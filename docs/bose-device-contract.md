@@ -4,9 +4,25 @@
 型と API を、実装(protocol-core 以降)の前に確定する。Codex #2「この抽象化コストは過小評価されている」への回答。
 
 - 前段: [bose-frozen-spec.md](bose-frozen-spec.md)(BMAP 確定仕様)/ [bose-support-plan.md](bose-support-plan.md)(全体設計)
-- この段階で**実コード化するのは安定した土台の型のみ**(`Sources/DeviceContract/`)。フィーチャ状態/コマンドの
-  詳細型は「決定済み API」として本書に定義し、**段階6(縦切り)で battery+NC の1機能から材料化・検証**する。
-  UI 全面移行を一度にやらない(Codex #2 のコスト過小評価を回避)。
+- **Codex レビュー(2回目)を反映して全面改訂済み**。土台型だけでなく、フィーチャ詳細型・原子的 `DeviceState`・
+  typed error・`DeviceControl` protocol・transport port まで**実コード化**し、Sony/Ultra/QC35 の**射影 fixture テスト**で
+  各機種の形状が契約型で成立することを検証済み(`Tests/DeviceContractTests/ProjectionFixtureTests.swift`)。
+- UI 全面移行だけは段階6(縦切り)に残す(Codex #2 のコスト過小評価を回避)。契約の型自体はここで凍結する。
+
+## 0. Codex 2回目レビューで直した設計欠陥
+
+| # | 旧設計の欠陥 | 修正 |
+|---|---|---|
+| C1 | `WriteTrust` が「モデル信頼度」と「一時的に書けない(suspended)」を混同 | `ConnectionPhase`(suspended 含む・typed reason)/ `VerificationTrust` / `WriteAvailability`(canWriteNow)に3分離 |
+| C2 | `NoiseControlSnapshot` が Bose CNC(連続)と QC35(level無し離散)を表現不可 | `NoiseTopology` を `.discrete(options:)` / `.continuous(range:endpoints:)` に。voiceFocus/wind/ANC/adaptive を独立軸に |
+| H3 | `setToggle` が3値(spatial)・4値(sidetone)・timeout「解除まで」を壊す | `SettingSnapshot` を toggle/choice/range/speakToChat に。opaque `OptionID` で選択 |
+| H4 | EQ/Mode の Preset/Band/Mode 未定義、index はズレに弱い | opaque `OptionID`、band に frequencyHz?(Bose は nil)、per-preset/mode editable |
+| H5 | capability / 読取成功 / 操作可否の混同 | `FeatureReadState`(undeclared/loading/fresh/stale/failed)+ `FeatureWriteState`。`canWrite` は device 全体 & feature 両ゲート |
+| H6 | 4つの独立 getter が異時点の値になる | 原子的 `DeviceState`(revision付き)1発取得。`apply` は `RevisionedCommand` + typed `DeviceControlError`(notApplied 実値・staleSnapshot 含む) |
+| H7 | adapter 配置矛盾・`DeviceIdentity` 名前衝突 | `DeviceDescriptor` に改名。adapter 配置は §2 で確定 |
+| H9 | Battery の percent 未検証・充電4状態を Bool? で表せない・labeled(String) が PII 経路 | percent を 0..100 検証、`ChargeState` 4状態、`other(index:)`(名前でなく番号)、enclosure 一意化 |
+| H10 | transport preference/単一セッション所有者 未設計 | `TransportPreferenceStore`(匿名 `DevicePreferenceKey`=model単位)+ `DeviceSessionSupervisor`(close-before-open 保証)を実コード化 |
+| M11 | codec を静的 identity に、caveat 文字列を session が生成 | codec を identity から除去(live reading)。caveat 文字列でなく typed `UnverifiedReason`、表示文言は Perch |
 
 ---
 

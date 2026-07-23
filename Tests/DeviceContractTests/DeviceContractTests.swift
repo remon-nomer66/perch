@@ -2,57 +2,93 @@ import Testing
 
 @testable import DeviceContract
 
-/// The contract's foundation is pure value logic; these pin the derived behaviour that
-/// the UI and the brand adapters will rely on.
+/// The contract's foundation is pure value logic; these pin the derived behaviour the UI
+/// and adapters rely on.
 struct DeviceContractTests {
-  @Test("Controllable statuses are exactly ready and unverified")
-  func controllableStatuses() {
-    #expect(ConnectionStatus.ready.isControllable)
-    #expect(ConnectionStatus.unverified(caveat: "x").isControllable)
-    #expect(!ConnectionStatus.readOnly(caveat: "x").isControllable)
-    #expect(!ConnectionStatus.noDevice.isControllable)
-    #expect(!ConnectionStatus.connecting.isControllable)
-    #expect(!ConnectionStatus.reading.isControllable)
-    #expect(!ConnectionStatus.contended.isControllable)
-    #expect(!ConnectionStatus.unreachable.isControllable)
+  @Test("Readable phases are ready, unverified, and suspended")
+  func readablePhases() {
+    #expect(ConnectionPhase.ready.isReadable)
+    #expect(ConnectionPhase.unverified(.unknownModel).isReadable)
+    #expect(ConnectionPhase.suspended(resume: .ready).isReadable)
+    #expect(!ConnectionPhase.noDevice.isReadable)
+    #expect(!ConnectionPhase.connecting.isReadable)
+    #expect(!ConnectionPhase.reading.isReadable)
+    #expect(!ConnectionPhase.contended.isReadable)
+    #expect(!ConnectionPhase.unreachable(canRetry: true).isReadable)
   }
 
-  @Test("Write trust gates writes; only read-only refuses")
-  func writeTrustGate() {
-    #expect(WriteTrust.trusted.allowsWrites)
-    #expect(WriteTrust.experimental.allowsWrites)
-    #expect(!WriteTrust.readOnly.allowsWrites)
+  @Test("Retry is meaningful only from contended and spent-budget unreachable")
+  func retryablePhases() {
+    #expect(ConnectionPhase.contended.canRetry)
+    #expect(ConnectionPhase.unreachable(canRetry: true).canRetry)
+    #expect(!ConnectionPhase.unreachable(canRetry: false).canRetry)
+    #expect(!ConnectionPhase.ready.canRetry)
+    #expect(!ConnectionPhase.suspended(resume: .ready).canRetry)
   }
 
-  @Test("Capability declaration is membership, independent of write trust")
-  func capabilityDeclaration() {
-    let caps = DeviceCapabilities(features: [.noiseControl, .sidetone], writeTrust: .readOnly)
+  @Test("Write availability gates writes independently of trust")
+  func writeAvailability() {
+    #expect(WriteAvailability.writable.canWriteNow)
+    #expect(!WriteAvailability.readOnly.canWriteNow)
+    #expect(!WriteAvailability.suspended.canWriteNow)
+    #expect(!WriteAvailability.unavailable.canWriteNow)
+  }
+
+  @Test("Feature write needs both device-wide and per-feature permission")
+  func perFeatureWriteGate() {
+    let caps = DeviceCapabilities(
+      trust: .unverified(.unknownModel),
+      writeAvailability: .writable,
+      features: [
+        .noiseControl: .init(read: .fresh, write: .writable),
+        .sidetone: .init(read: .fresh, write: .disabled),   // present but control-disabled
+      ]
+    )
     #expect(caps.declares(.noiseControl))
     #expect(caps.declares(.sidetone))
     #expect(!caps.declares(.equalizer))
-    // A feature can be declared while writes are gated off — the two are separate.
-    #expect(!caps.writeTrust.allowsWrites)
+    #expect(caps.canWrite(.noiseControl))
+    #expect(!caps.canWrite(.sidetone))          // disabled feature refuses the write
+    #expect(!caps.canWrite(.equalizer))         // undeclared
   }
 
-  @Test("Battery carries components independently; unknown is empty")
-  func batteryComponents() {
+  @Test("Read-only device blocks every feature write even when the feature is writable")
+  func deviceWideReadOnlyGate() {
+    let caps = DeviceCapabilities(
+      trust: .unverified(.verificationFailed),
+      writeAvailability: .readOnly,
+      features: [.noiseControl: .init(read: .fresh, write: .writable)]
+    )
+    #expect(caps.declares(.noiseControl))       // still declared and readable
+    #expect(!caps.canWrite(.noiseControl))      // but the device is gated read-only
+  }
+
+  @Test("Battery validates percent, dedupes enclosures, and preserves order")
+  func batteryInvariants() {
     #expect(BatteryReading.unknown.cells.isEmpty)
-    let earbuds = BatteryReading(cells: [
-      .init(component: .left, percent: 80),
-      .init(component: .right, percent: 75),
-      .init(component: .caseEnclosure, percent: 50, isCharging: true),
+    let b = BatteryReading(cells: [
+      .init(enclosure: .left, percent: 80, charge: .notCharging),
+      .init(enclosure: .right, percent: 150),                     // out of range → nil
+      .init(enclosure: .caseEnclosure, percent: 50, charge: .charging),
+      .init(enclosure: .left, percent: 10),                       // duplicate → dropped
     ])
-    #expect(earbuds.cells.count == 3)
-    #expect(earbuds.cells[2].isCharging == true)
-    #expect(earbuds.cells[0].percent == 80)
+    #expect(b.cells.count == 3)
+    #expect(b.cells[0].enclosure == .left)
+    #expect(b.cells[0].percent == 80)                             // first write wins
+    #expect(b.cells[1].percent == nil)                            // 150 rejected
+    #expect(b.cells[2].charge == .charging)
   }
 
-  @Test("Identity defaults leave everything but brand unread")
-  func identityDefaults() {
-    let id = DeviceIdentity(brand: .bose)
-    #expect(id.brand == .bose)
-    #expect(id.modelName == nil)
-    #expect(id.firmwareVersion == nil)
-    #expect(id.codec == nil)
+  @Test("Charge state distinguishes not-charging from unknown from charged")
+  func chargeStates() {
+    #expect(ChargeState.notCharging != ChargeState.unknown)
+    #expect(ChargeState.charged != ChargeState.charging)
+  }
+
+  @Test("Descriptor holds model only; codec is absent by design")
+  func descriptorShape() {
+    let d = DeviceDescriptor(brand: .bose, modelName: "QC Ultra 2")
+    #expect(d.brand == .bose)
+    #expect(d.firmwareVersion == nil)
   }
 }
