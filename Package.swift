@@ -44,6 +44,10 @@ let package = Package(
       exclude: agentNotes("Sources/NotchKit")
     ),
     .target(
+      name: "SpatialAudioKit",
+      exclude: agentNotes("Sources/SpatialAudioKit")
+    ),
+    .target(
       name: "ScriptingBridgeGlue",
       exclude: agentNotes("Sources/ScriptingBridgeGlue")
     ),
@@ -80,6 +84,11 @@ let package = Package(
       name: "NotchKitTests",
       dependencies: ["NotchKit"],
       exclude: agentNotes("Tests/NotchKitTests")
+    ),
+    .testTarget(
+      name: "SpatialAudioKitTests",
+      dependencies: ["SpatialAudioKit"],
+      exclude: agentNotes("Tests/SpatialAudioKitTests")
     ),
     .testTarget(
       name: "PlayerBridgeTests",
