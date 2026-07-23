@@ -12,6 +12,10 @@ Perch を Sony(Tandem)専用から、Bose(BMAP)にも対応させるための調
 > **重要**: 以下のプロトコル知識(バイト列・UUID・アドレス)は事実データであり参照に制約はないが、
 > パーサ/ビルダのコード構造を写経する場合は各 MIT の帰属表示を `THIRD_PARTY_NOTICES.md` に残すこと。
 
+> **参照表**: 機種カタログ(全38)・機能アドレス・enum 値・モード名文字列・機種別 quirks・
+> 未解明 TODO の全数表は [bose-bmap-reference.md](bose-bmap-reference.md) にある(bosectl の
+> APK 解析成果を事実データとして抽出したもの)。実装時はそちらを引く。
+
 ---
 
 ## 1. 結論(先に要点)
