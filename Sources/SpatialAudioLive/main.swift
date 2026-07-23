@@ -142,8 +142,37 @@ func runMultiband(muteOriginal: Bool, autoBalance: Bool, wanderDegrees: Double, 
   if !muteOriginal {
     print("  原音ミュートなし（原音＋空間化版）。")
   }
-  print("何か音楽を再生してください。Ctrl-C で停止。")
-  while true { Thread.sleep(forTimeInterval: 1.0) }
+  print("何か音楽を再生してください。Ctrl-C で停止。\n")
+
+  while true {
+    let state = spatializer.movementState
+    let line =
+      "\r揺らぎ  "
+      + "中央 " + gauge(state.centerAzimuth) + String(format: "%+5.1f°", state.centerAzimuth)
+      + "  左 " + gauge(state.leftAzimuth) + String(format: "%+5.1f°", state.leftAzimuth)
+      + "  右 " + gauge(state.rightAzimuth) + String(format: "%+5.1f°", state.rightAzimuth)
+      + "  拍 " + beatBar(state.beatLevel) + "   "
+    print(line, terminator: "")
+    fflush(stdout)
+    Thread.sleep(forTimeInterval: 0.05)
+  }
+}
+
+/// 方位角（度）を中央基準の横ゲージにする。左が負、右が正。
+func gauge(_ degrees: Double, span: Double = 15, width: Int = 9) -> String {
+  let half = width / 2
+  let clamped = max(-span, min(span, degrees))
+  let position = half + Int((clamped / span) * Double(half))
+  var cells = Array(repeating: "·", count: width)
+  cells[half] = "|"  // 中央（基準位置）
+  cells[max(0, min(width - 1, position))] = "●"
+  return "[" + cells.joined() + "]"
+}
+
+/// 拍の強さ（0〜1）を縦棒のバーにする。
+func beatBar(_ level: Double, width: Int = 6) -> String {
+  let filled = max(0, min(width, Int(level * Double(width) + 0.5)))
+  return String(repeating: "▇", count: filled) + String(repeating: "·", count: width - filled)
 }
 
 @available(macOS 14.4, *)

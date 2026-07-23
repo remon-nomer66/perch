@@ -76,6 +76,13 @@ public final class MultibandSpatializer: @unchecked Sendable {
   private let beatAmplitude: Double  // ラジアン。0 なら拍リアクティブ無効。
   private static let beatDecayTimeConstant = 0.12
 
+  // 表示用: 各音源の現在の揺らぎ量（基準位置からのズレ、ラジアン）。
+  // オーディオスレッドが書き、表示スレッドが読む（表示用途なので競合は無害）。
+  private var offCenterAzimuth = 0.0
+  private var offCenterElevation = 0.0
+  private var offLeftAzimuth = 0.0
+  private var offRightAzimuth = 0.0
+
   // オーディオスレッドから読む可変ゲイン（耳合わせ用。単純なFloatなので競合は軽微）。
   public var lowGain: Float
   public var midGain: Float
@@ -163,13 +170,46 @@ public final class MultibandSpatializer: @unchecked Sendable {
   private func reposition(_ index: Int, base: SphericalDirection, source: Int, time: Double) {
     let drift = wander.offset(source: source, time: time)
     let beat = beatOffset(source: source)
+    let azimuthOffset = drift.azimuth + beat.azimuth
+    let elevationOffset = drift.elevation + beat.elevation
     graph.setPosition(
       index,
       SphericalDirection(
-        azimuth: base.azimuth + drift.azimuth + beat.azimuth,
-        elevation: base.elevation + drift.elevation + beat.elevation,
+        azimuth: base.azimuth + azimuthOffset,
+        elevation: base.elevation + elevationOffset,
         distance: base.distance
       )
+    )
+    switch source {
+    case SourceIndex.center:
+      offCenterAzimuth = azimuthOffset
+      offCenterElevation = elevationOffset
+    case SourceIndex.left:
+      offLeftAzimuth = azimuthOffset
+    case SourceIndex.right:
+      offRightAzimuth = azimuthOffset
+    default:
+      break
+    }
+  }
+
+  /// 表示用の、現在の揺らぎ状態（基準位置からのズレ、度）。
+  public struct MovementState: Sendable {
+    public let centerAzimuth: Double
+    public let centerElevation: Double
+    public let leftAzimuth: Double
+    public let rightAzimuth: Double
+    public let beatLevel: Double
+  }
+
+  public var movementState: MovementState {
+    let toDegrees = 180.0 / Double.pi
+    return MovementState(
+      centerAzimuth: offCenterAzimuth * toDegrees,
+      centerElevation: offCenterElevation * toDegrees,
+      leftAzimuth: offLeftAzimuth * toDegrees,
+      rightAzimuth: offRightAzimuth * toDegrees,
+      beatLevel: beatLevel
     )
   }
 
