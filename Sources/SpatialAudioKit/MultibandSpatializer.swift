@@ -57,6 +57,8 @@ public final class MultibandSpatializer: @unchecked Sendable {
   private var crossoverLeft: Crossover
   private var crossoverRight: Crossover
   private let sideSpread: Double
+  private let sampleRate: Double
+  private var analyzer: BalanceAnalyzer?
   private var tap: SystemAudioTap?
   private let muteOriginal: Bool
 
@@ -74,15 +76,20 @@ public final class MultibandSpatializer: @unchecked Sendable {
   public init(
     config: MultibandConfig = MultibandConfig(),
     muteOriginal: Bool = true,
+    autoBalance: Bool = false,
     sampleRate: Double = 48_000
   ) throws {
     self.muteOriginal = muteOriginal
+    self.sampleRate = sampleRate
     lowGain = config.lowGain
     midGain = config.midGain
     sideWidth = config.sideWidth
     sideSpread = config.sideSpreadDegrees * .pi / 180
     crossoverLeft = Crossover(cutoff: config.crossover, sampleRate: sampleRate)
     crossoverRight = Crossover(cutoff: config.crossover, sampleRate: sampleRate)
+    if autoBalance {
+      analyzer = BalanceAnalyzer(baselineLowGain: config.lowGain, baselineWidth: config.sideWidth)
+    }
 
     graph = try PositionedSourceGraph(sampleRate: sampleRate, sourceCount: 3)
     graph.setAlgorithm(config.quality)
@@ -129,6 +136,22 @@ public final class MultibandSpatializer: @unchecked Sendable {
     guard !left.isEmpty, !right.isEmpty else { return }
     let (lowLeft, highLeft) = crossoverLeft.split(left)
     let (lowRight, highRight) = crossoverRight.split(right)
+
+    // 自動バランス: 各帯域のレベルを測り、低音ゲインと幅をゆっくり追従させる。
+    if analyzer != nil {
+      let count = min(lowLeft.count, lowRight.count, highLeft.count, highRight.count)
+      if count > 0 {
+        analyzer!.observe(
+          lowRMS: Self.rmsOfMean(lowLeft, lowRight, count: count),
+          midRMS: Self.rmsOfMean(highLeft, highRight, count: count),
+          sideRMS: Self.rmsOfDifference(highLeft, highRight, count: count),
+          dt: Double(count) / sampleRate
+        )
+        lowGain = analyzer!.lowGain
+        sideWidth = analyzer!.sideWidth
+      }
+    }
+
     let mixed = Self.mix(
       lowLeft: lowLeft, lowRight: lowRight,
       highLeft: highLeft, highRight: highRight,
@@ -175,5 +198,27 @@ public final class MultibandSpatializer: @unchecked Sendable {
       sideRight[index] = -side
     }
     return (bassLeft, bassRight, center, sideLeft, sideRight)
+  }
+
+  /// (a+b)/2 の RMS（中央成分のレベル）。
+  static func rmsOfMean(_ a: [Float], _ b: [Float], count: Int) -> Double {
+    guard count > 0 else { return 0 }
+    var sum = 0.0
+    for index in 0..<count {
+      let value = (Double(a[index]) + Double(b[index])) * 0.5
+      sum += value * value
+    }
+    return (sum / Double(count)).squareRoot()
+  }
+
+  /// (a−b)/2 の RMS（左右差＝サイド成分のレベル）。
+  static func rmsOfDifference(_ a: [Float], _ b: [Float], count: Int) -> Double {
+    guard count > 0 else { return 0 }
+    var sum = 0.0
+    for index in 0..<count {
+      let value = (Double(a[index]) - Double(b[index])) * 0.5
+      sum += value * value
+    }
+    return (sum / Double(count)).squareRoot()
   }
 }

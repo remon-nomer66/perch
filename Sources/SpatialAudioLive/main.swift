@@ -5,8 +5,9 @@ import SpatialAudioKit
 
 // システム音のリアルタイム空間化（本命）。
 //
-//   引数 multiband : マルチバンド+M/S 空間化（本命）。低音は中央で固く、中高域の
-//                    左右成分を広げる。ミックスの楽器パンを尊重して立体化。
+//   引数 multiband : マルチバンド+M/S 空間化（本命）。低音は両耳へ直通、中高域を空間化。
+//   引数 auto      : multiband に自動バランスを重ねる。直近の音を測り、低音ゲインと
+//                    幅をゆっくり自動追従（曲が変わっても数秒で馴染む）。
 //   引数 tune     : 対話調整モード。再生しながらキー操作で音場を追い込む。
 //   引数 rotate   : リスナーの向きをゆっくり回す効果デモ。
 //   引数 nomute   : 原音をミュートしない（原音＋空間化版を同時に鳴らして比較）。
@@ -39,14 +40,15 @@ func disableRawInput() {
 @available(macOS 14.4, *)
 func runLive() -> Never {
   let arguments = Set(CommandLine.arguments.dropFirst())
-  let multiband = arguments.contains("multiband")
+  let auto = arguments.contains("auto")
+  let multiband = arguments.contains("multiband") || auto
   let tune = arguments.contains("tune")
   let rotate = arguments.contains("rotate")
   // 既定は空間化版だけを流す（調整・本番とも耳で判断しやすい）。nomute で無効化。
   let muteOriginal = !arguments.contains("nomute")
 
   if multiband {
-    runMultiband(muteOriginal: muteOriginal)
+    runMultiband(muteOriginal: muteOriginal, autoBalance: auto)
   }
 
   let live: LiveSpatializer
@@ -85,10 +87,10 @@ func runLive() -> Never {
 }
 
 @available(macOS 14.4, *)
-func runMultiband(muteOriginal: Bool) -> Never {
+func runMultiband(muteOriginal: Bool, autoBalance: Bool) -> Never {
   let spatializer: MultibandSpatializer
   do {
-    spatializer = try MultibandSpatializer(muteOriginal: muteOriginal)
+    spatializer = try MultibandSpatializer(muteOriginal: muteOriginal, autoBalance: autoBalance)
   } catch {
     fail("マルチバンド初期化に失敗: \(error)")
   }
@@ -99,11 +101,12 @@ func runMultiband(muteOriginal: Bool) -> Never {
   }
 
   let format = spatializer.captureFormat
-  print("マルチバンド + M/S 空間化中。")
+  print("マルチバンド + M/S 空間化中。低音は両耳へ直通、中高域を空間化しています。")
   print(String(format: "  取得フォーマット: %.0f Hz / %u ch", format.mSampleRate, format.mChannelsPerFrame))
-  if muteOriginal {
-    print("  原音はミュート中。低音は中央で固く、中高域の左右成分を広げています。")
-  } else {
+  if autoBalance {
+    print("  自動バランス: ON。直近の音を測り、低音ゲインと幅をゆっくり追従します。")
+  }
+  if !muteOriginal {
     print("  原音ミュートなし（原音＋空間化版）。")
   }
   print("何か音楽を再生してください。Ctrl-C で停止。")
