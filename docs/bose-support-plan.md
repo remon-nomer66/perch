@@ -198,7 +198,7 @@ Sony は「device 申告からの feature inventory」と「verified profile に
 
 横に長いレイヤ順(protocol→rfcomm→ble→session→…)は、最も不確実な BLE identity と共通型が後回しで実機失敗リスクが高い。**共通契約 + 縦切り**へ組み替える。各段階の**完了条件にテストと由来表記(MIT notice)を含める**(後段に送らない)。支流は `feature/bose-support` から切る。
 
-1. **spec-freeze** — BMAP 表の矛盾解消(CNC/モードスロット/CONNECT・ACK/ModeConfig offset を確定)、各値の確認度・fixture 由来・対応宣言機種の明示。**実機なしで可**。
+1. **spec-freeze** ✅ 完了 → [bose-frozen-spec.md](bose-frozen-spec.md)。BMAP の矛盾を実コード+実機キャプチャで裁定(CNC バイト順・CONNECT/ACK・ModeConfig offset・モードスロット・バッテリ形状・ANR ワイヤ値・config 軸)。fixture 由来 commit と PII 置換要件、第一段階の実装対象機種(wolverine 0x4082 / qc35 系)を確定。
 2. **device-contract**(`bose/device-abstraction` を前倒し)— 共通 snapshot/capability/command、接続状態、write trust、shared transport target のグラフを確定。**API を先に決める**。
 3. **protocol-core**(`bose/protocol-core`)— フレーム codec / stream parser / ERROR / BLE segmenter。**純粋テストをここで実施**。※ 矛盾した capture から機能 parser/catalog を作り込むのは spec-freeze 完了後。
 4. **scripted-session** — mock channel + injected clock で single/multi/set→poll/cancellation を完成。**実機なしで可**。
