@@ -19,18 +19,18 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.1</string>
+	<string>1.0.0</string>
 	<key>CFBundleVersion</key>
 	<string>1</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
 	<key>LSUIElement</key>
 	<true/>
-	<key>NSHighResolutionCapable</key>
-	<true/>
-	<key>NSBluetoothAlwaysUsageDescription</key>
-	<string>Perch uses Bluetooth to read the status of your connected headphones and change their settings.</string>
 	<key>NSAppleEventsUsageDescription</key>
 	<string>Perch communicates with music apps to show and control playback, and with browsers to switch sound settings automatically for the site you are watching.</string>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>Perch uses Bluetooth to read the status of your connected headphones and change their settings.</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
 </dict>
 </plist>
