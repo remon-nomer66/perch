@@ -28,3 +28,37 @@ func ruleRoundTripsThroughCodable() throws {
   let decoded = try JSONDecoder().decode(SoundRule.self, from: data)
   #expect(decoded == rule)
 }
+
+@Test("A rule stored before deviceModel existed still decodes, with deviceModel nil")
+func legacyJSONDecodesWithNilDeviceModel() throws {
+  // The exact on-disk shape a released build wrote: no deviceModel key, the trigger
+  // as a single-key object, noise/listening as raw strings, the preset as a number.
+  let legacy = #"""
+  {"noise":"ambient","equalizerPreset":160,"id":"E88A355F-A7A1-4366-889A-39AC30D7910C","trigger":{"site":{"_0":"example.com"}},"listening":"standard"}
+  """#
+  let decoded = try JSONDecoder().decode(SoundRule.self, from: Data(legacy.utf8))
+  #expect(decoded.trigger == .site("example.com"))
+  #expect(decoded.deviceModel == nil)  // absent key ⇒ "all devices" (grandfathered)
+  #expect(decoded.noise == .ambient)
+  #expect(decoded.equalizerPreset == 0xA0)
+  #expect(decoded.listening == .standard)
+}
+
+@Test("A new rule defaults to no device scope")
+func newRuleDefaultsToNoDeviceScope() {
+  #expect(SoundRule(trigger: .app("com.spotify.client")).deviceModel == nil)
+}
+
+@Test("An artist rule with a device scope round-trips through Codable")
+func artistRuleRoundTrips() throws {
+  var rule = SoundRule(trigger: .artist("YOASOBI"))
+  rule.deviceModel = "WH-1000XM6"
+  rule.noise = .noiseCancelling
+  rule.equalizerPreset = 0x01
+  rule.listening = .standard
+  let data = try JSONEncoder().encode(rule)
+  let decoded = try JSONDecoder().decode(SoundRule.self, from: data)
+  #expect(decoded == rule)
+  #expect(decoded.trigger == .artist("YOASOBI"))
+  #expect(decoded.deviceModel == "WH-1000XM6")
+}

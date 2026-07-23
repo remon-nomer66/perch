@@ -395,7 +395,7 @@ final class AppModel: ObservableObject {
   }
   private var ruleHold: RuleHold?
 
-  func playingSource() async -> String? { await nowPlayingService.playingBundleID() }
+  func playingNow() async -> NowPlayingService.Playing? { await nowPlayingService.playing() }
 
   /// Applies the matched rule, first undoing whichever rule held before it.
   ///
@@ -854,30 +854,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
           // releasing an existing hold may run under it: the engine freezes as it
           // stands and resumes once the preview ends.
         } else if settingsStore.isRulesEnabled, !settingsStore.rules.isEmpty {
-          // The playing player is what the ears are on; while none plays, a rule's
-          // app matches by being frontmost and site rules speak through the visible
-          // tabs. The rule list's order settles any tie.
-          let playing = await model.playingSource()
+          let rules = settingsStore.rules
+          // The playing player is what the ears are on; while none plays, an app rule
+          // matches by being frontmost and site rules speak through the visible tabs.
+          let playing = await model.playingNow()
           let frontmost =
             playing == nil ? NSWorkspace.shared.frontmostApplication?.bundleIdentifier : nil
-          // Browsers are only asked while a site rule could use the answer: the
-          // query is what surfaces the automation-permission prompts and reads the
-          // open tabs, and a rule set of app triggers justifies neither.
-          let hasSiteRule = settingsStore.rules.contains { rule in
-            if case .site = rule.trigger { return true }
+          // Browsers are only asked while a rule could use the answer, and only while no
+          // player is playing: the query is what surfaces the automation prompts and
+          // reads the tabs. Hosts feed site rules; titles feed artist rules for the video
+          // pages the player APIs cannot see. An app-only rule set justifies neither.
+          let idle = playing == nil
+          let hasSiteRule = rules.contains {
+            if case .site = $0.trigger { return true }
             return false
           }
-          let hosts =
-            playing == nil && hasSiteRule ? await SiteWatcher.visibleTabHosts() : []
-          let matched = settingsStore.rules.first { rule in
-            switch rule.trigger {
-            case .app(let bundleID):
-              playing == bundleID || (playing == nil && frontmost == bundleID)
-            case .site(let domain):
-              playing == nil && SiteWatcher.matches(hosts: hosts, sites: [domain])
-            }
+          let hasArtistRule = rules.contains {
+            if case .artist = $0.trigger { return true }
+            return false
           }
-          model.applyRule(matched, using: service)
+          let hosts = idle && hasSiteRule ? await SiteWatcher.visibleTabHosts() : []
+          let titles = idle && hasArtistRule ? await SiteWatcher.visibleTabTitles() : []
+          let context = RuleMatcher.Context(
+            deviceModel: model.panel.summary.modelName,
+            playingBundleID: playing?.bundleID,
+            playingArtist: playing?.artist,
+            frontmostBundleID: frontmost,
+            browserHosts: hosts,
+            browserTitles: titles
+          )
+          model.applyRule(RuleMatcher.match(rules, in: context), using: service)
         } else {
           model.applyRule(nil, using: service)
         }

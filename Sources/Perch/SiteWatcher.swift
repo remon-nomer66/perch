@@ -31,8 +31,24 @@ enum SiteWatcher {
       #"tell application "Brave Browser" to return URL of active tab of (every window whose minimized is false)"#,
   ]
 
+  /// The same windows, asked for their front tab's title instead of its URL — the artist
+  /// a video page shows lives there, where the player scripting APIs cannot reach it.
+  private static let browserTitleScripts: [String: String] = [
+    "com.apple.Safari":
+      #"tell application "Safari" to return name of current tab of (every window whose visible is true and miniaturized is false)"#,
+    "com.google.Chrome":
+      #"tell application "Google Chrome" to return title of active tab of (every window whose minimized is false)"#,
+    "com.microsoft.edgemac":
+      #"tell application "Microsoft Edge" to return title of active tab of (every window whose minimized is false)"#,
+    "com.brave.Browser":
+      #"tell application "Brave Browser" to return title of active tab of (every window whose minimized is false)"#,
+  ]
+
   private static let queue = AppleEventQueue(label: "Perch.SiteWatcher")
   private static let gate = AppleEventQueue.Gate()
+  /// A gate of its own: the title query and the host query run on their own cadences and
+  /// must only skip for their own stuck rounds.
+  private static let titleGate = AppleEventQueue.Gate()
 
   /// The hosts on every running browser window's front tab. Empty when no known
   /// browser runs, none shows a window, automation has not been granted yet, or the
@@ -46,16 +62,38 @@ enum SiteWatcher {
     return await queue.perform(gate: gate, fallback: []) { hosts(from: scripts) }
   }
 
+  /// The titles on every running browser window's front tab. Same access and caveats as
+  /// `visibleTabHosts`: empty when no known browser runs, none shows a window, automation
+  /// has not been granted, or the browsers take longer to answer than a rule pass waits.
+  static func visibleTabTitles() async -> [String] {
+    let running = Set(NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier))
+    let scripts = browserTitleScripts.filter { running.contains($0.key) }.map(\.value)
+    guard !scripts.isEmpty else { return [] }
+    return await queue.perform(gate: titleGate, fallback: []) { titles(from: scripts) }
+  }
+
   /// The Apple Events denial, `errAEEventNotPermitted`: automation for the target
   /// was refused in System Settings (or the consent dialog was dismissed).
   private nonisolated static let eventNotPermitted = -1743
 
-  /// Runs on the queue. A browser whose script errors — permission not granted,
-  /// above all — contributes no hosts rather than failing the others. A refusal is
-  /// reported so the rules screen can say why site rules stopped matching; a browser
-  /// answering clears it again, that being the only way a later grant shows itself.
+  /// Runs on the queue. The hosts on the front tabs, from the URLs the browsers report.
   private nonisolated static func hosts(from scripts: [String]) -> [String] {
-    var hosts: [String] = []
+    rawStrings(from: scripts).compactMap { URL(string: $0)?.host?.lowercased() }
+  }
+
+  /// Runs on the queue. The front tabs' titles, verbatim — an artist name is sought
+  /// inside them, so they are not parsed here.
+  private nonisolated static func titles(from scripts: [String]) -> [String] {
+    rawStrings(from: scripts)
+  }
+
+  /// Runs each browser's script and gathers the string list it returns. A browser whose
+  /// script errors — permission not granted, above all — contributes nothing rather than
+  /// failing the others. A refusal is reported so the rules screen can say why
+  /// browser-driven rules stopped matching; a browser answering clears it again, that
+  /// being the only way a later grant shows itself.
+  private nonisolated static func rawStrings(from scripts: [String]) -> [String] {
+    var values: [String] = []
     var sawDenial = false
     var sawAnswer = false
     for source in scripts {
@@ -67,11 +105,11 @@ enum SiteWatcher {
         continue
       }
       sawAnswer = true
-      hosts.append(contentsOf: strings(from: result).compactMap { URL(string: $0)?.host?.lowercased() })
+      values.append(contentsOf: strings(from: result))
     }
     if sawDenial || sawAnswer {
       // A denial outweighs another browser answering: as long as any browser is
-      // refused, some site rules are blind and the warning has cause to stand.
+      // refused, some rules are blind and the warning has cause to stand.
       let denied = sawDenial
       Task { @MainActor in
         denied
@@ -79,7 +117,7 @@ enum SiteWatcher {
           : AutomationPermission.shared.noteBrowserAnswered()
       }
     }
-    return hosts
+    return values
   }
 
   /// A single window comes back as a bare string, several as a list; flatten both.
@@ -93,8 +131,9 @@ enum SiteWatcher {
 
   /// A registered `example.com` matches the host `example.com` and every subdomain.
   /// Both sides shed a leading `www.` — it names the same site, and rules stored by
-  /// an earlier build may still carry it.
-  static func matches(hosts: [String], sites: [String]) -> Bool {
+  /// an earlier build may still carry it. Pure, hence `nonisolated`: the rule matcher
+  /// calls it off the main actor.
+  nonisolated static func matches(hosts: [String], sites: [String]) -> Bool {
     hosts.contains { host in
       let host = strippingWWW(host.lowercased())
       return sites.contains { site in
@@ -128,7 +167,7 @@ enum SiteWatcher {
     return candidate
   }
 
-  private static func strippingWWW(_ host: String) -> String {
+  nonisolated private static func strippingWWW(_ host: String) -> String {
     host.hasPrefix("www.") ? String(host.dropFirst("www.".count)) : host
   }
 }

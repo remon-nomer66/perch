@@ -38,6 +38,18 @@ public final class NowPlayingService: Sendable {
     }
   }
 
+  /// A playing player and the artist it reports, read together so an artist rule is
+  /// judged against the same player the transport controls drive.
+  public struct Playing: Equatable, Sendable {
+    public let bundleID: String
+    public let artist: String?
+
+    public init(bundleID: String, artist: String?) {
+      self.bundleID = bundleID
+      self.artist = artist
+    }
+  }
+
   /// Spotify reports track duration in milliseconds; Music in seconds. Everything else
   /// about the two scripting interfaces lines up, so one protocol serves both.
   private struct Source {
@@ -84,6 +96,14 @@ public final class NowPlayingService: Sendable {
     return await queue.perform(gate: playingGate, fallback: nil) {
       Self.playingBundleID(sources, delegate)
     }
+  }
+
+  /// The playing player's identifier and the artist it reports, in one query — what an
+  /// artist rule is judged by. Nil while nothing is playing.
+  public func playing() async -> Playing? {
+    let sources = self.sources
+    let delegate = self.failureDelegate
+    return await queue.perform(gate: playingGate, fallback: nil) { Self.playing(sources, delegate) }
   }
 
   public func playPause() { post { $0.playpause?() } }
@@ -139,6 +159,19 @@ public final class NowPlayingService: Sendable {
         player.playerState == .playing
       {
         return source.bundleID
+      }
+    }
+    return nil
+  }
+
+  private static func playing(
+    _ sources: [Source], _ delegate: EventFailureDelegate?
+  ) -> Playing? {
+    for source in sources {
+      if let player = runningPlayer(source.bundleID, delegate),
+        player.playerState == .playing
+      {
+        return Playing(bundleID: source.bundleID, artist: player.currentTrack?.artist)
       }
     }
     return nil
