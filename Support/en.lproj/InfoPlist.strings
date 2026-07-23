@@ -1,0 +1,4 @@
+/* Permission prompts. Info.plist carries the same English text as the default;
+   this file keeps the English localization explicit alongside ja.lproj. */
+"NSBluetoothAlwaysUsageDescription" = "Perch uses Bluetooth to read the status of your connected headphones and change their settings.";
+"NSAppleEventsUsageDescription" = "Perch communicates with music apps to show and control playback, and with browsers to switch sound settings automatically for the site you are watching.";

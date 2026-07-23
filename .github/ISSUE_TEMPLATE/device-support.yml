@@ -1,0 +1,66 @@
+name: 機器の対応申請
+description: 読み取りはできるが書き込みに対応していない機器の、対応を申請する
+title: "[device] "
+labels:
+  - device-support
+  - needs-verification
+body:
+  - type: markdown
+    attributes:
+      value: |
+        アプリの「対応を申請」から開いた場合、下の「機器が申告した内容」は入力済みです。
+
+        本文が長くURLに収まらなかった場合は空になります。その場合はアプリが本文を
+        クリップボードへ渡しているので、貼り付けてください。
+
+        **このIssueは公開されます。** 入力済みの内容には、Bluetoothアドレス、機器の
+        個体識別子、マルチポイントの接続先名を含みません。手で書き足す際もこれらを
+        載せないでください。
+
+  - type: textarea
+    id: report
+    attributes:
+      label: 機器が申告した内容
+      description: アプリが生成した内容。手で書き換えないでください。
+      render: markdown
+    validations:
+      required: true
+
+  - type: textarea
+    id: wanted
+    attributes:
+      label: 使いたい機能
+      description: |
+        どの機能を操作したいかを書いてください。上の表の機能名で示せると確実です。
+      placeholder: |
+        例: ノイズキャンセリングと外音取り込みの切り替え、イコライザーのプリセット選択
+    validations:
+      required: true
+
+  - type: dropdown
+    id: verification
+    attributes:
+      label: 実機での確認に協力できますか
+      description: |
+        機器が機能を申告していることと、実際にその機能を操作できることは別です。
+        書き込みの対応は、実機で読み戻して意図どおりになることを確かめてから入ります。
+        確認に協力いただける場合、対応が入るまでの往復が短くなります。
+      options:
+        - はい。試用版を試して結果を報告できる
+        - いいえ。申請だけしたい
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: acknowledgements
+    attributes:
+      label: 確認
+      options:
+        - label: この内容が公開されることを理解している
+          required: true
+        - label: 自分が所有する機器で取得した内容である
+          required: true
+        - label: |
+            対応が入る保証はないこと、また申告されている機能でも実機で操作できない
+            場合があることを理解している
+          required: true

@@ -1,0 +1,85 @@
+name: 対応申請の受付
+
+on:
+  issues:
+    types: [opened, edited, labeled]
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  validate:
+    if: contains(github.event.issue.labels.*.name, 'device-support')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 機械可読ブロックを取り出して検査する
+        id: extract
+        # Issueの本文は第三者が書ける。`${{ }}` でスクリプトへ直接埋め込むと、
+        # 本文の中身がそのままシェルとして実行されうる。環境変数として渡し、
+        # スクリプトからは値としてしか触れないようにする。
+        env:
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: |
+          set -o pipefail
+          if printf '%s' "$ISSUE_BODY" \
+              | python3 tools/extract-device-report.py > report.json 2> problems.txt; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 読み取れた内容を要約して返す
+        if: steps.extract.outputs.ok == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
+        # コメントは Markdown として描画される。機種名・firmware は第三者が
+        # 書ける値なので、生の値ではなく extract-device-report.py が置換済みの
+        # 表示専用値(display)だけを埋め込む。生の値をここへ足さないこと。
+        run: |
+          python3 - > comment.md <<'PY'
+          import json
+          d = json.load(open("report.json"))
+          shown = d["display"]
+          t1, t2 = d["table1Functions"], d["table2Functions"]
+          unknown = [f for f in t1 + t2 if f.get("name") is None]
+          print("申請の内容を読み取れました。\n")
+          print(f"- 機種: `{shown['modelName']}` / firmware `{shown['firmwareVersion']}`")
+          print(f"- 申告された機能: table 1 が {len(t1)} 件、table 2 が {len(t2)} 件")
+          if unknown:
+              codes = ", ".join(f"`0x{f['code']:02X}`" for f in unknown)
+              print(f"- このリポジトリの対応表に無い機能が {len(unknown)} 件: {codes}")
+              print("  対応表より新しい機種またはfirmwareの可能性があります。")
+          print()
+          print("機能が申告されていることと、実際に操作できることは別です。"
+                "書き込みの対応は実機で読み戻して確かめてから入ります。")
+          PY
+          gh issue comment "$ISSUE" --repo "$REPO" --body-file comment.md
+          gh issue edit "$ISSUE" --repo "$REPO" --remove-label "needs-report" || true
+
+      - name: 読み取れなかったことを伝える
+        if: steps.extract.outputs.ok == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          # problems.txt はスクリプト自身の定型文だけを含むが、万一 ``` が
+          # 紛れてもフェンスを破れないよう、一段長いフェンスで囲む。
+          {
+            echo "申請の機械可読ブロックを読み取れませんでした。"
+            echo
+            echo '````'
+            cat problems.txt
+            echo '````'
+            echo
+            echo "アプリの「対応を申請」から開き直すと、正しい内容が入力されます。"
+            echo "本文が長くURLに収まらなかった場合は、アプリがクリップボードへ渡した"
+            echo "内容をそのまま貼り付けてください。"
+          } > comment.md
+          gh issue comment "$ISSUE" --repo "$REPO" --body-file comment.md
+          gh issue edit "$ISSUE" --repo "$REPO" --add-label "needs-report" || true

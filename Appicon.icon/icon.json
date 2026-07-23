@@ -1,0 +1,58 @@
+{
+  "fill" : {
+    "solid" : "extended-gray:0.00000,1.00000"
+  },
+  "groups" : [
+    {
+      "layers" : [
+        {
+          "image-name" : "finder4.png",
+          "name" : "finder4"
+        },
+        {
+          "glass" : true,
+          "image-name" : "finder3.png",
+          "name" : "finder3"
+        }
+      ],
+      "shadow" : {
+        "kind" : "neutral",
+        "opacity" : 0.5
+      },
+      "translucency" : {
+        "enabled" : true,
+        "value" : 0.5
+      }
+    },
+    {
+      "layers" : [
+        {
+          "image-name" : "finder2 2.png",
+          "name" : "finder2 2"
+        },
+        {
+          "image-name" : "finder1 2.png",
+          "name" : "finder1 2"
+        },
+        {
+          "image-name" : "finder 2.png",
+          "name" : "finder 2"
+        }
+      ],
+      "shadow" : {
+        "kind" : "neutral",
+        "opacity" : 0.5
+      },
+      "translucency" : {
+        "enabled" : true,
+        "value" : 0.5
+      }
+    }
+  ],
+  "supported-platforms" : {
+    "circles" : [
+      "watchOS"
+    ],
+    "squares" : "shared"
+  }
+}
