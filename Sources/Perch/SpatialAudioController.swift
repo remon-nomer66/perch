@@ -100,16 +100,18 @@ final class SpatialAudioController: ObservableObject {
     }
   }
 
-  /// Waits for capture to actually begin, giving a first-time permission prompt time to
-  /// be answered. On the first buffer it commits to on; if none arrives it reverts and
-  /// puts the original audio back, so a denial never strands the user in silence.
+  /// Waits for *real* capture — a non-silent sample — before committing to on. A denied
+  /// permission still fires callbacks, but with silence, so callbacks alone are not
+  /// proof. On the first real audio it commits; otherwise it reverts and puts the
+  /// original audio back, so neither a denial nor a stuck tap strands the user in silence.
   private func confirmCapture() {
     verifyTask = Task { @MainActor [weak self] in
-      for _ in 0..<15 {
+      // Poll for a while so a first-time prompt can be answered and some audio can play.
+      for _ in 0..<20 {
         try? await Task.sleep(for: .milliseconds(400))
         guard let self, !Task.isCancelled, self.isStarting else { return }
         if #available(macOS 14.4, *),
-          (self.engine as? MultibandSpatializer)?.hasReceivedAudio == true {
+          (self.engine as? MultibandSpatializer)?.hasAudioSignal == true {
           self.isStarting = false
           self.isEnabled = true
           self.errorMessage = nil
@@ -117,11 +119,11 @@ final class SpatialAudioController: ObservableObject {
         }
       }
       guard let self, self.isStarting else { return }
-      NSLog("Perch spatial: no audio captured; reverting (permission likely denied)")
+      NSLog("Perch spatial: no audio signal captured; reverting (permission denied or nothing playing)")
       self.teardown()
       self.errorMessage = L(
-        "音声を取得できませんでした。システムオーディオ録音の許可を確認してください。",
-        "No audio was captured. Check the system audio recording permission."
+        "音声を取得できませんでした。何か再生しているか確認し、「システムオーディオ録音」の許可をオンにしてください。",
+        "No audio was captured. Make sure something is playing, and turn on the System Audio Recording permission."
       )
     }
   }
