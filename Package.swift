@@ -45,6 +45,15 @@ let package = Package(
       name: "BoseCore",
       exclude: agentNotes("Sources/BoseCore")
     ),
+    // Bose BMAP session layer: transport-abstracted request model over BoseCore.
+    // No IOBluetooth / CoreBluetooth yet — the real transports arrive in stage 5 and
+    // will conform to `BmapChannel`; today only the protocol and its mock exist, so the
+    // whole layer builds and tests without hardware.
+    .target(
+      name: "BoseSession",
+      dependencies: ["BoseCore"],
+      exclude: agentNotes("Sources/BoseSession")
+    ),
     .target(
       name: "TandemSession",
       dependencies: ["TandemCore"],
@@ -94,6 +103,11 @@ let package = Package(
       name: "BoseCoreTests",
       dependencies: ["BoseCore"],
       exclude: agentNotes("Tests/BoseCoreTests")
+    ),
+    .testTarget(
+      name: "BoseSessionTests",
+      dependencies: ["BoseSession"],
+      exclude: agentNotes("Tests/BoseSessionTests")
     ),
     .testTarget(
       name: "TandemSessionTests",
