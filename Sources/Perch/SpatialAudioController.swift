@@ -19,6 +19,9 @@ final class SpatialAudioController: ObservableObject {
   /// system-audio prompt is up, or the first buffers are still on their way.
   @Published private(set) var isStarting = false
   @Published private(set) var errorMessage: String?
+  /// The tempo the engine hears in whatever is playing, rounded to whole BPM.
+  /// nil while off, or while no steady beat can be found.
+  @Published private(set) var estimatedBPM: Double?
 
   @Published var autoBalance: Bool {
     didSet {
@@ -43,6 +46,7 @@ final class SpatialAudioController: ObservableObject {
   /// macOS 14.4 (it is created only inside availability checks).
   private var engine: AnyObject?
   private var verifyTask: Task<Void, Never>?
+  private var tempoTask: Task<Void, Never>?
   private let defaults: UserDefaults
 
   /// Core Audio process taps — how the system audio is captured — arrived in macOS 14.4.
@@ -119,6 +123,7 @@ final class SpatialAudioController: ObservableObject {
           self.isStarting = false
           self.isEnabled = true
           self.errorMessage = nil
+          self.startTempoPolling()
           return
         }
       }
@@ -180,9 +185,30 @@ final class SpatialAudioController: ObservableObject {
     }
   }
 
+  /// Follows the engine's tempo estimate while capture runs. The engine object may be
+  /// rebuilt underneath (option changes) — each tick reads whatever engine is current,
+  /// so one task survives reconfigurations.
+  private func startTempoPolling() {
+    tempoTask?.cancel()
+    tempoTask = Task { @MainActor [weak self] in
+      while !Task.isCancelled {
+        guard let self, self.isEnabled else { return }
+        if #available(macOS 14.4, *) {
+          let bpm = (self.engine as? MultibandSpatializer)?
+            .movementState.estimatedBPM.map { $0.rounded() }
+          if self.estimatedBPM != bpm { self.estimatedBPM = bpm }
+        }
+        try? await Task.sleep(for: .milliseconds(500))
+      }
+    }
+  }
+
   private func teardown() {
     verifyTask?.cancel()
     verifyTask = nil
+    tempoTask?.cancel()
+    tempoTask = nil
+    estimatedBPM = nil
     if #available(macOS 14.4, *) {
       (engine as? MultibandSpatializer)?.stop()
     }
