@@ -207,6 +207,8 @@ func runBGM(bpm: Double, autoBalance: Bool, wanderDegrees: Double, beatDegrees: 
 func runMovementDisplay(_ spatializer: MultibandSpatializer) -> Never {
   while true {
     let state = spatializer.movementState
+    // ♪ は揺らぎがテンポに同期していることを示す。
+    let syncMark = state.wanderSyncWeight > 0.7 ? "♪" : " "
     let tempoText = state.estimatedBPM.map { String(format: "%3.0f", $0) } ?? "---"
     let line =
       "\r揺らぎ  "
@@ -214,7 +216,7 @@ func runMovementDisplay(_ spatializer: MultibandSpatializer) -> Never {
       + "  左 " + gauge(state.leftAzimuth) + String(format: "%+5.1f°", state.leftAzimuth)
       + "  右 " + gauge(state.rightAzimuth) + String(format: "%+5.1f°", state.rightAzimuth)
       + "  拍 " + String(format: "%4.2f ", state.beatLevel) + beatBar(state.beatLevel)
-      + "  テンポ " + tempoText + " BPM   "
+      + "  テンポ " + tempoText + " BPM" + syncMark + "   "
     print(line, terminator: "")
     fflush(stdout)
     Thread.sleep(forTimeInterval: 0.05)
