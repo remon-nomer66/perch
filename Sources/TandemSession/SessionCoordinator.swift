@@ -166,6 +166,29 @@ public actor SessionCoordinator {
   public var unsupportedReason: TandemDeviceVerificationFailure? { rejection }
   public var readings: DeviceReadings { latestReadings }
 
+  /// Everything a panel refresh needs, read in one actor hop so the fields are always
+  /// of the same instant. Taken one accessor at a time, an `invalidate()` could land
+  /// between them and hand the panel a `.ready` phase with a nil fingerprint for a
+  /// frame; with device-scoped rules that momentary nil model name unmatched a rule and
+  /// set noise/EQ flapping. A single hop cannot be interrupted.
+  public struct Snapshot: Sendable {
+    public let phase: SessionState.Phase
+    public let fingerprint: TandemDeviceFingerprint?
+    public let unsupportedReason: TandemDeviceVerificationFailure?
+    public let acceptsWrites: Bool
+    public let readings: DeviceReadings
+  }
+
+  public var snapshot: Snapshot {
+    Snapshot(
+      phase: state.phase,
+      fingerprint: fingerprint,
+      unsupportedReason: rejection,
+      acceptsWrites: acceptsWrites,
+      readings: latestReadings
+    )
+  }
+
   public private(set) lazy var deviceNotifications: AsyncStream<TandemFrame> = {
     let (stream, continuation) = AsyncStream<TandemFrame>.makeStream(
       bufferingPolicy: .bufferingNewest(64)
@@ -369,6 +392,7 @@ public actor SessionCoordinator {
 
     case .data(let frame):
       guard var request = inFlight, request.epoch == epoch, request.matches(frame) else {
+        applyUnsolicited(frame)
         gestureLog = gestureLog.recording(frame.payload)
         notifications?.yield(frame)
         return
@@ -378,6 +402,52 @@ public actor SessionCoordinator {
       endSendTurn()
       request.continuation.resume(returning: frame)
     }
+  }
+
+  /// A setting changed on the device itself — a touch on the headset, or a change made
+  /// from the phone app — is announced over the channel as an unsolicited frame, not as
+  /// a reply to a request. The periodic read folds such a change in eventually, but only
+  /// on its slow keepalive cadence (up to a reading interval later), which is why a
+  /// noise-control change made by touch took many seconds to reach the panel. Parsing
+  /// the notification here updates the reading at once, so the panel reflects a physical
+  /// change within a refresh tick.
+  ///
+  /// Only a noise-control parameter — what a headphone touch actually changes — is
+  /// handled; every other unsolicited frame is left untouched for the notification
+  /// stream and the gesture log. The reading's shape (modes, field count, wind kind) is
+  /// carried over from what was read, since the notification alone does not restate it.
+  private func applyUnsolicited(_ frame: TandemFrame) {
+    guard let reading = latestReadings.noiseControl else { return }
+    let bytes = [UInt8](frame.payload)
+    guard bytes.count >= 2, bytes[1] == reading.inquiry else { return }
+    // The device announces a noise-control change with either the return (0x67) or the
+    // notify (0x69) command — the same two the write's read-back listens for.
+    let state: TandemNoiseControlState
+    switch bytes[0] {
+    case 0x67:
+      guard
+        let parsed = try? TandemNoiseControlProtocol.parseParameterResponse(
+          frame, inquiry: reading.inquiry)
+      else { return }
+      state = parsed
+    case 0x69:
+      guard
+        let parsed = try? TandemNoiseControlProtocol.parseParameterNotification(
+          frame, inquiry: reading.inquiry)
+      else { return }
+      state = parsed
+    default:
+      return
+    }
+    guard state != reading.state else { return }
+    latestReadings.noiseControl = NoiseControlReading(
+      inquiry: reading.inquiry,
+      modes: reading.modes,
+      state: state,
+      valueFieldCount: max(bytes.count - 2, reading.valueFieldCount),
+      legacyWindKind: reading.inquiry == TandemNoiseControlProtocol.legacyInquiry && bytes.count > 3
+        ? bytes[3] : reading.legacyWindKind
+    )
   }
 
   private func failPending(with failure: RequestFailure) {

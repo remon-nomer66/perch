@@ -1,6 +1,28 @@
 import AppKit
 import SwiftUI
 
+/// What the hosted view needs to draw the notch in one value: the state it is in,
+/// where the cutout sits, and whether it was synthesised on a screen with none — the
+/// last so the view can rest a virtual notch as a thin sliver rather than a full bar.
+///
+/// Passed through from the controller, which owns the geometry, so the view never has
+/// to re-derive the cutout from `NSScreen` (where a virtual notch does not exist).
+public struct NotchRender: Equatable, Sendable {
+  public let presentation: NotchPresenter.Presentation
+  public let notchRect: CGRect
+  public let isVirtual: Bool
+
+  public init(
+    presentation: NotchPresenter.Presentation,
+    notchRect: CGRect,
+    isVirtual: Bool
+  ) {
+    self.presentation = presentation
+    self.notchRect = notchRect
+    self.isVirtual = isVirtual
+  }
+}
+
 extension NSScreen {
   public var notchGeometry: ScreenNotchGeometry? {
     ScreenNotchGeometry.resolve(
@@ -13,6 +35,19 @@ extension NSScreen {
 
   public static var withNotch: NSScreen? {
     screens.first { $0.notchGeometry != nil }
+  }
+
+  /// A notch made up over this screen's menu bar, for a display that has no real one.
+  /// Nil when the screen genuinely has a cutout — that one is used instead.
+  ///
+  /// The menu bar height is read from the gap the visible frame leaves at the top, and
+  /// floored so a globally auto-hidden menu bar still yields a sensible band to sit in.
+  public func virtualNotchGeometry(width: CGFloat) -> ScreenNotchGeometry? {
+    guard notchGeometry == nil else { return nil }
+    let menuBarHeight = Swift.max(frame.maxY - visibleFrame.maxY, 24)
+    return ScreenNotchGeometry.synthesized(
+      screenFrame: frame, menuBarHeight: menuBarHeight, width: width
+    )
   }
 }
 
@@ -31,6 +66,9 @@ public final class NotchController: ObservableObject {
   /// global too — but a view hosted in the strip window must shift positions by the
   /// notch screen's own `minX` before drawing by this rect.
   @Published public private(set) var notchRect: CGRect = .zero
+  /// Whether the notch now on screen was synthesised on a display with no cutout. The
+  /// hosted view reads this to rest as a thin sliver instead of drawing a full bar.
+  @Published public private(set) var isVirtualNotch = false
   public private(set) var hasUsableNotch = false
   public var onUsableNotchChanged: ((Bool) -> Void)?
   /// Asked whether the closed bar is currently drawn at its widened size. Left unset,
@@ -41,22 +79,36 @@ public final class NotchController: ObservableObject {
 
   private let pointer = PointerMonitor()
   private var window: NotchWindow?
+  /// Whether `start()` is in effect. `refresh()` leans on it so a settings change
+  /// cannot rebuild a notch the user has switched off.
+  private var isRunning = false
   private var geometry: ScreenNotchGeometry?
   /// The notch screen's frame, kept so the strip and the panel rect can be re-derived
   /// on every pointer event without asking AppKit for the screen list each time.
   private var screenFrame: CGRect?
   private var screenObserver: (any NSObjectProtocol)?
   private var presenter: NotchPresenter
-  private let content: (NotchPresenter.Presentation) -> AnyView
+  private let content: (NotchRender) -> AnyView
   /// Read on every hit test so a change in the settings takes effect at once.
   private let appearance: () -> NotchAppearance
+  /// Read on every rebuild: when no screen has a real notch and this answers true, one
+  /// is synthesised so the interface stays reachable. Left unset, a display without a
+  /// cutout simply has no notch, as before.
+  private let virtualNotchEnabled: () -> Bool
+
+  /// The made-up width of a virtual notch. A screen with no cutout has no true width
+  /// to measure, so a nominal one is used — close to a real notch, wide enough to
+  /// centre the panel and catch the pointer, without spanning the menu bar.
+  nonisolated static let virtualNotchWidth: CGFloat = 220
 
   public init(
     appearance: @escaping () -> NotchAppearance = { .default },
-    @ViewBuilder content: @escaping (NotchPresenter.Presentation) -> some View
+    virtualNotchEnabled: @escaping () -> Bool = { false },
+    @ViewBuilder content: @escaping (NotchRender) -> some View
   ) {
     self.presenter = NotchPresenter()
     self.appearance = appearance
+    self.virtualNotchEnabled = virtualNotchEnabled
     self.content = { AnyView(content($0)) }
   }
 
@@ -80,6 +132,16 @@ public final class NotchController: ObservableObject {
       MainActor.assumeIsolated { self?.clicked(at: location) }
     }
     pointer.start()
+    isRunning = true
+  }
+
+  /// Re-evaluates which screen hosts the notch without tearing anything down, for the
+  /// moments the geometry did not change but the choice of it did — the virtual-notch
+  /// setting being switched while the app runs. A no-op while stopped, so toggling it
+  /// with the notch off does not conjure a window.
+  public func refresh() {
+    guard isRunning else { return }
+    rebuild()
   }
 
   /// Closes an open panel, for the moments the interface moves elsewhere — pressing
@@ -90,6 +152,7 @@ public final class NotchController: ObservableObject {
   }
 
   public func stop() {
+    isRunning = false
     if let screenObserver { NotificationCenter.default.removeObserver(screenObserver) }
     screenObserver = nil
     pointer.stop()
@@ -104,8 +167,20 @@ public final class NotchController: ObservableObject {
   // MARK: - Screens
 
   private func rebuild() {
-    let screen = NSScreen.withNotch
-    let geometry = screen?.notchGeometry
+    // A real notch wins wherever one exists; only when none does, and the setting asks
+    // for it, is a notch synthesised over the main screen's menu bar.
+    let screen: NSScreen?
+    let geometry: ScreenNotchGeometry?
+    if let real = NSScreen.withNotch {
+      screen = real
+      geometry = real.notchGeometry
+    } else if virtualNotchEnabled(), let main = NSScreen.main ?? NSScreen.screens.first {
+      screen = main
+      geometry = main.virtualNotchGeometry(width: Self.virtualNotchWidth)
+    } else {
+      screen = nil
+      geometry = nil
+    }
     self.geometry = geometry
     self.screenFrame = screen?.frame
 
@@ -114,6 +189,8 @@ public final class NotchController: ObservableObject {
       hasUsableNotch = usable
       onUsableNotchChanged?(usable)
     }
+    let virtual = geometry?.isVirtual ?? false
+    if virtual != isVirtualNotch { isVirtualNotch = virtual }
 
     guard let screen, geometry != nil else {
       window?.orderOut(nil)
@@ -186,6 +263,7 @@ public final class NotchController: ObservableObject {
     return Self.hoverTarget(
       barVisible: isBarVisible?() ?? true,
       notch: geometry.rect,
+      isVirtual: geometry.isVirtual,
       appearance: appearance()
     )
     .insetBy(dx: -4, dy: -4)
@@ -193,13 +271,15 @@ public final class NotchController: ObservableObject {
   }
 
   /// What the pointer must reach to count as "over the notch", in global screen
-  /// coordinates: the widened bar while it is drawn, but only the bare cutout while
-  /// the host reports the bar hidden — an invisible target that reacts anyway reads
-  /// as a haunted patch of menu bar.
+  /// coordinates. A virtual notch rests as a thin sliver, so that sliver is its whole
+  /// target regardless of the bar flag. A real notch's target is the widened bar while
+  /// it is drawn, but only the bare cutout while the host reports the bar hidden — an
+  /// invisible target that reacts anyway reads as a haunted patch of menu bar.
   nonisolated static func hoverTarget(
-    barVisible: Bool, notch: CGRect, appearance: NotchAppearance
+    barVisible: Bool, notch: CGRect, isVirtual: Bool, appearance: NotchAppearance
   ) -> CGRect {
-    barVisible ? appearance.closedRect(around: notch) : notch
+    if isVirtual { return appearance.restingSliver(in: notch) }
+    return barVisible ? appearance.closedRect(around: notch) : notch
   }
 
   private var expandedRect: CGRect {
@@ -245,8 +325,8 @@ public final class NotchController: ObservableObject {
     window?.setInteractive(presenter.presentation == .opened)
   }
 
-  fileprivate func body(_ presentation: NotchPresenter.Presentation) -> AnyView {
-    content(presentation)
+  fileprivate func body(_ render: NotchRender) -> AnyView {
+    content(render)
   }
 }
 
@@ -254,7 +334,13 @@ private struct NotchHost: View {
   @ObservedObject var controller: NotchController
 
   var body: some View {
-    controller.body(controller.presentation)
-      .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+    controller.body(
+      NotchRender(
+        presentation: controller.presentation,
+        notchRect: controller.notchRect,
+        isVirtual: controller.isVirtualNotch
+      )
+    )
+    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
   }
 }

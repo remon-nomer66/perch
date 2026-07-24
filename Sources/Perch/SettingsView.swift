@@ -13,10 +13,11 @@ struct SettingsView: View {
   @ObservedObject var model: AppModel
   @ObservedObject var appearanceStore: NotchAppearanceStore
   @ObservedObject var settingsStore: AppSettingsStore
+  @ObservedObject var updateChecker: UpdateChecker
   let service: SessionService
   @StateObject private var loginItem = LoginItemModel()
 
-  private enum Tab: Hashable { case general, behavior, notch, about }
+  private enum Tab: Hashable { case general, behavior, music, notch, about }
   /// Held here, outside the `.id` below: the language switch rebuilds the TabView,
   /// and a selection owned by it would reset to the first tab on every switch.
   @State private var selectedTab = Tab.general
@@ -29,10 +30,13 @@ struct SettingsView: View {
       BehaviorTab(settings: settingsStore, loginItem: loginItem, model: model, service: service)
         .tabItem { Label(L("設定", "Settings"), systemImage: "gearshape") }
         .tag(Tab.behavior)
+      MusicRulesView(settings: settingsStore, model: model, service: service)
+        .tabItem { Label(L("音楽", "Music"), systemImage: "music.note") }
+        .tag(Tab.music)
       NotchSettingsView(store: appearanceStore, settings: settingsStore)
         .tabItem { Label(L("ノッチ", "Notch"), systemImage: "macwindow") }
         .tag(Tab.notch)
-      AboutTab()
+      AboutTab(updateChecker: updateChecker, settings: settingsStore)
         .tabItem { Label(L("情報", "About"), systemImage: "info.circle") }
         .tag(Tab.about)
     }
@@ -47,6 +51,9 @@ struct SettingsView: View {
 extension AppModel {
   func panelPages(using service: SessionService) -> [PanelPage] {
     PanelPages.all(
+      spatial: spatial,
+      headTracking: headTracking,
+      outputRoute: outputRoute,
       equalizer: panel.equalizer,
       noiseControl: panel.noiseControl,
       listeningMode: panel.listeningMode,
@@ -131,16 +138,22 @@ private struct GeneralTab: View {
               await service.session.gestureCaptures()
             }
           )
+        }
 
-          ForEach(model.panelPages(using: service)) { page in
-            page.content
-              .frame(maxWidth: .infinity, alignment: .topLeading)
-              .padding(14)
-              .background(RoundedRectangle(cornerRadius: 10).fill(.black))
-              // A read-only session still shows every reading; only the writes are
-              // withheld, and the caveat above says why.
-              .disabled(!model.panel.summary.acceptsWrites)
-          }
+        // The common (device-independent) sheets — spatial audio above all — need no
+        // device at all, so neither the missing device nor a read-only session may
+        // hide or disable them; only the device sheets are gated.
+        ForEach(
+          model.panelPages(using: service)
+            .filter { model.panel.summary.isControllable || $0.isCommon }
+        ) { page in
+          page.content
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+            .padding(14)
+            .background(RoundedRectangle(cornerRadius: 10).fill(.black))
+            // A read-only session still shows every reading; only the device writes
+            // are withheld, and the caveat above says why.
+            .disabled(!page.isCommon && !model.panel.summary.acceptsWrites)
         }
       }
       .padding(16)
@@ -328,45 +341,18 @@ private struct BehaviorTab: View {
           .foregroundStyle(.orange)
         }
 
-        ForEach(Array(settings.rules.enumerated()), id: \.element.id) { index, rule in
-          HStack(alignment: .firstTextBaseline) {
-            VStack(alignment: .leading, spacing: 1) {
-              Text(Self.triggerLabel(rule.trigger))
-                .font(.system(size: 12, weight: .medium))
-              Text(Self.actionSummary(rule))
-                .font(.system(size: 10))
-                .foregroundStyle(.secondary)
-            }
-            Spacer()
-            // Order is priority: the first matching rule wins, so rows can be walked
-            // up and down instead of deleting and re-adding to reorder.
-            Button {
-              move(rule, by: -1)
-            } label: {
-              Image(systemName: "chevron.up")
-                .foregroundStyle(index == 0 ? .quaternary : .secondary)
-            }
-            .buttonStyle(.plain)
-            .disabled(index == 0)
-            .accessibilityLabel(L("優先度を上げる", "Raise priority"))
-            Button {
-              move(rule, by: 1)
-            } label: {
-              Image(systemName: "chevron.down")
-                .foregroundStyle(index == settings.rules.count - 1 ? .quaternary : .secondary)
-            }
-            .buttonStyle(.plain)
-            .disabled(index == settings.rules.count - 1)
-            .accessibilityLabel(L("優先度を下げる", "Lower priority"))
-            Button {
-              settings.rules.removeAll { $0.id == rule.id }
-            } label: {
-              Image(systemName: "minus.circle.fill")
-                .foregroundStyle(.secondary)
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel(L("ルールを削除", "Delete rule"))
-          }
+        // Order is priority: the first matching rule wins, so rows are walked up and
+        // down instead of deleting and re-adding. Artist rules live on the "音楽" tab;
+        // this list is site and app rules.
+        ForEach(Array(listedRules.enumerated()), id: \.element.id) { index, rule in
+          RuleRow(
+            rule: rule,
+            isFirst: index == 0,
+            isLast: index == listedRules.count - 1,
+            moveUp: { move(rule, by: -1) },
+            moveDown: { move(rule, by: 1) },
+            delete: { settings.rules.removeAll { $0.id == rule.id } }
+          )
         }
 
         // The choices a rule offers are the connected device's declarations, so a rule
@@ -433,58 +419,19 @@ private struct BehaviorTab: View {
       }
     }
 
-    Text(
-      L(
-        "選んだ設定はその場で機器に反映され、聴きながら選べます。ルールを追加すると元の設定に戻ります。",
-        "Choices are applied to the device right away, so they can be judged by ear. "
-          + "Adding the rule puts the previous settings back."
-      )
+    // New rules are pinned to the connected model: an equaliser preset is that device's
+    // own identifier and is meaningless on another.
+    Text("\(L("対象機種", "Device")): \(model.panel.summary.modelName ?? "—")")
+      .font(.system(size: 11))
+      .foregroundStyle(.secondary)
+
+    RuleActionEditor(
+      model: model,
+      service: service,
+      noise: $newNoise,
+      preset: $newPreset,
+      listening: $newListening
     )
-    .font(.system(size: 11))
-    .foregroundStyle(.secondary)
-
-    Picker(L("ノイキャン", "Noise control"), selection: $newNoise) {
-      ForEach(SoundRule.NoiseAction.allCases, id: \.self) { action in
-        Text(Self.noiseLabel(action)).tag(action)
-      }
-    }
-    .onChange(of: newNoise) { _, value in
-      model.previewNoise(value, using: service)
-    }
-
-    // Preset choices are what the connected device declared. While the rule also puts
-    // the device into BGM or cinema, the device itself switches the equaliser off, so
-    // the two cannot be asked for together.
-    Picker(L("イコライザー", "Equalizer"), selection: $newPreset) {
-      Text(L("そのまま", "Keep")).tag(-1)
-      ForEach(presetChoices, id: \.self) { identifier in
-        Text(PresetDisplay.label(for: identifier)).tag(Int(identifier))
-      }
-    }
-    .onChange(of: newPreset) { _, value in
-      model.previewEqualizerPreset(value, using: service)
-    }
-    .disabled(listeningBlocksEqualizer)
-    if listeningBlocksEqualizer {
-      Text(
-        L(
-          "BGM・シネマ中は機器側でイコライザーが無効になるため、同時には指定できません。",
-          "The device disables its equalizer during BGM and Cinema, so the two cannot be set together."
-        )
-      )
-        .font(.system(size: 11))
-        .foregroundStyle(.secondary)
-    }
-
-    Picker(L("リスニングモード", "Listening mode"), selection: $newListening) {
-      ForEach(SoundRule.ListeningAction.allCases, id: \.self) { action in
-        Text(Self.listeningLabel(action)).tag(action)
-      }
-    }
-    .onChange(of: newListening) { _, value in
-      if value == .backgroundMusic || value == .cinema { newPreset = -1 }
-      model.previewListening(value, using: service)
-    }
 
     HStack {
       if isDuplicateTrigger {
@@ -533,12 +480,12 @@ private struct BehaviorTab: View {
     newApp = id
   }
 
-  private var listeningBlocksEqualizer: Bool {
-    newListening == .backgroundMusic || newListening == .cinema
-  }
-
-  private var presetChoices: [UInt8] {
-    model.panel.equalizer?.presets.map(\.identifier) ?? []
+  /// Site and app rules only; artist rules are shown and ordered on the "音楽" tab.
+  private var listedRules: [SoundRule] {
+    settings.rules.filter {
+      if case .artist = $0.trigger { return false }
+      return true
+    }
   }
 
   /// The trigger the editor currently describes, nil while the site field does not
@@ -550,9 +497,14 @@ private struct BehaviorTab: View {
     }
   }
 
+  /// One rule per source *per device*, the same line the music tab draws: a rule pinned
+  /// to another model never fires here, so the same site or app on a different model is
+  /// a distinct rule, not a duplicate. Judged by trigger and scope together — trigger
+  /// alone blocked a second device from ever getting its own rule for the same site.
   private var isDuplicateTrigger: Bool {
     guard let newTrigger else { return false }
-    return settings.rules.contains { $0.trigger == newTrigger }
+    let scope = model.panel.summary.modelName
+    return settings.rules.contains { $0.trigger == newTrigger && $0.deviceModel == scope }
   }
 
   private var canAddRule: Bool {
@@ -561,17 +513,15 @@ private struct BehaviorTab: View {
   }
 
   private func move(_ rule: SoundRule, by offset: Int) {
-    guard let index = settings.rules.firstIndex(where: { $0.id == rule.id }) else { return }
-    let target = index + offset
-    guard settings.rules.indices.contains(target) else { return }
-    var reordered = settings.rules
-    reordered.swapAt(index, target)
-    settings.rules = reordered
+    settings.rules = RuleOrdering.moving(
+      settings.rules, id: rule.id, by: offset, within: listedRules
+    )
   }
 
   private func addRule() {
     guard let trigger = newTrigger, !isDuplicateTrigger else { return }
     var rule = SoundRule(trigger: trigger)
+    rule.deviceModel = model.panel.summary.modelName
     rule.noise = newNoise
     rule.equalizerPreset = newPreset >= 0 ? UInt8(newPreset) : nil
     rule.listening = newListening
@@ -587,44 +537,6 @@ private struct BehaviorTab: View {
     model.endPreview(using: service)
   }
 
-  private static func triggerLabel(_ trigger: SoundRule.Trigger) -> String {
-    switch trigger {
-    case .site(let domain): domain
-    case .app(let bundleID): SoundRule.appTitle(for: bundleID)
-    }
-  }
-
-  private static func actionSummary(_ rule: SoundRule) -> String {
-    var parts: [String] = []
-    if rule.noise != .keep {
-      parts.append("\(L("ノイキャン", "NC")): \(noiseLabel(rule.noise))")
-    }
-    if let preset = rule.equalizerPreset {
-      parts.append("EQ: \(PresetDisplay.label(for: preset))")
-    }
-    if rule.listening != .keep {
-      parts.append("\(L("モード", "Mode")): \(listeningLabel(rule.listening))")
-    }
-    return parts.isEmpty ? L("変更なし", "No changes") : parts.joined(separator: " / ")
-  }
-
-  private static func noiseLabel(_ action: SoundRule.NoiseAction) -> String {
-    switch action {
-    case .keep: L("そのまま", "Keep")
-    case .noiseCancelling: L("ノイズキャンセリング", "Noise Cancelling")
-    case .ambient: L("外音取り込み", "Ambient Sound")
-    case .off: L("オフ", "Off")
-    }
-  }
-
-  private static func listeningLabel(_ action: SoundRule.ListeningAction) -> String {
-    switch action {
-    case .keep: L("そのまま", "Keep")
-    case .standard: L("標準", "Standard")
-    case .backgroundMusic: L("BGM", "Background Music")
-    case .cinema: L("シネマ", "Cinema")
-    }
-  }
 }
 
 /// Registers the app as a login item, and reports what actually happened: a binary
@@ -664,6 +576,9 @@ final class LoginItemModel: ObservableObject {
 // MARK: - About
 
 private struct AboutTab: View {
+  @ObservedObject var updateChecker: UpdateChecker
+  @ObservedObject var settings: AppSettingsStore
+
   var body: some View {
     VStack(spacing: 10) {
       Group {
@@ -684,6 +599,8 @@ private struct AboutTab: View {
       Text("\(L("バージョン", "Version")) \(version)")
         .font(.system(size: 11))
         .foregroundStyle(.secondary)
+
+      updateSection
       Text(
         L(
           "対応ヘッドホン・イヤホンをノッチから操作するユーティリティ",
@@ -719,6 +636,127 @@ private struct AboutTab: View {
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity)
     .padding(24)
+  }
+
+  // MARK: - Update check
+
+  @ViewBuilder
+  private var updateSection: some View {
+    VStack(alignment: .leading, spacing: 8) {
+      HStack(spacing: 8) {
+        Image(systemName: updateGlyph)
+          .foregroundStyle(updateTint)
+        Text(updateHeadline)
+          .font(.system(size: 12, weight: .medium))
+        if updateChecker.status == .checking {
+          ProgressView().controlSize(.small)
+        }
+        Spacer()
+        Button(L("更新を確認", "Check for Updates")) {
+          Task { await updateChecker.checkNow() }
+        }
+        .controlSize(.small)
+        .disabled(updateChecker.status == .checking)
+      }
+
+      if case .available(let info) = updateChecker.status {
+        Text(updateDetail(info))
+          .font(.system(size: 11))
+          .foregroundStyle(.secondary)
+        HStack(spacing: 12) {
+          Button(L("ダウンロード", "Download")) {
+            NSWorkspace.shared.open(info.bestDownloadURL)
+          }
+          .controlSize(.small)
+          Button(L("リリースノート", "Release Notes")) {
+            NSWorkspace.shared.open(info.releaseURL)
+          }
+          .buttonStyle(.link)
+          Button(L("このバージョンを飛ばす", "Skip This Version")) {
+            updateChecker.skipAvailable()
+          }
+          .buttonStyle(.link)
+        }
+        Text(
+          L(
+            "ダウンロードした .dmg を開き、Perch をアプリケーションフォルダにドラッグして"
+              + "置き換えてください。設定はそのまま引き継がれます。",
+            "Open the downloaded .dmg and drag Perch onto your Applications folder to "
+              + "replace it. Your settings carry over."
+          )
+        )
+        .font(.system(size: 11))
+        .foregroundStyle(.secondary)
+      } else if case .failed(let reason) = updateChecker.status {
+        Text(Self.failureText(reason))
+          .font(.system(size: 11))
+          .foregroundStyle(.orange)
+      }
+
+      Toggle(
+        L("起動時に更新を確認", "Check for updates at launch"),
+        isOn: $settings.checksForUpdatesAtLaunch
+      )
+      .font(.system(size: 11))
+      .toggleStyle(.checkbox)
+      .padding(.top, 2)
+    }
+    .padding(12)
+    .frame(maxWidth: 420, alignment: .leading)
+    .background(
+      RoundedRectangle(cornerRadius: 8)
+        .strokeBorder(.quaternary, lineWidth: 1)
+    )
+    .padding(.top, 8)
+  }
+
+  private var updateGlyph: String {
+    switch updateChecker.status {
+    case .available: "arrow.down.circle.fill"
+    case .upToDate: "checkmark.circle.fill"
+    case .failed: "exclamationmark.triangle.fill"
+    default: "arrow.triangle.2.circlepath"
+    }
+  }
+
+  private var updateTint: Color {
+    switch updateChecker.status {
+    case .available: .accentColor
+    case .upToDate: .green
+    case .failed: .orange
+    default: .secondary
+    }
+  }
+
+  private var updateHeadline: String {
+    switch updateChecker.status {
+    case .idle: L("アップデート", "Updates")
+    case .checking: L("確認しています…", "Checking…")
+    case .upToDate: L("最新です", "Up to date")
+    case .available: L("新しいバージョンがあります", "An update is available")
+    case .failed: L("更新を確認できませんでした", "Couldn’t check for updates")
+    }
+  }
+
+  private func updateDetail(_ info: ReleaseInfo) -> String {
+    L(
+      "バージョン \(info.version) が公開されています（現在 \(version)）。",
+      "Version \(info.version) is available (you have \(version))."
+    )
+  }
+
+  private static func failureText(_ reason: UpdateCheckFailure) -> String {
+    switch reason {
+    case .offlineOrUnreachable:
+      L(
+        "ネットワークに接続できませんでした。時間をおいて再度お試しください。",
+        "Couldn’t reach the network. Please try again later."
+      )
+    case .developmentBuild:
+      L("開発ビルドのため確認できません。", "Can’t check for updates from a development build.")
+    case .malformedResponse:
+      L("応答を読み取れませんでした。", "Couldn’t read the response from the server.")
+    }
   }
 
   private var appName: String {

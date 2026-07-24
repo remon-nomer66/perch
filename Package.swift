@@ -30,6 +30,9 @@ let package = Package(
     .executable(name: "perch-probe", targets: ["PerchProbe"]),
     .executable(name: "bose-probe", targets: ["BoseProbe"]),
     .executable(name: "bose-panel-preview", targets: ["BosePanelPreview"]),
+    .executable(name: "spatial-audio-probe", targets: ["SpatialAudioProbe"]),
+    .executable(name: "system-audio-probe", targets: ["SystemAudioProbe"]),
+    .executable(name: "spatial-audio-live", targets: ["SpatialAudioLive"]),
   ],
   targets: [
     // Brand-neutral vocabulary shared by every headset. Pure value types, no
@@ -98,6 +101,10 @@ let package = Package(
       exclude: agentNotes("Sources/NotchKit")
     ),
     .target(
+      name: "SpatialAudioKit",
+      exclude: agentNotes("Sources/SpatialAudioKit")
+    ),
+    .target(
       name: "ScriptingBridgeGlue",
       exclude: agentNotes("Sources/ScriptingBridgeGlue")
     ),
@@ -112,7 +119,7 @@ let package = Package(
     .executableTarget(
       name: "Perch",
       dependencies: [
-        "TandemCore", "TandemSession", "NotchKit", "PlayerBridge",
+        "TandemCore", "TandemSession", "NotchKit", "PlayerBridge", "SpatialAudioKit",
         // Bose (stage 6): the app now hosts a parallel Bose control path alongside Sony.
         "BoseCore", "BoseSession", "BoseTransport", "BosePanel", "DeviceContract",
       ],
@@ -130,6 +137,21 @@ let package = Package(
       name: "BoseProbe",
       dependencies: ["BoseCore", "BoseSession", "BoseTransport"],
       exclude: agentNotes("Sources/BoseProbe")
+    ),
+    .executableTarget(
+      name: "SpatialAudioProbe",
+      dependencies: ["SpatialAudioKit"],
+      exclude: agentNotes("Sources/SpatialAudioProbe")
+    ),
+    .executableTarget(
+      name: "SystemAudioProbe",
+      dependencies: ["SpatialAudioKit"],
+      exclude: agentNotes("Sources/SystemAudioProbe")
+    ),
+    .executableTarget(
+      name: "SpatialAudioLive",
+      dependencies: ["SpatialAudioKit"],
+      exclude: agentNotes("Sources/SpatialAudioLive")
     ),
     .testTarget(
       name: "DeviceContractTests",
@@ -167,13 +189,18 @@ let package = Package(
       exclude: agentNotes("Tests/NotchKitTests")
     ),
     .testTarget(
+      name: "SpatialAudioKitTests",
+      dependencies: ["SpatialAudioKit"],
+      exclude: agentNotes("Tests/SpatialAudioKitTests")
+    ),
+    .testTarget(
       name: "PlayerBridgeTests",
       dependencies: ["PlayerBridge"],
       exclude: agentNotes("Tests/PlayerBridgeTests")
     ),
     .testTarget(
       name: "PerchTests",
-      dependencies: ["Perch"],
+      dependencies: ["Perch", "SpatialAudioKit"],
       exclude: agentNotes("Tests/PerchTests")
     ),
   ]

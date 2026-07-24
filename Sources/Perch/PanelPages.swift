@@ -6,13 +6,22 @@ import TandemSession
 /// thing, and every control on them reflects a value read from the device.
 @MainActor
 enum PanelPages {
-  /// The pages in display order — the one source `count` and `all` both follow, so
-  /// the pager is built with the right number of stops before the pages themselves
-  /// exist.
-  static let pageIDs = ["noise", "equalizer", "listening", "speakToChat"]
+  /// Device-independent sheets live to the LEFT of the device sheets, so they are
+  /// reachable even with nothing connected. The device sheets follow. The one source
+  /// `count`, `homeIndex` and `all` all agree on, so the pager is built with the right
+  /// number of stops before the pages themselves exist.
+  static let commonPageIDs = ["spatial"]
+  static let devicePageIDs = ["noise", "equalizer", "listening", "speakToChat"]
+  static let pageIDs = commonPageIDs + devicePageIDs
   static var count: Int { pageIDs.count }
+  /// The first device sheet — the panel's home, shown on open whether or not a device
+  /// is connected. The common sheets sit to its left (index 0 … homeIndex-1).
+  static var homeIndex: Int { commonPageIDs.count }
 
   static func all(
+    spatial: SpatialAudioController,
+    headTracking: HeadTrackingController,
+    outputRoute: OutputRouteWatcher,
     equalizer: EqualizerReading?,
     noiseControl: NoiseControlReading?,
     listeningMode: TandemListeningReading?,
@@ -27,7 +36,12 @@ enum PanelPages {
     sidetone: SidetoneReading?,
     applySidetone: @escaping (Bool) -> Void
   ) -> [PanelPage] {
-    let pages = [
+    let common = [
+      PanelPage(id: "spatial", isCommon: true, content: AnyView(
+        SpatialAudioPage(controller: spatial, headTracking: headTracking, outputRoute: outputRoute)
+      )),
+    ]
+    let devicePages = [
       PanelPage(id: "noise", content: AnyView(NoiseControlPage(reading: noiseControl, apply: applyNoiseControl, dragLevel: dragNoiseLevel))),
       PanelPage(id: "equalizer", content: AnyView(EqualizerPage(
         equalizer: equalizer,
@@ -44,8 +58,212 @@ enum PanelPages {
         applySidetone: applySidetone
       ))),
     ]
+    let pages = common + devicePages
     assert(pages.map(\.id) == pageIDs, "the built pages must follow pageIDs")
     return pages
+  }
+}
+
+/// The first common (device-independent) sheet: system-wide spatial audio. It captures
+/// the Mac's own audio and spreads it outside the head, so nothing here depends on the
+/// connected model. Needs macOS 14.4+ (Core Audio taps); older systems say so.
+private struct SpatialAudioPage: View {
+  @ObservedObject var controller: SpatialAudioController
+  @ObservedObject var headTracking: HeadTrackingController
+  @ObservedObject var outputRoute: OutputRouteWatcher
+
+  var body: some View {
+    // Two fifths for spatial audio, three kept for head tracking: the switches want less
+    // width than the tracking controls that will land beside them, so the split leans
+    // right. The section title lives in the left column so the head-tracking heading
+    // lines up with it across the top, rather than starting a row lower. The reader is
+    // given its height explicitly — outside the notch's fixed slot (the settings window's
+    // scrolling cards) it would otherwise collapse.
+    GeometryReader { proxy in
+      let spacing: CGFloat = 18
+      let fifth = (proxy.size.width - spacing) / 5
+      HStack(alignment: .top, spacing: spacing) {
+        VStack(alignment: .leading, spacing: 8) {
+          HStack(spacing: 6) {
+            PageTitle(text: L("空間オーディオ", "Spatial Audio"))
+            // 拍に反応が ON のあいだ、いま聴こえている曲の推定テンポを添える。
+            if controller.beat, controller.isEnabled, let bpm = controller.estimatedBPM {
+              Text("♪ \(Int(bpm))")
+                .font(.system(size: 10, weight: .medium))
+                .monospacedDigit()
+                .foregroundStyle(.white.opacity(0.6))
+            }
+          }
+          spatialColumn
+        }
+        .frame(width: fifth * 2, alignment: .topLeading)
+
+        headTrackingColumn
+          .frame(width: fifth * 3, alignment: .topLeading)
+      }
+    }
+    .frame(height: 118)
+  }
+
+  /// The spatial-audio switches, on the left two fifths. The toggles ride this column's
+  /// own right edge, not the sheet's, so they sit in from the far side of the panel.
+  @ViewBuilder
+  private var spatialColumn: some View {
+    if controller.isAvailable {
+      VStack(alignment: .leading, spacing: 7) {
+        SwitchRow(title: L("空間オーディオ", "Spatial Audio"), isOn: controller.isEnabled) {
+          controller.setEnabled($0)
+        }
+        // The switch does not commit to on until capture is confirmed, so while the
+        // permission prompt is up (or the first buffers are on their way) it says so.
+        // And it is headphone-gated: HRTF binaural on speakers falls apart, so with
+        // anything but headphones as the output the feature stays off.
+        .disabled(controller.isStarting || !outputRoute.isHeadphones)
+        .opacity(outputRoute.isHeadphones ? 1 : 0.45)
+
+        if !outputRoute.isHeadphones {
+          Text(
+            L(
+              "ヘッドホン/イヤホンの接続中のみ使えます。スピーカーでは立体感が出ないためです。",
+              "Available only with headphones connected — on speakers the effect falls apart."
+            )
+          )
+            .font(.system(size: 9))
+            .foregroundStyle(.white.opacity(0.5))
+            .fixedSize(horizontal: false, vertical: true)
+        }
+
+        if controller.isStarting {
+          Text(L("確認中…（許可を確認しています）", "Starting… (checking permission)"))
+            .font(.system(size: 9))
+            .foregroundStyle(.white.opacity(0.5))
+        }
+
+        // The refinements only matter once it is on.
+        if controller.isEnabled {
+          SwitchRow(title: L("自動バランス", "Auto balance"), isOn: controller.autoBalance) {
+            controller.autoBalance = $0
+          }
+          SwitchRow(title: L("ゆらぎ", "Movement"), isOn: controller.wander) {
+            controller.wander = $0
+          }
+          SwitchRow(title: L("拍に反応", "Beat reactive"), isOn: controller.beat) {
+            controller.beat = $0
+          }
+        }
+        if let error = controller.errorMessage {
+          Text(error)
+            .font(.system(size: 9))
+            .foregroundStyle(.orange)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+      }
+    } else {
+      Text(
+        L(
+          "空間オーディオは macOS 14.4 以降が必要です。",
+          "Spatial Audio requires macOS 14.4 or later."
+        )
+      )
+        .font(.system(size: 10))
+        .foregroundStyle(.white.opacity(0.5))
+        .fixedSize(horizontal: false, vertical: true)
+    }
+  }
+
+  /// The right three fifths: camera head tracking. The toggle is gated on the
+  /// spatialiser being on — orientation goes nowhere without a running engine — and
+  /// every state the camera can be in (permission, calibration, tracking, lost) is
+  /// said out loud, because an active camera must never be a mystery.
+  @ViewBuilder
+  private var headTrackingColumn: some View {
+    VStack(alignment: .leading, spacing: 7) {
+      Text(L("ヘッドトラッキング", "Head Tracking"))
+        .font(.system(size: 10, weight: .medium))
+        .foregroundStyle(.white.opacity(0.45))
+
+      if controller.isAvailable {
+        SwitchRow(
+          title: L("カメラで頭に追従", "Follow with the camera"),
+          isOn: headTracking.isEnabled
+        ) {
+          headTracking.setEnabled($0)
+        }
+        .disabled(!controller.isEnabled)
+        .opacity(controller.isEnabled ? 1 : 0.45)
+
+        if !controller.isEnabled {
+          trackingCaption(
+            L("空間オーディオをオンにすると使えます。", "Turn on Spatial Audio to use this.")
+          )
+        } else {
+          if headTracking.isEnabled {
+            SwitchRow(
+              title: L("距離も反映（実験的）", "Distance too (experimental)"),
+              isOn: headTracking.distanceEnabled
+            ) {
+              headTracking.distanceEnabled = $0
+            }
+          }
+          trackingStatus
+        }
+      } else {
+        trackingCaption(
+          L("空間オーディオと同じく macOS 14.4 以降が必要です。", "Requires macOS 14.4 or later, like Spatial Audio.")
+        )
+      }
+    }
+  }
+
+  @ViewBuilder
+  private var trackingStatus: some View {
+    switch headTracking.status {
+    case .off:
+      trackingCaption(
+        L("頭を回すと音場が部屋に残るように追従します。", "Keeps the sound field in place as you turn your head.")
+      )
+    case .requestingPermission:
+      trackingCaption(L("カメラの許可を確認しています…", "Waiting for camera permission…"))
+    case .calibrating:
+      trackingCaption(
+        L("較正中 — 正面を向いたままお待ちください。", "Calibrating — keep facing forward.")
+      )
+    case .tracking:
+      HStack(spacing: 8) {
+        trackingCaption(L("追跡中（カメラ使用中）", "Tracking (camera in use)"))
+        SegmentButton(
+          title: L("再センター", "Recenter"), isSelected: false, fixedWidth: false
+        ) {
+          headTracking.recenter()
+        }
+      }
+    case .faceLost:
+      trackingCaption(
+        L("顔を見失っています — 音場をゆっくり正面へ戻します。", "Face lost — easing the sound field back to front.")
+      )
+    case .denied:
+      Text(
+        L(
+          "カメラの許可がありません。設定 → プライバシーとセキュリティ → カメラ で Perch をオンにしてください。",
+          "Camera access is not allowed. Turn Perch on in Settings → Privacy & Security → Camera."
+        )
+      )
+        .font(.system(size: 9))
+        .foregroundStyle(.orange)
+        .fixedSize(horizontal: false, vertical: true)
+    case .failed(let message):
+      Text(message)
+        .font(.system(size: 9))
+        .foregroundStyle(.orange)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+  }
+
+  private func trackingCaption(_ text: String) -> some View {
+    Text(text)
+      .font(.system(size: 9))
+      .foregroundStyle(.white.opacity(0.5))
+      .fixedSize(horizontal: false, vertical: true)
   }
 }
 

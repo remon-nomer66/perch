@@ -71,10 +71,18 @@ public final class AppleEventQueue: Sendable {
   }
 
   /// Fire-and-forget work whose only answer is the target doing it — a transport
-  /// command. No gate and no deadline: these arrive at tap rate, and one queued
-  /// behind a stuck query should still land once the target recovers.
-  public func post(_ work: @escaping @Sendable () -> Void) {
-    queue.async(execute: work)
+  /// command. No gate: a tap should act, not skip. But it does go stale: if the queue
+  /// is blocked by a hung query, taps pile up behind it, and when it finally clears —
+  /// its own Apple Event timeout minutes away — every queued command would fire at once,
+  /// a burst of play/pause toggles the wearer never asked for now. So each carries a
+  /// short deadline and is dropped if it only reaches the front after it: a transport
+  /// command that late is stale, and doing nothing is righter than a storm.
+  public func post(staleAfter: Duration = .seconds(3), _ work: @escaping @Sendable () -> Void) {
+    let deadline = ContinuousClock.now.advanced(by: staleAfter)
+    queue.async {
+      guard ContinuousClock.now < deadline else { return }
+      work()
+    }
   }
 }
 
