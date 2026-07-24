@@ -63,6 +63,12 @@ public final class MultibandSpatializer: @unchecked Sendable {
   private var tap: SystemAudioTap?
   private let muteOriginal: Bool
 
+  /// True once any capture callback has arrived. Lets a caller tell a tap that started
+  /// but never delivers audio (e.g. the system-audio permission was denied) from one
+  /// that is simply between sounds.
+  private var receivedAudio = false
+  public var hasReceivedAudio: Bool { receivedAudio }
+
   // 音源の基準位置（揺らぎはこれに加算する）と、ゆっくり漂わせる揺らぎ。
   private var centerBase: SphericalDirection
   private var leftBase: SphericalDirection
@@ -231,6 +237,7 @@ public final class MultibandSpatializer: @unchecked Sendable {
   }
 
   private func process(_ bufferListPointer: UnsafePointer<AudioBufferList>) {
+    receivedAudio = true
     let (left, right) = LiveSpatializer.extractStereo(bufferListPointer)
     guard !left.isEmpty, !right.isEmpty else { return }
     let (lowLeft, highLeft) = crossoverLeft.split(left)

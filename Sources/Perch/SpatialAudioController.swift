@@ -34,6 +34,10 @@ final class SpatialAudioController: ObservableObject {
   /// The running spatialiser, type-erased so this controller need not itself be gated to
   /// macOS 14.4 (it is created only inside availability checks).
   private var engine: AnyObject?
+  /// Fires shortly after start to catch a tap that never delivers audio — the shape a
+  /// denied system-audio permission can take (it starts without error, then stays silent
+  /// while the original audio is muted). Without this the user would sit in silence.
+  private var verifyTask: Task<Void, Never>?
   private let defaults: UserDefaults
 
   /// Core Audio process taps — how the system audio is captured — arrived in macOS 14.4.
@@ -74,22 +78,45 @@ final class SpatialAudioController: ObservableObject {
       engine = spatializer
       isEnabled = true
       errorMessage = nil
+      scheduleCaptureCheck()
     } catch {
       engine = nil
       isEnabled = false
+      NSLog("Perch spatial: start failed: %@", String(describing: error))
       errorMessage = L(
         "空間オーディオを開始できませんでした。システムオーディオ録音の許可を確認してください。",
         "Could not start Spatial Audio. Check the system audio recording permission."
-      )
+      ) + " [\(error)]"
     }
   }
 
   private func stop() {
+    verifyTask?.cancel()
+    verifyTask = nil
     if #available(macOS 14.4, *) {
       (engine as? MultibandSpatializer)?.stop()
     }
     engine = nil
     isEnabled = false
+  }
+
+  /// A tap can start without error yet deliver nothing when the system-audio permission
+  /// is denied — and the original audio is muted meanwhile. If no capture has arrived
+  /// shortly after start, treat it as a denial: put the sound back and say so.
+  private func scheduleCaptureCheck() {
+    verifyTask = Task { @MainActor [weak self] in
+      try? await Task.sleep(for: .milliseconds(1500))
+      guard let self, !Task.isCancelled, self.isEnabled else { return }
+      guard #available(macOS 14.4, *), let engine = self.engine as? MultibandSpatializer else { return }
+      if !engine.hasReceivedAudio {
+        NSLog("Perch spatial: no audio captured within 1.5s; reverting (permission likely denied)")
+        self.stop()
+        self.errorMessage = L(
+          "音声を取得できませんでした。システムオーディオ録音の許可を確認してください。",
+          "No audio was captured. Check the system audio recording permission."
+        )
+      }
+    }
   }
 
   private enum Keys {

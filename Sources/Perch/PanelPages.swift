@@ -67,15 +67,36 @@ private struct SpatialAudioPage: View {
   @ObservedObject var controller: SpatialAudioController
 
   var body: some View {
-    VStack(alignment: .leading, spacing: 9) {
+    VStack(alignment: .leading, spacing: 8) {
       PageTitle(text: L("空間オーディオ", "Spatial Audio"))
 
-      if controller.isAvailable {
-        SwitchRow(
-          title: L("空間オーディオ", "Spatial Audio"),
-          isOn: controller.isEnabled
-        ) { controller.setEnabled($0) }
+      // Two fifths for spatial audio, three kept for head tracking: the switches want
+      // less width than the tracking controls that will land beside them, so the split
+      // leans right. The reader is given its height explicitly — outside the notch's
+      // fixed slot (the settings window's scrolling cards) it would otherwise collapse.
+      GeometryReader { proxy in
+        let spacing: CGFloat = 18
+        let fifth = (proxy.size.width - spacing) / 5
+        HStack(alignment: .top, spacing: spacing) {
+          spatialColumn
+            .frame(width: fifth * 2, alignment: .topLeading)
+          headTrackingColumn
+            .frame(width: fifth * 3, alignment: .topLeading)
+        }
+      }
+      .frame(height: 96)
+    }
+  }
 
+  /// The spatial-audio switches, on the left two fifths. The toggles ride this column's
+  /// own right edge, not the sheet's, so they sit in from the far side of the panel.
+  @ViewBuilder
+  private var spatialColumn: some View {
+    if controller.isAvailable {
+      VStack(alignment: .leading, spacing: 7) {
+        SwitchRow(title: L("空間オーディオ", "Spatial Audio"), isOn: controller.isEnabled) {
+          controller.setEnabled($0)
+        }
         // The refinements only matter once it is on.
         if controller.isEnabled {
           SwitchRow(title: L("自動バランス", "Auto balance"), isOn: controller.autoBalance) {
@@ -88,34 +109,38 @@ private struct SpatialAudioPage: View {
             controller.beat = $0
           }
         }
-
         if let error = controller.errorMessage {
           Text(error)
-            .font(.system(size: 10))
+            .font(.system(size: 9))
             .foregroundStyle(.orange)
             .fixedSize(horizontal: false, vertical: true)
-        } else {
-          Text(
-            L(
-              "システム全体の音を頭の外へ広げます。機種に依存しません。",
-              "Spreads all system audio outside your head. Works with any device."
-            )
-          )
-            .font(.system(size: 9))
-            .foregroundStyle(.white.opacity(0.4))
-            .fixedSize(horizontal: false, vertical: true)
         }
-      } else {
-        Text(
-          L(
-            "空間オーディオは macOS 14.4 以降が必要です。",
-            "Spatial Audio requires macOS 14.4 or later."
-          )
-        )
-          .font(.system(size: 10))
-          .foregroundStyle(.white.opacity(0.5))
-          .fixedSize(horizontal: false, vertical: true)
       }
+    } else {
+      Text(
+        L(
+          "空間オーディオは macOS 14.4 以降が必要です。",
+          "Spatial Audio requires macOS 14.4 or later."
+        )
+      )
+        .font(.system(size: 10))
+        .foregroundStyle(.white.opacity(0.5))
+        .fixedSize(horizontal: false, vertical: true)
+    }
+  }
+
+  /// The right three fifths, held for head tracking (phase 2): following the head with
+  /// the camera. Left intentionally spare so the controls have room to arrive.
+  @ViewBuilder
+  private var headTrackingColumn: some View {
+    VStack(alignment: .leading, spacing: 4) {
+      Text(L("ヘッドトラッキング", "Head Tracking"))
+        .font(.system(size: 10, weight: .medium))
+        .foregroundStyle(.white.opacity(0.4))
+      Text(L("カメラで顔の向きに音を追従（準備中）。", "Follows your head with the camera (coming soon)."))
+        .font(.system(size: 9))
+        .foregroundStyle(.white.opacity(0.3))
+        .fixedSize(horizontal: false, vertical: true)
     }
   }
 }
