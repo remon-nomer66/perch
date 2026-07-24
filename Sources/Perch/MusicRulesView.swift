@@ -32,11 +32,13 @@ struct MusicRulesView: View {
         Text(
           L(
             "再生中の曲のアーティストで切り替えます。Spotify・ミュージックの再生情報か、"
-              + "ブラウザのタブのタイトルから判定します（YouTube などのウェブ再生も対象）。"
+              + "ブラウザのタブのタイトルから判定します（YouTube などのウェブ再生も対象。"
+              + "タブの判定は実際に音を出しているブラウザに限ります）。"
               + "設定したアーティスト名が含まれていれば適用します（「feat.」のどちらかに入っていてもOK）。"
               + "アーティストのルールはサイトやアプリのルールより優先されます。",
             "Switches by the artist of the playing track, read from Spotify or Music, or "
-              + "from a browser tab's title (web playback such as YouTube counts too). A rule "
+              + "from a browser tab's title (web playback such as YouTube counts too; tab "
+              + "titles only count while that browser is audibly playing). A rule "
               + "applies when its artist name appears in what is playing — either side of a "
               + "\"feat.\" included. Artist rules outrank site and app rules."
           )

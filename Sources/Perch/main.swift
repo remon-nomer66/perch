@@ -879,7 +879,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return false
           }
           let hosts = idle && hasSiteRule ? await SiteWatcher.visibleTabHosts() : []
-          let titles = idle && hasArtistRule ? await SiteWatcher.visibleTabTitles() : []
+          // Titles are trusted only from browsers that audibly play right now: an open
+          // search page naming an artist is what is being read, not what is being heard.
+          let titles =
+            idle && hasArtistRule
+            ? await SiteWatcher.visibleTabTitles(audible: AudibleProcesses.outputtingBundleIDs())
+            : []
           let context = RuleMatcher.Context(
             deviceModel: model.panel.summary.modelName,
             playingBundleID: playing?.bundleID,
