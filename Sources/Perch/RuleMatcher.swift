@@ -41,11 +41,17 @@ enum RuleMatcher {
       rule.deviceModel == nil || rule.deviceModel == context.deviceModel
     }
 
-    // The artist can be told from the playing player, or from a browser tab's title —
-    // the video pages the player scripting APIs never see.
-    var artistHaystacks = context.browserTitles
+    // The artist is told by the playing player when one plays; the browser tabs' titles
+    // speak only when no player does — the video pages the player scripting APIs never
+    // see. While a player plays, a mere open tab naming another artist is not what is
+    // being heard, and must not overrule it (the site tier draws the same line).
+    let artistHaystacks: [String]
     if let playingArtist = context.playingArtist {
-      artistHaystacks.insert(playingArtist, at: 0)
+      artistHaystacks = [playingArtist]
+    } else if context.playingBundleID == nil {
+      artistHaystacks = context.browserTitles
+    } else {
+      artistHaystacks = []
     }
     if let hit = rules.first(where: { rule in
       guard deviceMatches(rule), case .artist(let name) = rule.trigger else { return false }
