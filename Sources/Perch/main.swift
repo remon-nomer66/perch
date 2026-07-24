@@ -92,6 +92,19 @@ final class AppModel: ObservableObject {
   /// device that takes a moment to apply a mode change cannot snap the picker back.
   private var listeningAdjustment = AdjustmentGuard()
 
+  /// Device writes land in the order they were asked. Each write is its own Task, and
+  /// two independent Tasks can reach the session actor in either order — a rule switch
+  /// whose "restore the old value" landed *after* the new rule's write was exactly that
+  /// race. Every write hops onto the tail of the previous one instead.
+  private var deviceWriteChain: Task<Void, Never>?
+  private func enqueueDeviceWrite(_ operation: @escaping @MainActor () async -> Void) {
+    let previous = deviceWriteChain
+    deviceWriteChain = Task { @MainActor in
+      await previous?.value
+      await operation()
+    }
+  }
+
   func applyListening(_ target: TandemListeningSelection, using service: SessionService) {
     guard let current = panel.listeningMode else { return }
     let savedRoom: TandemListeningRoom
@@ -102,21 +115,21 @@ final class AppModel: ObservableObject {
       selection: target,
       savedRoom: savedRoom
     )
-    Task {
+    enqueueDeviceWrite { [weak self] in
       let session = await service.session
       try? await session.apply(listeningSelection: target)
-      await refresh(from: service)
-      listeningAdjustment.end(token)
+      await self?.refresh(from: service)
+      self?.listeningAdjustment.end(token)
     }
   }
 
   func applyNoiseControl(_ target: TandemNoiseControlState, using service: SessionService) {
     levelDrag?.cancel()
     levelAdjustment.cancel()
-    Task {
+    enqueueDeviceWrite { [weak self] in
       let session = await service.session
       try? await session.apply(noiseControl: target)
-      await refresh(from: service)
+      await self?.refresh(from: service)
     }
   }
 
@@ -182,11 +195,11 @@ final class AppModel: ObservableObject {
       selectedPreset: identifier,
       bandSteps: bandSteps.isEmpty ? reading.bandSteps : bandSteps.map(Int.init)
     )
-    Task {
+    enqueueDeviceWrite { [weak self] in
       let session = await service.session
       try? await session.apply(equalizerPreset: identifier, bandSteps: bandSteps)
-      await refresh(from: service)
-      equalizerAdjustment.end(token)
+      await self?.refresh(from: service)
+      self?.equalizerAdjustment.end(token)
     }
   }
 
@@ -495,7 +508,7 @@ final class AppModel: ObservableObject {
   }
   private var ruleHold: RuleHold?
 
-  func playingNow() async -> NowPlayingService.Playing? { await nowPlayingService.playing() }
+  func playingNow() async -> NowPlayingService.PlayingAnswer { await nowPlayingService.playing() }
 
   /// Applies the matched rule, first undoing whichever rule held before it.
   ///
@@ -990,7 +1003,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
           let rules = settingsStore.rules
           // The playing player is what the ears are on; while none plays, an app rule
           // matches by being frontmost and site rules speak through the visible tabs.
-          let playing = await model.playingNow()
+          let answer = await model.playingNow()
+          // "Could not be asked" is not "nothing is playing": a hung player or a
+          // pending prompt must not send the pass down to the browser tiers while
+          // music actually plays. Judgement is withheld; the current hold stands.
+          guard answer != .unknown else {
+            try? await Task.sleep(for: .seconds(2))
+            continue
+          }
+          var playing: NowPlayingService.Playing?
+          if case .playing(let current) = answer { playing = current }
           let frontmost =
             playing == nil ? NSWorkspace.shared.frontmostApplication?.bundleIdentifier : nil
           // Browsers are only asked while a rule could use the answer, and only while no

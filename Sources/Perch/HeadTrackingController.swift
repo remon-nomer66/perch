@@ -64,11 +64,16 @@ final class HeadTrackingController: ObservableObject {
   private var distance: RelativeDistanceEstimator?
   private var lastTime: Double?
   private var receivedAnySample = false
+  /// 最後にフレームが届いた壁時計時刻（起動直後は起動時刻）。フレームの絶えた
+  /// カメラ — 中断・他アプリの占有・黙ったままの構成成功 — を watchdog が見る。
+  private var lastSampleAt = ContinuousClock.now
   /// 較正中に顔の取れないフレームが続いた数。閾値超えで「検出できない」と告げて止まる
   /// （黙って較正中のまま永久に待たない）。15fps で約8秒ぶん。
   private var calibrationMisses = 0
   private let calibrationMissLimit: Int
   private let calibrationSamples: Int
+  private let stallTimeout: Duration
+  private let watchdogInterval: Duration
 
   init(
     providerFactory: @escaping @MainActor () -> any HeadPoseProvider = { CameraHeadPoseProvider() },
@@ -76,7 +81,9 @@ final class HeadTrackingController: ObservableObject {
     requestAccess: @escaping () async -> Bool = { await CameraHeadPoseProvider.requestAccess() },
     defaults: UserDefaults = .standard,
     calibrationSamples: Int = 15,
-    calibrationMissLimit: Int = 120
+    calibrationMissLimit: Int = 120,
+    stallTimeout: Duration = .seconds(6),
+    watchdogInterval: Duration = .seconds(2)
   ) {
     self.providerFactory = providerFactory
     self.authorization = authorization
@@ -84,6 +91,8 @@ final class HeadTrackingController: ObservableObject {
     self.defaults = defaults
     self.calibrationSamples = calibrationSamples
     self.calibrationMissLimit = calibrationMissLimit
+    self.stallTimeout = stallTimeout
+    self.watchdogInterval = watchdogInterval
     distanceEnabled = defaults.object(forKey: Keys.distance) as? Bool ?? false
     center = PoseCenter(sampleTarget: calibrationSamples)
   }
@@ -174,21 +183,36 @@ final class HeadTrackingController: ObservableObject {
       )
     }
 
-    // フレームが1枚も届かないままの沈黙（構成は成功したがカメラが黙っている）を
-    // 較正表示のまま放置しない。
+    // カメラの沈黙を較正・追跡表示のまま放置しない。最初の1枚が来ない（構成は
+    // 成功したがカメラが黙っている）だけでなく、追跡確立後の停止 — 他アプリの
+    // 占有・セッション中断はストリーム終端にならないことがある — も同じ看板で捕まえる。
+    // 追跡表示のまま姿勢が固まると、音場が古い頭の向きに置き去りになる。
+    lastSampleAt = .now
     watchdog = Task { @MainActor [weak self] in
-      try? await Task.sleep(for: .seconds(6))
-      guard let self, !Task.isCancelled else { return }
-      if self.status == .calibrating, !self.receivedAnySample {
-        self.fail(
-          L("カメラから映像が届きません。", "No video is arriving from the camera.")
-        )
+      while !Task.isCancelled {
+        try? await Task.sleep(for: self?.watchdogInterval ?? .seconds(2))
+        guard let self, !Task.isCancelled else { return }
+        // 許可待ちを数えない心配は要らない: watchdog は launch()（許可が下りた後）
+        // でしか生まれず、走っている間に許可待ちへ戻る遷移は無い。
+        guard self.isEnabled else { continue }
+        if ContinuousClock.now - self.lastSampleAt > self.stallTimeout {
+          self.fail(
+            self.receivedAnySample
+              ? L(
+                "カメラからの映像が止まりました。もう一度オンにしてください。",
+                "Video from the camera stopped. Turn it on again."
+              )
+              : L("カメラから映像が届きません。", "No video is arriving from the camera.")
+          )
+          return
+        }
       }
     }
   }
 
   private func process(_ sample: HeadPoseSample) {
     receivedAnySample = true
+    lastSampleAt = .now
     // フレーム時刻の差から dt を得る。中断（スリープ等）明けの巨大な dt は上限で抑える。
     let dt = lastTime.map { max(0.001, min(0.25, sample.time - $0)) } ?? 1.0 / 15
     lastTime = sample.time

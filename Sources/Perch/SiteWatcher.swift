@@ -31,18 +31,44 @@ enum SiteWatcher {
       #"tell application "Brave Browser" to return URL of active tab of (every window whose minimized is false)"#,
   ]
 
-  /// The same windows, asked for their front tab's title instead of its URL — the artist
-  /// a video page shows lives there, where the player scripting APIs cannot reach it.
+  /// The same windows, asked for their front tab's *URL and* title — the artist a video
+  /// page shows lives in the title, where the player scripting APIs cannot reach it, and
+  /// the URL says which pages must not be listened to (a search result naming an artist
+  /// is a query, not a song). One entry per window, "URL⇥title": a URL never contains a
+  /// literal tab, so the first tab splits them. A window whose tab has no URL yet is
+  /// skipped by its own `try`, never failing the others.
   private static let browserTitleScripts: [String: String] = [
-    "com.apple.Safari":
-      #"tell application "Safari" to return name of current tab of (every window whose visible is true and miniaturized is false)"#,
-    "com.google.Chrome":
-      #"tell application "Google Chrome" to return title of active tab of (every window whose minimized is false)"#,
-    "com.microsoft.edgemac":
-      #"tell application "Microsoft Edge" to return title of active tab of (every window whose minimized is false)"#,
-    "com.brave.Browser":
-      #"tell application "Brave Browser" to return title of active tab of (every window whose minimized is false)"#,
+    "com.apple.Safari": """
+      tell application "Safari"
+        set out to {}
+        repeat with w in (every window whose visible is true and miniaturized is false)
+          try
+            set t to current tab of w
+            set end of out to (URL of t) & tab & (name of t)
+          end try
+        end repeat
+        return out
+      end tell
+      """,
+    "com.google.Chrome": chromiumTitleScript("Google Chrome"),
+    "com.microsoft.edgemac": chromiumTitleScript("Microsoft Edge"),
+    "com.brave.Browser": chromiumTitleScript("Brave Browser"),
   ]
+
+  private static func chromiumTitleScript(_ appName: String) -> String {
+    """
+    tell application "\(appName)"
+      set out to {}
+      repeat with w in (every window whose minimized is false)
+        try
+          set t to active tab of w
+          set end of out to (URL of t) & tab & (title of t)
+        end try
+      end repeat
+      return out
+    end tell
+    """
+  }
 
   private static let queue = AppleEventQueue(label: "Perch.SiteWatcher")
   private static let gate = AppleEventQueue.Gate()
@@ -101,10 +127,42 @@ enum SiteWatcher {
     rawStrings(from: scripts).compactMap { URL(string: $0)?.host?.lowercased() }
   }
 
-  /// Runs on the queue. The front tabs' titles, verbatim — an artist name is sought
-  /// inside them, so they are not parsed here.
+  /// Runs on the queue. The front tabs' titles, minus the pages whose *URL* says the
+  /// title must not be listened to: a search page's title carries whatever was typed,
+  /// and an artist name in a query is being read about, not heard. The remaining titles
+  /// stay verbatim — an artist name is sought inside them, so they are not parsed here.
   private nonisolated static func titles(from scripts: [String]) -> [String] {
-    rawStrings(from: scripts)
+    rawStrings(from: scripts).compactMap { raw in
+      let (host, title) = parseTabPair(raw)
+      if let host, isSearchHost(host) { return nil }
+      return title
+    }
+  }
+
+  /// One scripted entry is "URL⇥title". A URL never contains a literal tab, so the
+  /// first tab splits them; an entry without one (an older script's plain title) is
+  /// all title, with no host to judge by. Pure, hence testable.
+  nonisolated static func parseTabPair(_ raw: String) -> (host: String?, title: String) {
+    guard let separator = raw.firstIndex(of: "\t") else { return (nil, raw) }
+    let url = String(raw[..<separator])
+    let title = String(raw[raw.index(after: separator)...])
+    return (URL(string: url)?.host?.lowercased(), title)
+  }
+
+  /// Whether this host is a search engine's — a page whose title echoes the query, so
+  /// an artist's name in it proves nothing about what is heard. Matched structurally
+  /// (the site's own label, `search.` subdomains) rather than by an exhaustive list.
+  nonisolated static func isSearchHost(_ host: String) -> Bool {
+    let host = strippingWWW(host.lowercased())
+    let labels = host.split(separator: ".")
+    guard let first = labels.first else { return false }
+    // google.com, google.co.jp, … — the search lives on the bare domain.
+    if first == "google" { return true }
+    // search.yahoo.co.jp, search.brave.com, search.naver.com, …
+    if first == "search" { return true }
+    if host == "bing.com" || host.hasSuffix(".bing.com") { return true }
+    if host == "duckduckgo.com" { return true }
+    return false
   }
 
   /// Runs each browser's script and gathers the string list it returns. A browser whose

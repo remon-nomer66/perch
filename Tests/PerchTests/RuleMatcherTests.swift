@@ -118,6 +118,22 @@ func appAndSiteTiers() {
   )
 }
 
+@Test("An app rule wins over a site rule, whatever the list order")
+func appBeatsSiteWhateverTheOrder() {
+  // Documented as artist > app > site — but a combined pass let the list order pick
+  // the site rule whenever it sat higher. The app tier names what makes the sound
+  // (or holds the foreground); the site tier only what some window shows.
+  let rules = [
+    rule(.site("youtube.com")),
+    rule(.app("com.apple.Music")),
+  ]
+  let context = RuleMatcher.Context(
+    frontmostBundleID: "com.apple.Music",
+    browserHosts: ["youtube.com"]
+  )
+  #expect(RuleMatcher.match(rules, in: context)?.trigger == .app("com.apple.Music"))
+}
+
 @Test("With no player, a frontmost app matches its app rule")
 func frontmostAppMatches() {
   let rules = [rule(.app("com.apple.Music"))]

@@ -64,18 +64,21 @@ enum RuleMatcher {
       return hit
     }
 
+    // App before site, as documented: the app tier names what is actually making the
+    // sound (or holding the foreground), the site tier only what some window shows.
+    // One combined pass would let list order decide between the two tiers.
+    if let hit = rules.first(where: { rule in
+      guard deviceMatches(rule), case .app(let bundleID) = rule.trigger else { return false }
+      return context.playingBundleID == bundleID
+        || (context.playingBundleID == nil && context.frontmostBundleID == bundleID)
+    }) {
+      return hit
+    }
+
     return rules.first { rule in
-      guard deviceMatches(rule) else { return false }
-      switch rule.trigger {
-      case .app(let bundleID):
-        return context.playingBundleID == bundleID
-          || (context.playingBundleID == nil && context.frontmostBundleID == bundleID)
-      case .site(let domain):
-        return context.playingBundleID == nil
-          && SiteWatcher.matches(hosts: context.browserHosts, sites: [domain])
-      case .artist:
-        return false
-      }
+      guard deviceMatches(rule), case .site(let domain) = rule.trigger else { return false }
+      return context.playingBundleID == nil
+        && SiteWatcher.matches(hosts: context.browserHosts, sites: [domain])
     }
   }
 }

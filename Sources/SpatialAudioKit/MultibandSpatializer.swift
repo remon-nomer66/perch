@@ -91,6 +91,10 @@ public final class MultibandSpatializer: @unchecked Sendable {
     // 拍解析の結果ミラー（解析キューが書き、オーディオが読んで消費する）。
     var pendingBeatStrength = 0.0
     var analysisBPM = Double.nan  // NaN = テンポ不明
+    // 解析待ちのモノ音声。オーディオ側が積み、解析キューが排出する。in-flight は
+    // 常に1つ: 解析が追いつかない時にタスクと配列がキューへ無限に溜まらないため。
+    var pendingMono: [Float] = []
+    var analysisScheduled = false
     // 表示用スナップショット（オーディオが書き、メインが読む）。
     var display = MovementState(
       centerAzimuth: 0, centerElevation: 0, leftAzimuth: 0, rightAzimuth: 0,
@@ -344,11 +348,34 @@ public final class MultibandSpatializer: @unchecked Sendable {
     tap?.stop()
     tap = nil
     graph.stop()
+    // 解析待ちを捨てる（排出中のタスクは空を見て自分でフラグを下ろす）。
+    shared.withLock { $0.pendingMono = [] }
   }
 
   private func process(_ bufferListPointer: UnsafePointer<AudioBufferList>) {
     let (left, right) = LiveSpatializer.extractStereo(bufferListPointer)
     processStereo(left: left, right: right)
+  }
+
+  /// 解析キュー上で、溜まったモノ音声を空になるまで処理する。空を見た時に in-flight
+  /// フラグを下ろす（下ろすのと同時に新しい積み込みが次のタスクを起こせる）。
+  private func drainAnalysis() {
+    guard let onsetDetector else { return }
+    while true {
+      let mono = shared.withLock { state -> [Float] in
+        let pending = state.pendingMono
+        state.pendingMono = []
+        if pending.isEmpty { state.analysisScheduled = false }
+        return pending
+      }
+      if mono.isEmpty { return }
+      let strength = onsetDetector.observe(mono: mono)
+      let bpm = onsetDetector.estimatedBPM ?? .nan
+      shared.withLock { state in
+        if strength > state.pendingBeatStrength { state.pendingBeatStrength = strength }
+        state.analysisBPM = bpm
+      }
+    }
   }
 
   private func processStereo(left: [Float], right: [Float]) {
@@ -408,19 +435,28 @@ public final class MultibandSpatializer: @unchecked Sendable {
         }
       }
 
-      // 拍・テンポの解析は専用キューへ。ここ（音声スレッド）では投げるだけ。
-      if let onsetDetector {
-        var mono = [Float](repeating: 0, count: count)
+      // 拍・テンポの解析は専用キューへ。ここ（音声スレッド）では積むだけ。in-flight は
+      // 常に1タスク: 解析が追いつかない時も、キューに配列と self が無限に溜まらない。
+      if onsetDetector != nil {
+        var monoBlock = [Float](repeating: 0, count: count)
         for index in 0..<count {
-          mono[index] = (left[index] + right[index]) * 0.5
+          monoBlock[index] = (left[index] + right[index]) * 0.5
         }
-        analysisQueue.async { [self, mono] in
-          let strength = onsetDetector.observe(mono: mono)
-          let bpm = onsetDetector.estimatedBPM ?? .nan
-          shared.withLock { state in
-            if strength > state.pendingBeatStrength { state.pendingBeatStrength = strength }
-            state.analysisBPM = bpm
+        let mono = monoBlock
+        let shouldSchedule = shared.withLock { state -> Bool in
+          state.pendingMono.append(contentsOf: mono)
+          // 溜まりの上限（約8秒）。超えたら古い方を捨てる — テンポ推定は連続性を
+          // 失うが数秒で立ち直る。無限に遅延と記憶を積むよりよい。
+          let cap = Int(sampleRate * 8)
+          if state.pendingMono.count > cap {
+            state.pendingMono.removeFirst(state.pendingMono.count - cap)
           }
+          if state.analysisScheduled { return false }
+          state.analysisScheduled = true
+          return true
+        }
+        if shouldSchedule {
+          analysisQueue.async { [self] in drainAnalysis() }
         }
       }
 

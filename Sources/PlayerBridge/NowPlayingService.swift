@@ -98,12 +98,26 @@ public final class NowPlayingService: Sendable {
     }
   }
 
+  /// What the players said when asked whether one is playing. "Nothing is playing" and
+  /// "the question could not be answered" are different answers: a hung player, a
+  /// pending automation prompt, or a stuck queue must not read as idle — a rule pass
+  /// that treats it so falls through to the browser tiers while music actually plays.
+  public enum PlayingAnswer: Equatable, Sendable {
+    case playing(Playing)
+    /// Every running player answered, and none is playing (no player running counts).
+    case idle
+    /// The question could not be answered in time — judgement should be withheld.
+    case unknown
+  }
+
   /// The playing player's identifier and the artist it reports, in one query — what an
-  /// artist rule is judged by. Nil while nothing is playing.
-  public func playing() async -> Playing? {
+  /// artist rule is judged by.
+  public func playing() async -> PlayingAnswer {
     let sources = self.sources
     let delegate = self.failureDelegate
-    return await queue.perform(gate: playingGate, fallback: nil) { Self.playing(sources, delegate) }
+    return await queue.perform(gate: playingGate, fallback: .unknown) {
+      Self.playing(sources, delegate)
+    }
   }
 
   public func playPause() { post { $0.playpause?() } }
@@ -166,15 +180,22 @@ public final class NowPlayingService: Sendable {
 
   private static func playing(
     _ sources: [Source], _ delegate: EventFailureDelegate?
-  ) -> Playing? {
+  ) -> PlayingAnswer {
+    // A player that is running but does not answer its state — an Apple Event timeout,
+    // an automation refusal — leaves the question open. Only players that are not
+    // running, or that answered a non-playing state, count as definitely idle.
+    var sawUnanswered = false
     for source in sources {
-      if let player = runningPlayer(source.bundleID, delegate),
-        player.playerState == .playing
-      {
-        return Playing(bundleID: source.bundleID, artist: player.currentTrack?.artist)
+      guard let player = runningPlayer(source.bundleID, delegate) else { continue }
+      guard let state = player.playerState else {
+        sawUnanswered = true
+        continue
+      }
+      if state == .playing {
+        return .playing(Playing(bundleID: source.bundleID, artist: player.currentTrack?.artist))
       }
     }
-    return nil
+    return sawUnanswered ? .unknown : .idle
   }
 
   /// The player a transport command should reach: the playing one, else a paused one

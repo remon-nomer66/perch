@@ -110,3 +110,45 @@ func unrelatedProcessesDoNotCount() {
   #expect(!SiteWatcher.browserIsAudible(
     "com.google.Chrome", outputting: ["com.google.Chromecast"]))
 }
+
+// MARK: - タブの URL とタイトルのペア
+
+@Test("A scripted entry splits at the first tab into host and title")
+@MainActor
+func tabPairSplitsAtTheFirstTab() {
+  let pair = SiteWatcher.parseTabPair("https://www.youtube.com/watch?v=1\tYOASOBI - アイドル")
+  #expect(pair.host == "www.youtube.com")
+  #expect(pair.title == "YOASOBI - アイドル")
+  // タイトル側のタブ文字は保たれる（最初のタブでだけ割る）。
+  let tabbed = SiteWatcher.parseTabPair("https://example.com/\ttitle\twith tab")
+  #expect(tabbed.title == "title\twith tab")
+}
+
+@Test("An entry without a URL is all title, with no host to judge by")
+@MainActor
+func tabPairWithoutURLIsAllTitle() {
+  let pair = SiteWatcher.parseTabPair("YOASOBI - アイドル")
+  #expect(pair.host == nil)
+  #expect(pair.title == "YOASOBI - アイドル")
+}
+
+@Test("Search-engine hosts are recognised; content sites are not")
+@MainActor
+func searchHostsAreRecognised() {
+  // 検索結果のタイトルは打ち込んだ語の残響 — アーティスト名が載っていても
+  // 「聴いている」証拠にならない。
+  #expect(SiteWatcher.isSearchHost("www.google.com"))
+  #expect(SiteWatcher.isSearchHost("google.co.jp"))
+  #expect(SiteWatcher.isSearchHost("search.yahoo.co.jp"))
+  #expect(SiteWatcher.isSearchHost("search.brave.com"))
+  #expect(SiteWatcher.isSearchHost("bing.com"))
+  #expect(SiteWatcher.isSearchHost("www.bing.com"))
+  #expect(SiteWatcher.isSearchHost("duckduckgo.com"))
+  // 音を聴く場所は除外しない。
+  #expect(!SiteWatcher.isSearchHost("www.youtube.com"))
+  #expect(!SiteWatcher.isSearchHost("music.youtube.com"))
+  #expect(!SiteWatcher.isSearchHost("www.nicovideo.jp"))
+  #expect(!SiteWatcher.isSearchHost("open.spotify.com"))
+  // Google の別サービスまで巻き込まない（検索の本体だけ）。
+  #expect(!SiteWatcher.isSearchHost("mail.google.com"))
+}

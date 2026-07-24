@@ -131,16 +131,22 @@ private struct GeneralTab: View {
               await service.session.gestureCaptures()
             }
           )
+        }
 
-          ForEach(model.panelPages(using: service)) { page in
-            page.content
-              .frame(maxWidth: .infinity, alignment: .topLeading)
-              .padding(14)
-              .background(RoundedRectangle(cornerRadius: 10).fill(.black))
-              // A read-only session still shows every reading; only the writes are
-              // withheld, and the caveat above says why.
-              .disabled(!model.panel.summary.acceptsWrites)
-          }
+        // The common (device-independent) sheets — spatial audio above all — need no
+        // device at all, so neither the missing device nor a read-only session may
+        // hide or disable them; only the device sheets are gated.
+        ForEach(
+          model.panelPages(using: service)
+            .filter { model.panel.summary.isControllable || $0.isCommon }
+        ) { page in
+          page.content
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+            .padding(14)
+            .background(RoundedRectangle(cornerRadius: 10).fill(.black))
+            // A read-only session still shows every reading; only the device writes
+            // are withheld, and the caveat above says why.
+            .disabled(!page.isCommon && !model.panel.summary.acceptsWrites)
         }
       }
       .padding(16)
@@ -459,9 +465,14 @@ private struct BehaviorTab: View {
     }
   }
 
+  /// One rule per source *per device*, the same line the music tab draws: a rule pinned
+  /// to another model never fires here, so the same site or app on a different model is
+  /// a distinct rule, not a duplicate. Judged by trigger and scope together — trigger
+  /// alone blocked a second device from ever getting its own rule for the same site.
   private var isDuplicateTrigger: Bool {
     guard let newTrigger else { return false }
-    return settings.rules.contains { $0.trigger == newTrigger }
+    let scope = model.panel.summary.modelName
+    return settings.rules.contains { $0.trigger == newTrigger && $0.deviceModel == scope }
   }
 
   private var canAddRule: Bool {

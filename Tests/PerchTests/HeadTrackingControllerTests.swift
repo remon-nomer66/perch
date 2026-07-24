@@ -40,7 +40,11 @@ private struct Harness {
   }
   let delivered = Delivered()
 
-  init(authorization: AVAuthorizationStatus = .authorized) {
+  init(
+    authorization: AVAuthorizationStatus = .authorized,
+    stallTimeout: Duration = .seconds(6),
+    watchdogInterval: Duration = .seconds(2)
+  ) {
     let provider = self.provider
     let defaults = UserDefaults(suiteName: "HeadTrackingControllerTests-\(UUID().uuidString)")!
     controller = HeadTrackingController(
@@ -49,7 +53,9 @@ private struct Harness {
       requestAccess: { false },
       defaults: defaults,
       calibrationSamples: 3,
-      calibrationMissLimit: 5
+      calibrationMissLimit: 5,
+      stallTimeout: stallTimeout,
+      watchdogInterval: watchdogInterval
     )
     let delivered = self.delivered
     controller.applyPose = { orientation, ratio in
@@ -220,6 +226,51 @@ func distanceStaysNeutralWhenDisabled() async {
   }
   await harness.drain { harness.delivered.lastRatio != nil }
   #expect(harness.delivered.lastRatio == 1.0)
+}
+
+@MainActor
+@Test("追跡確立後にフレームが絶えたら、追跡表示のまま固まらず failed へ")
+func aStalledCameraDoesNotStayTracking() async {
+  // ストリーム終端にならない停止 — 他アプリの占有・セッション中断 — では、最後の
+  // 頭の向きに音場が置き去りになる。watchdog が沈黙を検知して看板を降ろすこと。
+  let harness = Harness(stallTimeout: .milliseconds(120), watchdogInterval: .milliseconds(30))
+  harness.controller.setEnabled(true)
+  await harness.drain { harness.provider.started }
+  for index in 0..<4 {
+    harness.provider.continuation.yield(harness.face(index))
+  }
+  await harness.drain { harness.controller.status == .tracking }
+  #expect(harness.controller.status == .tracking)
+
+  // 以後フレームを一切流さない（finish はしない — 終端検知とは別経路の検証）。
+  await harness.drain {
+    if case .failed = harness.controller.status { return true }
+    return false
+  }
+  guard case .failed = harness.controller.status else {
+    Issue.record("failed にならなかった: \(harness.controller.status)")
+    return
+  }
+  #expect(harness.provider.stopped)
+}
+
+@MainActor
+@Test("フレームが流れ続けている間は watchdog は黙っている")
+func aLiveCameraIsLeftAlone() async {
+  let harness = Harness(stallTimeout: .milliseconds(150), watchdogInterval: .milliseconds(30))
+  harness.controller.setEnabled(true)
+  await harness.drain { harness.provider.started }
+  for index in 0..<4 {
+    harness.provider.continuation.yield(harness.face(index))
+  }
+  await harness.drain { harness.controller.status == .tracking }
+
+  // stallTimeout より短い間隔で流し続ける。合計は timeout を大きく超える時間。
+  for index in 4..<12 {
+    harness.provider.continuation.yield(harness.face(index))
+    try? await Task.sleep(for: .milliseconds(50))
+  }
+  #expect(harness.controller.status == .tracking)
 }
 
 @MainActor
