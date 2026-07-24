@@ -10,6 +10,9 @@ import SpatialAudioKit
 //                    幅をゆっくり自動追従（曲が変わっても数秒で馴染む）。
 //   引数 wanderNN  : 音源をゆっくり漂わせる振れ幅（度）。既定6。例 wander10。nowander で無効。
 //   引数 beat[NN]  : 拍（スペクトルフラックスの onset）に反応して音場をパルスさせる。既定5度。例 beat8。
+//   引数 bgm[NNN] : 値で合成したBGM（既定120BPM・8分グリッド）を空間化して再生。
+//                    システム音は取得しないので許可も再生アプリも不要。拍検出の
+//                    答え合わせ用（拍リアクティブは既定ON）。例 bgm100。
 //   引数 tune     : 対話調整モード。再生しながらキー操作で音場を追い込む。
 //   引数 rotate   : リスナーの向きをゆっくり回す効果デモ。
 //   引数 nomute   : 原音をミュートしない（原音＋空間化版を同時に鳴らして比較）。
@@ -66,6 +69,18 @@ func runLive() -> Never {
     } else if let value = Double(token.dropFirst("beat".count)), value >= 0, value <= 30 {
       beatDegrees = value
     }
+  }
+
+  // 合成BGMモード: 値で作ったテンポ既知のBGMを流し、拍検出を答え合わせする。
+  if let token = arguments.first(where: { $0.hasPrefix("bgm") }) {
+    var bpm = 120.0
+    if let value = Double(token.dropFirst("bgm".count)), value >= 40, value <= 220 {
+      bpm = value
+    }
+    runBGM(
+      bpm: bpm, autoBalance: auto, wanderDegrees: wanderDegrees,
+      beatDegrees: beatDegrees > 0 ? beatDegrees : 5  // 拍の確認が主目的なので既定ON
+    )
   }
 
   if multiband {
@@ -143,7 +158,53 @@ func runMultiband(muteOriginal: Bool, autoBalance: Bool, wanderDegrees: Double, 
     print("  原音ミュートなし（原音＋空間化版）。")
   }
   print("何か音楽を再生してください。Ctrl-C で停止。\n")
+  runMovementDisplay(spatializer)
+}
 
+/// 値で合成したBGM（テンポ既知・8分グリッド）を空間化して再生する。
+/// システム音は取得しないので、許可も再生アプリも要らない。拍検出の答え合わせ用。
+@available(macOS 14.4, *)
+func runBGM(bpm: Double, autoBalance: Bool, wanderDegrees: Double, beatDegrees: Double) -> Never {
+  let spatializer: MultibandSpatializer
+  do {
+    spatializer = try MultibandSpatializer(
+      muteOriginal: false, autoBalance: autoBalance,
+      wanderDegrees: wanderDegrees, beatDegrees: beatDegrees
+    )
+    try spatializer.startWithoutCapture()
+  } catch {
+    fail("BGMモード初期化に失敗: \(error)")
+  }
+
+  print(String(format: "合成BGM（%.0f BPM・4小節ループ Am→F→C→G）を空間化して再生中。", bpm))
+  print(String(format: "  拍は %.2f 秒ごと、発音はすべて8分グリッド（%.3f 秒刻み）に載っています。", 60 / bpm, 30 / bpm))
+  print(String(format: "  拍リアクティブ: ±%.0f°。拍の数値がグリッドに合って跳ねるか確認してください。", beatDegrees))
+  print("Ctrl-C で停止。\n")
+
+  // 生成スレッド: 実時間より300msだけ先行して feed し続ける（ドリフトしない実時間追従）。
+  let generatorThread = Thread {
+    var generator = BGMGenerator(bpm: bpm)
+    let blockFrames = 4_800
+    let blockSeconds = Double(blockFrames) / generator.sampleRate
+    let start = Date()
+    var generatedSeconds = 0.0
+    while true {
+      let target = -start.timeIntervalSinceNow + 0.3
+      while generatedSeconds < target {
+        let (left, right) = generator.render(frameCount: blockFrames)
+        spatializer.feed(left: left, right: right)
+        generatedSeconds += blockSeconds
+      }
+      Thread.sleep(forTimeInterval: 0.05)
+    }
+  }
+  generatorThread.start()
+  runMovementDisplay(spatializer)
+}
+
+/// 揺らぎの角度と拍の強さを、ゲージと数値でリアルタイム表示し続ける。
+@available(macOS 14.4, *)
+func runMovementDisplay(_ spatializer: MultibandSpatializer) -> Never {
   while true {
     let state = spatializer.movementState
     let line =
@@ -151,7 +212,7 @@ func runMultiband(muteOriginal: Bool, autoBalance: Bool, wanderDegrees: Double, 
       + "中央 " + gauge(state.centerAzimuth) + String(format: "%+5.1f°", state.centerAzimuth)
       + "  左 " + gauge(state.leftAzimuth) + String(format: "%+5.1f°", state.leftAzimuth)
       + "  右 " + gauge(state.rightAzimuth) + String(format: "%+5.1f°", state.rightAzimuth)
-      + "  拍 " + beatBar(state.beatLevel) + "   "
+      + "  拍 " + String(format: "%4.2f ", state.beatLevel) + beatBar(state.beatLevel) + "   "
     print(line, terminator: "")
     fflush(stdout)
     Thread.sleep(forTimeInterval: 0.05)

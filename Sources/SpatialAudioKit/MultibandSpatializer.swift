@@ -152,6 +152,16 @@ public final class MultibandSpatializer: @unchecked Sendable {
     tap = newTap
   }
 
+  /// システム音の取得なしで開始する（合成BGMのデモ・検証用）。音は feed で供給する。
+  public func startWithoutCapture() throws {
+    try graph.start()
+  }
+
+  /// 外部のステレオブロックを、取得音と同じ経路（帯域分割→空間化→拍検出）で処理する。
+  public func feed(left: [Float], right: [Float]) {
+    processStereo(left: left, right: right)
+  }
+
   public var captureFormat: AudioStreamBasicDescription {
     tap?.streamFormat ?? AudioStreamBasicDescription()
   }
@@ -243,8 +253,12 @@ public final class MultibandSpatializer: @unchecked Sendable {
   }
 
   private func process(_ bufferListPointer: UnsafePointer<AudioBufferList>) {
-    receivedAudio = true
     let (left, right) = LiveSpatializer.extractStereo(bufferListPointer)
+    processStereo(left: left, right: right)
+  }
+
+  private func processStereo(left: [Float], right: [Float]) {
+    receivedAudio = true
     guard !left.isEmpty, !right.isEmpty else { return }
 
     // Prove real capture, not just that the callback fired: a denied permission delivers
