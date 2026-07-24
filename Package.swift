@@ -115,7 +115,7 @@ let package = Package(
     ),
     .testTarget(
       name: "PerchTests",
-      dependencies: ["Perch"],
+      dependencies: ["Perch", "SpatialAudioKit"],
       exclude: agentNotes("Tests/PerchTests")
     ),
   ]

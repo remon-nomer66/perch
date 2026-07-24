@@ -51,6 +51,7 @@ extension AppModel {
   func panelPages(using service: SessionService) -> [PanelPage] {
     PanelPages.all(
       spatial: spatial,
+      headTracking: headTracking,
       equalizer: panel.equalizer,
       noiseControl: panel.noiseControl,
       listeningMode: panel.listeningMode,

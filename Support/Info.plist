@@ -30,6 +30,8 @@
 	<string>Perch communicates with music apps to show and control playback, and with browsers to switch sound settings automatically for the site you are watching.</string>
 	<key>NSAudioCaptureUsageDescription</key>
 	<string>Perch captures the system audio to render it as spatial audio in your headphones.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>Perch uses the camera to follow your head so the spatial sound field stays fixed in the room. Images never leave your Mac.</string>
 	<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>Perch uses Bluetooth to read the status of your connected headphones and change their settings.</string>
 	<key>NSHighResolutionCapable</key>

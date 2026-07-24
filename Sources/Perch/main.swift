@@ -50,6 +50,23 @@ final class AppModel: ObservableObject {
   /// System-wide spatial audio, driven from the common sheet. Device-independent.
   let spatial = SpatialAudioController()
 
+  /// Camera head tracking, feeding the spatialiser's listener orientation. It follows
+  /// the spatialiser's life: orientation goes nowhere without a running engine, and
+  /// when the spatialiser goes off the camera must not keep running for nothing.
+  let headTracking = HeadTrackingController()
+  private var headTrackingGate: AnyCancellable?
+
+  init() {
+    headTracking.applyOrientation = { [weak self] orientation in
+      self?.spatial.updateListener(orientation)
+    }
+    headTrackingGate = spatial.$isEnabled.sink { [weak self] enabled in
+      if !enabled {
+        self?.headTracking.setEnabled(false)
+      }
+    }
+  }
+
   /// Sends a change and refreshes from what the device actually reports back.
   ///
   /// The panel is not updated optimistically: on an unverified model the headset may
@@ -1018,6 +1035,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     if let scrollMonitor { NSEvent.removeMonitor(scrollMonitor) }
     mediaGestures?.stop()
     updateChecker.stop()
+    // The camera must not outlive the app either; stopping the tracker first also
+    // spares one pointless "face lost" fade while the spatializer is torn down.
+    model.headTracking.setEnabled(false)
     // The spatializer mutes the system's own output while it runs; it must give that
     // back before the process dies, or the quit leaves the Mac silent. setEnabled(false)
     // tears the tap down synchronously.

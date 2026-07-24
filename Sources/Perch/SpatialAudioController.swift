@@ -163,6 +163,18 @@ final class SpatialAudioController: ObservableObject {
     }
   }
 
+  /// The last listener orientation from head tracking, kept so an engine rebuild
+  /// (options changed mid-listen) does not snap the sound field to front for the
+  /// frames until the camera speaks again.
+  private var listenerOrientation: SpatialAudioKit.ListenerOrientation?
+
+  /// The listener orientation from head tracking. Only a running engine cares.
+  func updateListener(_ orientation: SpatialAudioKit.ListenerOrientation) {
+    guard isEnabled, #available(macOS 14.4, *) else { return }
+    listenerOrientation = orientation
+    (engine as? MultibandSpatializer)?.updateListener(orientation)
+  }
+
   /// A running engine with new options: rebuild in place, staying on. Capture is already
   /// confirmed, so no prompt and no waiting are involved.
   private func reconfigureIfRunning() {
@@ -173,6 +185,9 @@ final class SpatialAudioController: ObservableObject {
     engine = nil
     do {
       engine = try makeAndStartEngine()
+      if let listenerOrientation {
+        (engine as? MultibandSpatializer)?.updateListener(listenerOrientation)
+      }
       errorMessage = nil
     } catch {
       teardown()
@@ -189,6 +204,7 @@ final class SpatialAudioController: ObservableObject {
     engine = nil
     isEnabled = false
     isStarting = false
+    listenerOrientation = nil
   }
 
   private enum Keys {
