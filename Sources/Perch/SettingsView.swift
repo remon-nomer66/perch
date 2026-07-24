@@ -52,6 +52,7 @@ extension AppModel {
     PanelPages.all(
       spatial: spatial,
       headTracking: headTracking,
+      outputRoute: outputRoute,
       equalizer: panel.equalizer,
       noiseControl: panel.noiseControl,
       listeningMode: panel.listeningMode,

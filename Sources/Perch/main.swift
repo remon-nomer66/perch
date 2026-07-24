@@ -54,7 +54,14 @@ final class AppModel: ObservableObject {
   /// the spatialiser's life: orientation goes nowhere without a running engine, and
   /// when the spatialiser goes off the camera must not keep running for nothing.
   let headTracking = HeadTrackingController()
+
+  /// Whether the default output is headphones. Spatial audio is HRTF binaural — on
+  /// speakers it falls apart — so the route gates the whole feature: no enabling on
+  /// speakers, and pulling the headphones off turns it (and the camera, via the
+  /// cascade below) straight off.
+  let outputRoute = OutputRouteWatcher()
   private var headTrackingGate: AnyCancellable?
+  private var routeGate: AnyCancellable?
 
   init() {
     headTracking.applyPose = { [weak self] orientation, distanceRatio in
@@ -63,6 +70,11 @@ final class AppModel: ObservableObject {
     headTrackingGate = spatial.$isEnabled.sink { [weak self] enabled in
       if !enabled {
         self?.headTracking.setEnabled(false)
+      }
+    }
+    routeGate = outputRoute.$isHeadphones.sink { [weak self] headphones in
+      if !headphones {
+        self?.spatial.setEnabled(false)
       }
     }
   }

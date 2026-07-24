@@ -21,6 +21,7 @@ enum PanelPages {
   static func all(
     spatial: SpatialAudioController,
     headTracking: HeadTrackingController,
+    outputRoute: OutputRouteWatcher,
     equalizer: EqualizerReading?,
     noiseControl: NoiseControlReading?,
     listeningMode: TandemListeningReading?,
@@ -37,7 +38,7 @@ enum PanelPages {
   ) -> [PanelPage] {
     let common = [
       PanelPage(id: "spatial", isCommon: true, content: AnyView(
-        SpatialAudioPage(controller: spatial, headTracking: headTracking)
+        SpatialAudioPage(controller: spatial, headTracking: headTracking, outputRoute: outputRoute)
       )),
     ]
     let devicePages = [
@@ -69,6 +70,7 @@ enum PanelPages {
 private struct SpatialAudioPage: View {
   @ObservedObject var controller: SpatialAudioController
   @ObservedObject var headTracking: HeadTrackingController
+  @ObservedObject var outputRoute: OutputRouteWatcher
 
   var body: some View {
     // Two fifths for spatial audio, three kept for head tracking: the switches want less
@@ -105,7 +107,22 @@ private struct SpatialAudioPage: View {
         }
         // The switch does not commit to on until capture is confirmed, so while the
         // permission prompt is up (or the first buffers are on their way) it says so.
-        .disabled(controller.isStarting)
+        // And it is headphone-gated: HRTF binaural on speakers falls apart, so with
+        // anything but headphones as the output the feature stays off.
+        .disabled(controller.isStarting || !outputRoute.isHeadphones)
+        .opacity(outputRoute.isHeadphones ? 1 : 0.45)
+
+        if !outputRoute.isHeadphones {
+          Text(
+            L(
+              "ヘッドホン/イヤホンの接続中のみ使えます。スピーカーでは立体感が出ないためです。",
+              "Available only with headphones connected — on speakers the effect falls apart."
+            )
+          )
+            .font(.system(size: 9))
+            .foregroundStyle(.white.opacity(0.5))
+            .fixedSize(horizontal: false, vertical: true)
+        }
 
         if controller.isStarting {
           Text(L("確認中…（許可を確認しています）", "Starting… (checking permission)"))
