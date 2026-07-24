@@ -81,8 +81,8 @@ public final class MultibandSpatializer: @unchecked Sendable {
   private let wander: PositionWander
   private var elapsedTime: Double = 0
 
-  // 拍リアクティブ: 低音のオンセットで音場をパルス状に動かす。
-  private var beatDetector: BeatDetector?
+  // 拍リアクティブ: スペクトルフラックスの onset で音場をパルス状に動かす。
+  private var onsetDetector: SpectralFluxDetector?
   private var beatLevel: Double = 0
   private let beatAmplitude: Double  // ラジアン。0 なら拍リアクティブ無効。
   private static let beatDecayTimeConstant = 0.12
@@ -127,7 +127,8 @@ public final class MultibandSpatializer: @unchecked Sendable {
       analyzer = BalanceAnalyzer(baselineLowGain: config.lowGain, baselineWidth: config.sideWidth)
     }
     if beatAmplitude > 0 {
-      beatDetector = BeatDetector()
+      // 既定構成（2の冪の FFT サイズ）では失敗しない。万一 nil でも拍が動かないだけ。
+      onsetDetector = SpectralFluxDetector(sampleRate: sampleRate)
     }
 
     centerBase = SphericalDirection(azimuth: 0, elevation: 0, distance: config.centerDistance)
@@ -261,13 +262,10 @@ public final class MultibandSpatializer: @unchecked Sendable {
     if count > 0 {
       let dt = Double(count) / sampleRate
       elapsedTime += dt
-      let lowRMS = (analyzer != nil || beatDetector != nil)
-        ? Self.rmsOfMean(lowLeft, lowRight, count: count) : 0
-
       // 自動バランス: 各帯域のレベルを測り、低音ゲインと幅をゆっくり追従させる。
       if analyzer != nil {
         analyzer!.observe(
-          lowRMS: lowRMS,
+          lowRMS: Self.rmsOfMean(lowLeft, lowRight, count: count),
           midRMS: Self.rmsOfMean(highLeft, highRight, count: count),
           sideRMS: Self.rmsOfDifference(highLeft, highRight, count: count),
           dt: dt
@@ -276,9 +274,9 @@ public final class MultibandSpatializer: @unchecked Sendable {
         sideWidth = analyzer!.sideWidth
       }
 
-      // 拍リアクティブ: 低音のオンセットでパルスを立て、拍ごとに減衰させる。
-      if beatDetector != nil {
-        let strength = beatDetector!.observe(level: lowRMS, dt: dt)
+      // 拍リアクティブ: 全帯域のスペクトルフラックスでパルスを立て、拍ごとに減衰させる。
+      if let onsetDetector {
+        let strength = onsetDetector.observe(left: left, right: right)
         beatLevel *= exp(-dt / Self.beatDecayTimeConstant)
         if strength > beatLevel { beatLevel = strength }
       }
