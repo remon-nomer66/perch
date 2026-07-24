@@ -28,6 +28,8 @@
 	<true/>
 	<key>NSAppleEventsUsageDescription</key>
 	<string>Perch communicates with music apps to show and control playback, and with browsers to switch sound settings automatically for the site you are watching.</string>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>Perch captures the system audio to render it as spatial audio in your headphones.</string>
 	<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>Perch uses Bluetooth to read the status of your connected headphones and change their settings.</string>
 	<key>NSHighResolutionCapable</key>

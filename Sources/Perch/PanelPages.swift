@@ -6,13 +6,20 @@ import TandemSession
 /// thing, and every control on them reflects a value read from the device.
 @MainActor
 enum PanelPages {
-  /// The pages in display order — the one source `count` and `all` both follow, so
-  /// the pager is built with the right number of stops before the pages themselves
-  /// exist.
-  static let pageIDs = ["noise", "equalizer", "listening", "speakToChat"]
+  /// Device-independent sheets live to the LEFT of the device sheets, so they are
+  /// reachable even with nothing connected. The device sheets follow. The one source
+  /// `count`, `homeIndex` and `all` all agree on, so the pager is built with the right
+  /// number of stops before the pages themselves exist.
+  static let commonPageIDs = ["spatial"]
+  static let devicePageIDs = ["noise", "equalizer", "listening", "speakToChat"]
+  static let pageIDs = commonPageIDs + devicePageIDs
   static var count: Int { pageIDs.count }
+  /// The first device sheet — the panel's home, shown on open whether or not a device
+  /// is connected. The common sheets sit to its left (index 0 … homeIndex-1).
+  static var homeIndex: Int { commonPageIDs.count }
 
   static func all(
+    spatial: SpatialAudioController,
     equalizer: EqualizerReading?,
     noiseControl: NoiseControlReading?,
     listeningMode: TandemListeningReading?,
@@ -27,7 +34,10 @@ enum PanelPages {
     sidetone: SidetoneReading?,
     applySidetone: @escaping (Bool) -> Void
   ) -> [PanelPage] {
-    let pages = [
+    let common = [
+      PanelPage(id: "spatial", isCommon: true, content: AnyView(SpatialAudioPage(controller: spatial))),
+    ]
+    let devicePages = [
       PanelPage(id: "noise", content: AnyView(NoiseControlPage(reading: noiseControl, apply: applyNoiseControl, dragLevel: dragNoiseLevel))),
       PanelPage(id: "equalizer", content: AnyView(EqualizerPage(
         equalizer: equalizer,
@@ -44,8 +54,106 @@ enum PanelPages {
         applySidetone: applySidetone
       ))),
     ]
+    let pages = common + devicePages
     assert(pages.map(\.id) == pageIDs, "the built pages must follow pageIDs")
     return pages
+  }
+}
+
+/// The first common (device-independent) sheet: system-wide spatial audio. It captures
+/// the Mac's own audio and spreads it outside the head, so nothing here depends on the
+/// connected model. Needs macOS 14.4+ (Core Audio taps); older systems say so.
+private struct SpatialAudioPage: View {
+  @ObservedObject var controller: SpatialAudioController
+
+  var body: some View {
+    // Two fifths for spatial audio, three kept for head tracking: the switches want less
+    // width than the tracking controls that will land beside them, so the split leans
+    // right. The section title lives in the left column so the head-tracking heading
+    // lines up with it across the top, rather than starting a row lower. The reader is
+    // given its height explicitly — outside the notch's fixed slot (the settings window's
+    // scrolling cards) it would otherwise collapse.
+    GeometryReader { proxy in
+      let spacing: CGFloat = 18
+      let fifth = (proxy.size.width - spacing) / 5
+      HStack(alignment: .top, spacing: spacing) {
+        VStack(alignment: .leading, spacing: 8) {
+          PageTitle(text: L("空間オーディオ", "Spatial Audio"))
+          spatialColumn
+        }
+        .frame(width: fifth * 2, alignment: .topLeading)
+
+        headTrackingColumn
+          .frame(width: fifth * 3, alignment: .topLeading)
+      }
+    }
+    .frame(height: 118)
+  }
+
+  /// The spatial-audio switches, on the left two fifths. The toggles ride this column's
+  /// own right edge, not the sheet's, so they sit in from the far side of the panel.
+  @ViewBuilder
+  private var spatialColumn: some View {
+    if controller.isAvailable {
+      VStack(alignment: .leading, spacing: 7) {
+        SwitchRow(title: L("空間オーディオ", "Spatial Audio"), isOn: controller.isEnabled) {
+          controller.setEnabled($0)
+        }
+        // The switch does not commit to on until capture is confirmed, so while the
+        // permission prompt is up (or the first buffers are on their way) it says so.
+        .disabled(controller.isStarting)
+
+        if controller.isStarting {
+          Text(L("確認中…（許可を確認しています）", "Starting… (checking permission)"))
+            .font(.system(size: 9))
+            .foregroundStyle(.white.opacity(0.5))
+        }
+
+        // The refinements only matter once it is on.
+        if controller.isEnabled {
+          SwitchRow(title: L("自動バランス", "Auto balance"), isOn: controller.autoBalance) {
+            controller.autoBalance = $0
+          }
+          SwitchRow(title: L("ゆらぎ", "Movement"), isOn: controller.wander) {
+            controller.wander = $0
+          }
+          SwitchRow(title: L("拍に反応", "Beat reactive"), isOn: controller.beat) {
+            controller.beat = $0
+          }
+        }
+        if let error = controller.errorMessage {
+          Text(error)
+            .font(.system(size: 9))
+            .foregroundStyle(.orange)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+      }
+    } else {
+      Text(
+        L(
+          "空間オーディオは macOS 14.4 以降が必要です。",
+          "Spatial Audio requires macOS 14.4 or later."
+        )
+      )
+        .font(.system(size: 10))
+        .foregroundStyle(.white.opacity(0.5))
+        .fixedSize(horizontal: false, vertical: true)
+    }
+  }
+
+  /// The right three fifths, held for head tracking (phase 2): following the head with
+  /// the camera. Left intentionally spare so the controls have room to arrive.
+  @ViewBuilder
+  private var headTrackingColumn: some View {
+    VStack(alignment: .leading, spacing: 4) {
+      Text(L("ヘッドトラッキング", "Head Tracking"))
+        .font(.system(size: 10, weight: .medium))
+        .foregroundStyle(.white.opacity(0.4))
+      Text(L("カメラで顔の向きに音を追従（準備中）。", "Follows your head with the camera (coming soon)."))
+        .font(.system(size: 9))
+        .foregroundStyle(.white.opacity(0.3))
+        .fixedSize(horizontal: false, vertical: true)
+    }
   }
 }
 

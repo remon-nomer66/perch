@@ -41,9 +41,14 @@ private struct AdjustmentGuard {
 @MainActor
 final class AppModel: ObservableObject {
   @Published var panel = PanelModel()
-  @Published var page = 0
+  /// Opens on the home sheet — the first device sheet — with the common sheets to its
+  /// left. Home whether or not a device is connected.
+  @Published var page = PanelPages.homeIndex
 
-  var pager = PanelPager(pageCount: PanelPages.count)
+  var pager = PanelPager(pageCount: PanelPages.count, index: PanelPages.homeIndex)
+
+  /// System-wide spatial audio, driven from the common sheet. Device-independent.
+  let spatial = SpatialAudioController()
 
   /// Sends a change and refreshes from what the device actually reports back.
   ///
