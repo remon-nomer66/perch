@@ -121,18 +121,29 @@ public struct BmapRFCOMMChannelOpener: Sendable {
   }
 }
 
-/// Finds the address of a connected, paired device that advertises the BMAP control
-/// service. Used only to open the channel; the address is never printed, so it stays
-/// out of any log.
-public func connectedBmapAddress() -> String? {
+/// The addresses of every paired device that advertises the BMAP control service, most
+/// promising first (a currently-connected one, then the rest). Selection is by the BMAP
+/// marker in cached SDP, *not* by `isConnected()`: a TWS earbud's BMAP records can sit on
+/// an address that is not the one currently carrying audio, so requiring "connected"
+/// would skip the very device that answers BMAP. Addresses are only used to open a
+/// channel and are never printed, so they stay out of any log.
+public func bmapDeviceAddresses() -> [String] {
   let paired = IOBluetoothDevice.pairedDevices() as? [IOBluetoothDevice] ?? []
-  for device in paired where device.isConnected() {
-    guard device.addressString != nil else { continue }
-    if BmapServiceDiscovery.advertisesBmap(device) {
-      return device.addressString
+  let advertising = paired.filter { BmapServiceDiscovery.advertisesBmap($0) }
+  // Stable-sort connected devices ahead of the rest.
+  let ordered = advertising.enumerated().sorted { lhs, rhs in
+    if lhs.element.isConnected() != rhs.element.isConnected() {
+      return lhs.element.isConnected()
     }
+    return lhs.offset < rhs.offset
   }
-  return nil
+  return ordered.compactMap { $0.element.addressString }
+}
+
+/// The address of a connected, paired device that advertises the BMAP control service,
+/// or the first BMAP device otherwise. Kept for callers that want a single best guess.
+public func connectedBmapAddress() -> String? {
+  bmapDeviceAddresses().first
 }
 
 // MARK: - Host
@@ -211,9 +222,15 @@ final class BmapRFCOMMChannelHost: NSObject, @unchecked Sendable {
             finishOpen(.failure(BmapChannelOpenFailure.deviceNotFound))
             return
           }
-          guard device.isConnected() else {
-            finishOpen(.failure(BmapChannelOpenFailure.deviceNotConnected))
-            return
+          // Bring the baseband up first. A device paired but not currently connected —
+          // e.g. the BMAP-bearing address of earbuds whose audio rides a *different*
+          // address — needs an ACL link before RFCOMM (or even SDP) will answer
+          // (rfcomm-transport-notes.md §5). openConnection is synchronous here on the
+          // dedicated Bluetooth thread; its return status is not trusted (macOS 26 has
+          // been seen to report failure on links that do come up), so the RFCOMM open
+          // below is what actually decides success.
+          if !device.isConnected() {
+            _ = device.openConnection()
           }
           // The RFCOMM channel is model-dependent and read from SDP, never guessed.
           guard let channelID = BmapServiceDiscovery.controlChannel(on: device) else {

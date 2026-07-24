@@ -198,76 +198,92 @@ for arg in probeArguments {
   }
 }
 
-let target: String
-if let address {
-  target = address
-} else if let discovered = connectedBmapAddress() {
-  target = discovered
-} else {
-  fail("no connected Bose (BMAP) device found. Connect the headset and disconnect the phone's Bose app.")
-}
-
-print("model config    \(modelLabel)")
-
-let opened: OpenedBmapChannel
-do {
-  opened = try await BmapRFCOMMChannelOpener().open(address: target)
-} catch {
-  fail("could not open a BMAP channel: \(error)")
-}
-print("channel         open")
-
-let session = await BoseSession.start(opened: opened, config: config)
-
 func hex(_ frame: BmapFrame) -> String {
   [UInt8](frame.payload).map { String(format: "%02X", $0) }.joined(separator: " ")
 }
 
-do {
-  try await session.connect()
-  print("connect         ok")
-
-  // Identity + firmware.
-  if config.supports(.deviceName) {
-    let frame = try await session.request(try BmapProductInfo.deviceNameRequest())
-    print("name            \(try BmapProductInfo.parseDeviceName(frame))")
+// Opens, connects and reads one candidate device. Returns true when the device answered
+// BMAP, so the caller can stop at the first that works. Every step is labelled so a
+// failure shows exactly how far the link got.
+func probe(address: String, config: BoseDeviceConfig) async -> Bool {
+  let opened: OpenedBmapChannel
+  do {
+    opened = try await BmapRFCOMMChannelOpener().open(address: address)
+  } catch {
+    print("  open:    failed (\(error))")
+    return false
   }
-  if config.supports(.firmwareVersion) {
-    let frame = try await session.request(try BmapProductInfo.firmwareRequest())
-    print("firmware        \(try BmapProductInfo.parseFirmware(frame))")
-  }
+  print("  open:    ok")
 
-  // Battery.
-  if config.supports(.battery) {
-    let request = try BmapFrame(
-      fblock: BmapFunctionAddress.battery.fblock,
-      function: BmapFunctionAddress.battery.function,
-      op: .get
-    )
-    let frame = try await session.request(request)
-    let components = try BmapBattery.parse(frame, layout: config.batteryLayout)
-    print("battery raw     \(hex(frame))")
-    for component in components {
-      let id = component.componentId.map { String(format: "0x%02X", $0) } ?? "—"
-      let remaining = component.minutesRemaining.map { "\($0)m" } ?? "—"
-      print("  component \(id): \(component.percent)%  remaining \(remaining)")
+  let session = await BoseSession.start(opened: opened, config: config)
+  do {
+    try await session.connect()
+    print("  connect: ok")
+
+    if config.supports(.deviceName) {
+      let frame = try await session.request(try BmapProductInfo.deviceNameRequest())
+      print("  name:    \(try BmapProductInfo.parseDeviceName(frame))")
     }
+    if config.supports(.firmwareVersion) {
+      let frame = try await session.request(try BmapProductInfo.firmwareRequest())
+      print("  firmware:\(try BmapProductInfo.parseFirmware(frame))")
+    }
+    if config.supports(.battery) {
+      let request = try BmapFrame(
+        fblock: BmapFunctionAddress.battery.fblock,
+        function: BmapFunctionAddress.battery.function,
+        op: .get
+      )
+      let frame = try await session.request(request)
+      let components = try BmapBattery.parse(frame, layout: config.batteryLayout)
+      print("  battery: \(hex(frame))")
+      for component in components {
+        let id = component.componentId.map { String(format: "0x%02X", $0) } ?? "—"
+        let remaining = component.minutesRemaining.map { "\($0)m" } ?? "—"
+        print("    component \(id): \(component.percent)%  remaining \(remaining)")
+      }
+    }
+    // NC level [1.5], read only: the raw payload lets the frozen-spec byte order
+    // (byte0=numSteps, byte1=current) be checked against the real device.
+    if config.supports(.noiseCancellationRead) {
+      let frame = try await session.request(try BmapNoiseCancellationReader.readRequest())
+      let reading = try BmapNoiseCancellationReader.parse(frame)
+      print("  nc level:\(hex(frame)) → current \(reading.currentStep)/max \(reading.maximumStep)")
+    }
+    await session.close()
+    return true
+  } catch {
+    print("  read:    failed (\(error))")
+    await session.close()
+    return false
   }
-
-  // Noise-cancellation level [1.5] — read only. Printing the raw payload lets the
-  // frozen-spec byte order (byte0=numSteps, byte1=current) be checked against the real
-  // device, which is the裏取り the handoff asks for.
-  if config.supports(.noiseCancellationRead) {
-    let frame = try await session.request(try BmapNoiseCancellationReader.readRequest())
-    let reading = try BmapNoiseCancellationReader.parse(frame)
-    print("nc level raw    \(hex(frame))")
-    print("  current \(reading.currentStep) / max \(reading.maximumStep), enabled \(reading.isEnabled)")
-  }
-
-  print("--- probe ok ---")
-} catch {
-  await session.close()
-  fail("probe failed: \(error)")
 }
 
-await session.close()
+print("model config    \(modelLabel)")
+
+// Candidates: an explicit address if given, else every paired device advertising BMAP
+// (connected first). Trying each disentangles a TWS earbud whose BMAP records live on a
+// different address than the one currently carrying audio.
+let candidates: [String]
+if let address {
+  candidates = [address]
+} else {
+  candidates = bmapDeviceAddresses()
+}
+if candidates.isEmpty {
+  fail("no paired Bose (BMAP) device found in cached SDP. Run `bose-probe diagnose` first.")
+}
+print("candidates      \(candidates.count) (by index; addresses never printed)")
+
+var connected = false
+for (index, candidate) in candidates.enumerated() {
+  print("--- candidate #\(index) ---")
+  if await probe(address: candidate, config: config) {
+    print("--- probe ok (candidate #\(index)) ---")
+    connected = true
+    break
+  }
+}
+if !connected {
+  fail("no candidate answered BMAP. See per-candidate failures above.")
+}
