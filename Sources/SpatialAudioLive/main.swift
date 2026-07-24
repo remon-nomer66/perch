@@ -202,17 +202,19 @@ func runBGM(bpm: Double, autoBalance: Bool, wanderDegrees: Double, beatDegrees: 
   runMovementDisplay(spatializer)
 }
 
-/// 揺らぎの角度と拍の強さを、ゲージと数値でリアルタイム表示し続ける。
+/// 揺らぎの角度・拍の強さ・推定テンポを、ゲージと数値でリアルタイム表示し続ける。
 @available(macOS 14.4, *)
 func runMovementDisplay(_ spatializer: MultibandSpatializer) -> Never {
   while true {
     let state = spatializer.movementState
+    let tempoText = state.estimatedBPM.map { String(format: "%3.0f", $0) } ?? "---"
     let line =
       "\r揺らぎ  "
       + "中央 " + gauge(state.centerAzimuth) + String(format: "%+5.1f°", state.centerAzimuth)
       + "  左 " + gauge(state.leftAzimuth) + String(format: "%+5.1f°", state.leftAzimuth)
       + "  右 " + gauge(state.rightAzimuth) + String(format: "%+5.1f°", state.rightAzimuth)
-      + "  拍 " + String(format: "%4.2f ", state.beatLevel) + beatBar(state.beatLevel) + "   "
+      + "  拍 " + String(format: "%4.2f ", state.beatLevel) + beatBar(state.beatLevel)
+      + "  テンポ " + tempoText + " BPM   "
     print(line, terminator: "")
     fflush(stdout)
     Thread.sleep(forTimeInterval: 0.05)

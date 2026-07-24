@@ -126,10 +126,9 @@ public final class MultibandSpatializer: @unchecked Sendable {
     if autoBalance {
       analyzer = BalanceAnalyzer(baselineLowGain: config.lowGain, baselineWidth: config.sideWidth)
     }
-    if beatAmplitude > 0 {
-      // 既定構成（2の冪の FFT サイズ）では失敗しない。万一 nil でも拍が動かないだけ。
-      onsetDetector = SpectralFluxDetector(sampleRate: sampleRate)
-    }
+    // 拍検出は常時走らせる（拍の表示とテンポ推定のため）。音場を動かすかどうかは
+    // beatAmplitude だけで決まる。既定構成（2の冪の FFT サイズ）では失敗しない。
+    onsetDetector = SpectralFluxDetector(sampleRate: sampleRate)
 
     centerBase = SphericalDirection(azimuth: 0, elevation: 0, distance: config.centerDistance)
     leftBase = SphericalDirection(azimuth: -sideSpread, elevation: 0, distance: config.sideDistance)
@@ -215,13 +214,14 @@ public final class MultibandSpatializer: @unchecked Sendable {
     }
   }
 
-  /// 表示用の、現在の揺らぎ状態（基準位置からのズレ、度）。
+  /// 表示用の、現在の揺らぎ状態（基準位置からのズレ、度）と拍・テンポ。
   public struct MovementState: Sendable {
     public let centerAzimuth: Double
     public let centerElevation: Double
     public let leftAzimuth: Double
     public let rightAzimuth: Double
     public let beatLevel: Double
+    public let estimatedBPM: Double?
   }
 
   public var movementState: MovementState {
@@ -231,7 +231,8 @@ public final class MultibandSpatializer: @unchecked Sendable {
       centerElevation: offCenterElevation * toDegrees,
       leftAzimuth: offLeftAzimuth * toDegrees,
       rightAzimuth: offRightAzimuth * toDegrees,
-      beatLevel: beatLevel
+      beatLevel: beatLevel,
+      estimatedBPM: onsetDetector?.estimatedBPM
     )
   }
 
