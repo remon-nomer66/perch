@@ -28,6 +28,7 @@ let package = Package(
     .library(name: "DeviceContract", targets: ["DeviceContract"]),
     .executable(name: "Perch", targets: ["Perch"]),
     .executable(name: "perch-probe", targets: ["PerchProbe"]),
+    .executable(name: "bose-probe", targets: ["BoseProbe"]),
     .executable(name: "bose-panel-preview", targets: ["BosePanelPreview"]),
   ],
   targets: [
@@ -81,6 +82,17 @@ let package = Package(
         .linkedFramework("IOBluetooth")
       ]
     ),
+    // Bose's real RFCOMM transport (stage 5): the IOBluetooth host that conforms an
+    // opened SPP channel to `BmapChannel`. Deliberately separate from TandemSession —
+    // Sony and Bose share no transport code — so IOBluetooth is linked here too.
+    .target(
+      name: "BoseTransport",
+      dependencies: ["BoseCore", "BoseSession"],
+      exclude: agentNotes("Sources/BoseTransport"),
+      linkerSettings: [
+        .linkedFramework("IOBluetooth")
+      ]
+    ),
     .target(
       name: "NotchKit",
       exclude: agentNotes("Sources/NotchKit")
@@ -107,6 +119,13 @@ let package = Package(
       name: "PerchProbe",
       dependencies: ["TandemCore", "TandemSession"],
       exclude: agentNotes("Sources/PerchProbe")
+    ),
+    // Hardware疎通 probe for the Bose BMAP transport: opens a real channel and reads
+    // identity/battery/NC read-only, for verifying stage 5 before wiring the full UI.
+    .executableTarget(
+      name: "BoseProbe",
+      dependencies: ["BoseCore", "BoseSession", "BoseTransport"],
+      exclude: agentNotes("Sources/BoseProbe")
     ),
     .testTarget(
       name: "DeviceContractTests",
