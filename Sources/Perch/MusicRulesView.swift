@@ -139,14 +139,17 @@ struct MusicRulesView: View {
     newArtist.trimmingCharacters(in: .whitespacesAndNewlines)
   }
 
-  /// One rule per artist: an existing artist rule with the same name, compared the same
-  /// loose way the matching does, blocks a duplicate.
+  /// One rule per artist *per device*: a new rule is pinned to the connected model, so
+  /// the same artist on a different model is a distinct rule, not a duplicate — only the
+  /// same artist on the same model collides. The matcher already skips a rule scoped to
+  /// another model, so a same-name rule on a different device never fights this one.
   private var isDuplicate: Bool {
     let target = ArtistMatch.normalize(trimmedArtist)
     guard !target.isEmpty else { return false }
+    let scope = model.panel.summary.modelName
     return artistRules.contains { rule in
       guard case .artist(let name) = rule.trigger else { return false }
-      return ArtistMatch.normalize(name) == target
+      return ArtistMatch.normalize(name) == target && rule.deviceModel == scope
     }
   }
 
