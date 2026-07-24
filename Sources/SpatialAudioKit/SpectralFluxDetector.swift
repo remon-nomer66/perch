@@ -14,8 +14,12 @@ public final class SpectralFluxDetector {
   private let hopDuration: Double
   private let compression: Float
   private var picker: OnsetPeakPicker
+  private var tempo = TempoEstimator()
   private var pending: [Float] = []
   private var previousSpectrum: [Float]
+
+  /// フラックス包絡の自己相関によるテンポ推定。周期性が確認できないときは nil。
+  public var estimatedBPM: Double? { tempo.bpm }
 
   /// fftSize は 64 以上の 2 の冪、hopSize は 1〜fftSize。満たさなければ作れない。
   public init?(
@@ -48,6 +52,7 @@ public final class SpectralFluxDetector {
       let spectrum = SpectralFlux.logCompressed(analyzer.magnitudes(frame), gamma: compression)
       let flux = SpectralFlux.flux(previous: previousSpectrum, current: spectrum)
       previousSpectrum = spectrum
+      tempo.observe(flux: flux, dt: hopDuration)
       let strength = picker.observe(flux: flux, dt: hopDuration)
       if strength > strongest { strongest = strength }
     }
