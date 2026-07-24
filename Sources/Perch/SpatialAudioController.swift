@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 import SpatialAudioKit
 
@@ -85,11 +86,12 @@ final class SpatialAudioController: ObservableObject {
     teardown()
     errorMessage = nil
     do {
+      // Creating the tap raises the system-audio prompt the first time. Capture is
+      // confirmed by real audio later; whether it works at all is a permission question,
+      // answered separately below.
       engine = try makeAndStartEngine()
-      // Not on yet: the tap can start without error while the prompt is still up. Wait
-      // for real audio before committing the switch to on.
       isStarting = true
-      confirmCapture()
+      confirmCapture(retryAfterGrant: true)
     } catch {
       NSLog("Perch spatial: start failed: %@", String(describing: error))
       teardown()
@@ -100,14 +102,16 @@ final class SpatialAudioController: ObservableObject {
     }
   }
 
-  /// Waits for *real* capture — a non-silent sample — before committing to on. A denied
-  /// permission still fires callbacks, but with silence, so callbacks alone are not
-  /// proof. On the first real audio it commits; otherwise it reverts and puts the
-  /// original audio back, so neither a denial nor a stuck tap strands the user in silence.
-  private func confirmCapture() {
+  /// Waits for *real* capture — a non-silent sample — before committing to on, then
+  /// separates the two reasons it might not arrive:
+  ///  1. Permission: the system-audio recording grant is a distinct, persistent state
+  ///     (the same TCC as screen recording), read directly. If it is off, say only that.
+  ///  2. Nothing playing: only once permission is confirmed does the audio matter.
+  /// A tap created the instant the grant is given can stay silent, so a permitted-but-
+  /// silent first attempt rebuilds the tap once before concluding nothing is playing.
+  private func confirmCapture(retryAfterGrant: Bool) {
     verifyTask = Task { @MainActor [weak self] in
-      // Poll for a while so a first-time prompt can be answered and some audio can play.
-      for _ in 0..<20 {
+      for _ in 0..<15 {
         try? await Task.sleep(for: .milliseconds(400))
         guard let self, !Task.isCancelled, self.isStarting else { return }
         if #available(macOS 14.4, *),
@@ -119,11 +123,42 @@ final class SpatialAudioController: ObservableObject {
         }
       }
       guard let self, self.isStarting else { return }
-      NSLog("Perch spatial: no audio signal captured; reverting (permission denied or nothing playing)")
+
+      // Phase 1 — permission. Rule it out first, and if it is the cause, say only that.
+      guard CGPreflightScreenCaptureAccess() else {
+        NSLog("Perch spatial: system-audio recording permission not granted")
+        self.teardown()
+        self.errorMessage = L(
+          "「システムオーディオ録音」の許可がありません。設定 → プライバシーとセキュリティ → 画面収録とシステムオーディオ録音 で Perch をオンにしてください。",
+          "System Audio Recording is not allowed. Turn Perch on in Settings → Privacy & Security → Screen & System Audio Recording."
+        )
+        return
+      }
+
+      // Permitted but silent. A tap made the moment the grant landed can stay silent —
+      // rebuild it once before blaming the audio.
+      if retryAfterGrant, #available(macOS 14.4, *) {
+        NSLog("Perch spatial: permitted but silent; rebuilding tap once")
+        (self.engine as? MultibandSpatializer)?.stop()
+        self.engine = nil
+        do {
+          self.engine = try self.makeAndStartEngine()
+          self.confirmCapture(retryAfterGrant: false)
+        } catch {
+          self.teardown()
+          self.errorMessage = L(
+            "空間オーディオを開始できませんでした。", "Could not start Spatial Audio."
+          ) + " [\(error)]"
+        }
+        return
+      }
+
+      // Phase 2 — permitted, but no audio is playing.
+      NSLog("Perch spatial: permitted but no audio captured; nothing playing")
       self.teardown()
       self.errorMessage = L(
-        "音声を取得できませんでした。何か再生しているか確認し、「システムオーディオ録音」の許可をオンにしてください。",
-        "No audio was captured. Make sure something is playing, and turn on the System Audio Recording permission."
+        "音声が検出できませんでした。何か再生してからお試しください。",
+        "No audio detected. Play something, then try again."
       )
     }
   }
