@@ -80,6 +80,8 @@ public final class MultibandSpatializer: @unchecked Sendable {
   private var rightBase: SphericalDirection
   private let wander: PositionWander
   private var elapsedTime: Double = 0
+  // 揺らぎのテンポ同期: 推定BPMで拍を刻み、読めている間だけ同期揺らぎへ寄せる。
+  private var musicalClock = MusicalClock()
 
   // 拍リアクティブ: スペクトルフラックスの onset で音場をパルス状に動かす。
   private var onsetDetector: SpectralFluxDetector?
@@ -189,10 +191,14 @@ public final class MultibandSpatializer: @unchecked Sendable {
   }
 
   private func reposition(_ index: Int, base: SphericalDirection, source: Int, time: Double) {
-    let drift = wander.offset(source: source, time: time)
+    // 自由揺らぎ（壁時計）とテンポ同期揺らぎ（拍）を、同期の重みで滑らかに混ぜる。
+    let free = wander.offset(source: source, time: time)
+    let synced = wander.offset(source: source, beats: musicalClock.beats)
+    let weight = musicalClock.syncWeight
     let beat = beatOffset(source: source)
-    let azimuthOffset = drift.azimuth + beat.azimuth
-    let elevationOffset = drift.elevation + beat.elevation
+    let azimuthOffset = free.azimuth * (1 - weight) + synced.azimuth * weight + beat.azimuth
+    let elevationOffset =
+      free.elevation * (1 - weight) + synced.elevation * weight + beat.elevation
     graph.setPosition(
       index,
       SphericalDirection(
@@ -222,6 +228,8 @@ public final class MultibandSpatializer: @unchecked Sendable {
     public let rightAzimuth: Double
     public let beatLevel: Double
     public let estimatedBPM: Double?
+    /// 揺らぎがテンポに同期している度合い（0〜1）。
+    public let wanderSyncWeight: Double
   }
 
   public var movementState: MovementState {
@@ -232,7 +240,8 @@ public final class MultibandSpatializer: @unchecked Sendable {
       leftAzimuth: offLeftAzimuth * toDegrees,
       rightAzimuth: offRightAzimuth * toDegrees,
       beatLevel: beatLevel,
-      estimatedBPM: onsetDetector?.estimatedBPM
+      estimatedBPM: onsetDetector?.estimatedBPM,
+      wanderSyncWeight: musicalClock.syncWeight
     )
   }
 
@@ -295,6 +304,7 @@ public final class MultibandSpatializer: @unchecked Sendable {
         beatLevel *= exp(-dt / Self.beatDecayTimeConstant)
         if strength > beatLevel { beatLevel = strength }
       }
+      musicalClock.advance(dt: dt, bpm: onsetDetector?.estimatedBPM)
 
       // ゆっくりの揺らぎ ＋ 拍のパルスで音源を動かす。
       if wander.amplitude > 0 || beatLevel > 0.001 {
