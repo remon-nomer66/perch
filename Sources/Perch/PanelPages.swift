@@ -78,7 +78,16 @@ private struct SpatialAudioPage: View {
       let fifth = (proxy.size.width - spacing) / 5
       HStack(alignment: .top, spacing: spacing) {
         VStack(alignment: .leading, spacing: 8) {
-          PageTitle(text: L("空間オーディオ", "Spatial Audio"))
+          HStack(spacing: 6) {
+            PageTitle(text: L("空間オーディオ", "Spatial Audio"))
+            // 拍に反応が ON のあいだ、いま聴こえている曲の推定テンポを添える。
+            if controller.beat, controller.isEnabled, let bpm = controller.estimatedBPM {
+              Text("♪ \(Int(bpm))")
+                .font(.system(size: 10, weight: .medium))
+                .monospacedDigit()
+                .foregroundStyle(.white.opacity(0.6))
+            }
+          }
           spatialColumn
         }
         .frame(width: fifth * 2, alignment: .topLeading)
