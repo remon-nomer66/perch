@@ -62,14 +62,34 @@ enum SiteWatcher {
     return await queue.perform(gate: gate, fallback: []) { hosts(from: scripts) }
   }
 
-  /// The titles on every running browser window's front tab. Same access and caveats as
-  /// `visibleTabHosts`: empty when no known browser runs, none shows a window, automation
-  /// has not been granted, or the browsers take longer to answer than a rule pass waits.
-  static func visibleTabTitles() async -> [String] {
+  /// The titles on every running browser window's front tab — but only the browsers that
+  /// are audibly playing, when `audible` says who is: a tab's title only proves what is
+  /// being listened to while its browser makes sound. A search page naming an artist must
+  /// not pass for listening. `audible` nil means the outputting processes could not be
+  /// read (older macOS); then every running browser is asked, as before.
+  /// Same access and caveats as `visibleTabHosts` otherwise: empty when no candidate
+  /// browser runs, none shows a window, automation has not been granted, or the browsers
+  /// take longer to answer than a rule pass waits.
+  static func visibleTabTitles(audible: Set<String>? = nil) async -> [String] {
     let running = Set(NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier))
-    let scripts = browserTitleScripts.filter { running.contains($0.key) }.map(\.value)
+    let scripts = browserTitleScripts
+      .filter { running.contains($0.key) }
+      .filter { audible == nil || browserIsAudible($0.key, outputting: audible ?? []) }
+      .map(\.value)
     guard !scripts.isEmpty else { return [] }
     return await queue.perform(gate: titleGate, fallback: []) { titles(from: scripts) }
+  }
+
+  /// Whether this browser is among the processes currently outputting audio. A browser's
+  /// sound leaves from its helper processes, not the app itself — Chromium helpers carry
+  /// the browser's bundle ID plus a suffix, Safari's media runs in the WebKit GPU
+  /// process — so the match is by dotted prefix, with the WebKit family standing in for
+  /// Safari. Pure, hence testable.
+  nonisolated static func browserIsAudible(_ browserID: String, outputting: Set<String>) -> Bool {
+    if browserID == "com.apple.Safari" {
+      return outputting.contains { $0 == browserID || $0.hasPrefix("com.apple.WebKit") }
+    }
+    return outputting.contains { $0 == browserID || $0.hasPrefix(browserID + ".") }
   }
 
   /// The Apple Events denial, `errAEEventNotPermitted`: automation for the target
