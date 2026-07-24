@@ -157,6 +157,15 @@ final class BoseDeviceController: ObservableObject {
 
       firmwareVersion = try? await readFirmware(session)
       snapshot = await readSnapshot(session, includingStable: true)
+      // An opened channel that answers nothing is not a connection. Publishing `.ready`
+      // here would show an empty panel over a link the next refresh has to tear down
+      // anyway; failing now sends the loop straight back through connect().
+      guard snapshot.isControllable else {
+        Self.log.notice("bose connected but read nothing back; treating as unreachable")
+        await teardown(keepingAddress: true)
+        readout = Readout(status: .unreachable, modelName: nil, firmwareVersion: nil, battery: .unknown)
+        return
+      }
       // The session talks the Ultra 2 dialect for every model in the family, but the panel
       // display config is chosen once the device has named itself: the earbuds withhold
       // wind reduction while the headphones keep it. Product ids are not yet plumbed from
@@ -219,27 +228,39 @@ final class BoseDeviceController: ObservableObject {
   /// Reads the device into a snapshot. `includingStable` also fetches the fields that do
   /// not change while connected (model name, equalizer) — read once at connect and then
   /// carried forward, so the periodic refresh stays to battery and noise control.
+  ///
+  /// `isControllable` answers one question only: did *this* call get an answer out of the
+  /// device. It is therefore raised by live reads alone — never by a field carried over
+  /// from an earlier snapshot. Counting the carried name and equalizer kept the flag true
+  /// for the life of the connection, which made the caller's link-drop check dead code and
+  /// left a dead session showing stale readings as `.ready`.
   private func readSnapshot(_ session: BoseSession, includingStable: Bool) async -> BoseDeviceSnapshot {
     var snap = BoseDeviceSnapshot()
-    snap.isControllable = true
     snap.acceptsWrites = true
+    /// Whether any GET in this call came back parsed. The only evidence the link is alive.
+    var readSomething = false
 
     if includingStable {
       snap.modelName = try? await readModelName(session)
+      readSomething = readSomething || snap.modelName != nil
       snap.equalizerBands = try? await readEqualizer(session)
+      readSomething = readSomething || snap.equalizerBands != nil
       modeList = (try? await readModeList(session)) ?? []
+      readSomething = readSomething || !modeList.isEmpty
     } else {
       snap.modelName = snapshot.modelName
       snap.equalizerBands = snapshot.equalizerBands
     }
 
-    // Battery [2.2]. Its absence is not a link failure (some reads race a device that is
-    // busy), so an empty battery does not clear `isControllable`.
+    // Battery [2.2]. A device that is busy can answer with no components at all, so an
+    // empty list is still an answer: the read succeeded, which is what the flag tracks.
     if let battery = try? await readBatteryComponents(session) {
       snap.battery = battery
+      readSomething = true
     }
     // Noise cancellation level [1.5] — the CNC range and current ambient/ANC balance.
     snap.noiseCancellation = try? await readNoiseCancellation(session)
+    readSomething = readSomething || snap.noiseCancellation != nil
 
     // Audio modes (block 31). Ultra 2's live [31.10] answers a GET with
     // functionNotSupported, so the current ANC / spatial / wind state is read from the
@@ -247,19 +268,17 @@ final class BoseDeviceController: ObservableObject {
     var currentMode: Int?
     if config.supportsModeBlock {
       currentMode = try? await readCurrentMode(session)
+      readSomething = readSomething || currentMode != nil
       if let currentMode, let cfg = try? await readModeConfig(session, index: currentMode) {
         snap.liveNoiseControl = cfg.noiseControl
+        readSomething = true
       }
       if !modeList.isEmpty {
         snap.audioModes = BoseAudioModes(modes: modeList, selectedSlot: currentMode)
       }
     }
 
-    // If nothing at all came back, treat the link as gone.
-    let gotAnything = !snap.battery.isEmpty || snap.noiseCancellation != nil
-      || snap.liveNoiseControl != nil || snap.modelName != nil || snap.equalizerBands != nil
-      || snap.audioModes != nil
-    snap.isControllable = gotAnything
+    snap.isControllable = readSomething
     return snap
   }
 
