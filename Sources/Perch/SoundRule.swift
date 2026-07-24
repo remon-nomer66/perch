@@ -16,6 +16,10 @@ struct SoundRule: Codable, Equatable, Identifiable {
     /// An application: a scriptable player counts while it is the one playing, and
     /// any app counts while it is frontmost with no player playing.
     case app(String)
+    /// An artist being listened to: matched when the registered name is found in what
+    /// a player reports playing, or in a browser tab's title. Higher priority than a
+    /// site or app, since it is the most specific thing about what is being heard.
+    case artist(String)
   }
 
   enum NoiseAction: String, Codable, CaseIterable {
@@ -28,6 +32,12 @@ struct SoundRule: Codable, Equatable, Identifiable {
 
   var id = UUID()
   var trigger: Trigger
+  /// The device model this rule is written for, by its declared model name, or nil to
+  /// apply on any device. New rules are pinned to the connected model — an equaliser
+  /// preset is one device's own identifier and is meaningless on another. Nil is the
+  /// grandfathered value of rules stored before this field existed: they keep applying
+  /// everywhere, exactly as they did.
+  var deviceModel: String?
   var noise: NoiseAction = .keep
   /// The preset identifier to select, nil to keep.
   var equalizerPreset: UInt8?
