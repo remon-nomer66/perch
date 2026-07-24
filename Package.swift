@@ -23,6 +23,7 @@ let package = Package(
   ],
   products: [
     .library(name: "TandemCore", targets: ["TandemCore"]),
+    .library(name: "BoseCore", targets: ["BoseCore"]),
     .library(name: "DeviceContract", targets: ["DeviceContract"]),
     .executable(name: "Perch", targets: ["Perch"]),
     .executable(name: "perch-probe", targets: ["PerchProbe"]),
@@ -37,6 +38,12 @@ let package = Package(
     .target(
       name: "TandemCore",
       exclude: agentNotes("Sources/TandemCore")
+    ),
+    // Bose BMAP protocol layer. Pure value types, no dependencies — the Bose
+    // counterpart to TandemCore, testable without hardware.
+    .target(
+      name: "BoseCore",
+      exclude: agentNotes("Sources/BoseCore")
     ),
     .target(
       name: "TandemSession",
@@ -82,6 +89,11 @@ let package = Package(
       name: "TandemCoreTests",
       dependencies: ["TandemCore"],
       exclude: agentNotes("Tests/TandemCoreTests")
+    ),
+    .testTarget(
+      name: "BoseCoreTests",
+      dependencies: ["BoseCore"],
+      exclude: agentNotes("Tests/BoseCoreTests")
     ),
     .testTarget(
       name: "TandemSessionTests",
