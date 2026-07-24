@@ -25,6 +25,9 @@ let package = Package(
     .library(name: "TandemCore", targets: ["TandemCore"]),
     .executable(name: "Perch", targets: ["Perch"]),
     .executable(name: "perch-probe", targets: ["PerchProbe"]),
+    .executable(name: "spatial-audio-probe", targets: ["SpatialAudioProbe"]),
+    .executable(name: "system-audio-probe", targets: ["SystemAudioProbe"]),
+    .executable(name: "spatial-audio-live", targets: ["SpatialAudioLive"]),
   ],
   targets: [
     .target(
@@ -44,6 +47,10 @@ let package = Package(
       exclude: agentNotes("Sources/NotchKit")
     ),
     .target(
+      name: "SpatialAudioKit",
+      exclude: agentNotes("Sources/SpatialAudioKit")
+    ),
+    .target(
       name: "ScriptingBridgeGlue",
       exclude: agentNotes("Sources/ScriptingBridgeGlue")
     ),
@@ -57,7 +64,7 @@ let package = Package(
     ),
     .executableTarget(
       name: "Perch",
-      dependencies: ["TandemCore", "TandemSession", "NotchKit", "PlayerBridge"],
+      dependencies: ["TandemCore", "TandemSession", "NotchKit", "PlayerBridge", "SpatialAudioKit"],
       exclude: agentNotes("Sources/Perch"),
       resources: [.process("Resources")]
     ),
@@ -65,6 +72,21 @@ let package = Package(
       name: "PerchProbe",
       dependencies: ["TandemCore", "TandemSession"],
       exclude: agentNotes("Sources/PerchProbe")
+    ),
+    .executableTarget(
+      name: "SpatialAudioProbe",
+      dependencies: ["SpatialAudioKit"],
+      exclude: agentNotes("Sources/SpatialAudioProbe")
+    ),
+    .executableTarget(
+      name: "SystemAudioProbe",
+      dependencies: ["SpatialAudioKit"],
+      exclude: agentNotes("Sources/SystemAudioProbe")
+    ),
+    .executableTarget(
+      name: "SpatialAudioLive",
+      dependencies: ["SpatialAudioKit"],
+      exclude: agentNotes("Sources/SpatialAudioLive")
     ),
     .testTarget(
       name: "TandemCoreTests",
@@ -82,13 +104,18 @@ let package = Package(
       exclude: agentNotes("Tests/NotchKitTests")
     ),
     .testTarget(
+      name: "SpatialAudioKitTests",
+      dependencies: ["SpatialAudioKit"],
+      exclude: agentNotes("Tests/SpatialAudioKitTests")
+    ),
+    .testTarget(
       name: "PlayerBridgeTests",
       dependencies: ["PlayerBridge"],
       exclude: agentNotes("Tests/PlayerBridgeTests")
     ),
     .testTarget(
       name: "PerchTests",
-      dependencies: ["Perch"],
+      dependencies: ["Perch", "SpatialAudioKit"],
       exclude: agentNotes("Tests/PerchTests")
     ),
   ]

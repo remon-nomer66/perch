@@ -1,3 +1,7 @@
 /* 権限ダイアログの説明文。Info.plist の既定(英語)をここで上書きする。 */
 "NSBluetoothAlwaysUsageDescription" = "接続中のヘッドホンの状態を読み取り、設定を変更するためにBluetoothを使用します。";
 "NSAppleEventsUsageDescription" = "再生中の曲の表示・再生操作のために音楽アプリと、視聴中のサイトやアプリに応じた設定自動切り替えのためにブラウザと通信します。";
+
+"NSAudioCaptureUsageDescription" = "空間オーディオとしてヘッドホンで再生するため、システムの音声を取り込みます。";
+
+"NSCameraUsageDescription" = "頭の動きに合わせて音場を部屋に固定するため、カメラで顔の向きを読み取ります。映像がMacの外へ出ることはありません。";

@@ -41,9 +41,43 @@ private struct AdjustmentGuard {
 @MainActor
 final class AppModel: ObservableObject {
   @Published var panel = PanelModel()
-  @Published var page = 0
+  /// Opens on the home sheet — the first device sheet — with the common sheets to its
+  /// left. Home whether or not a device is connected.
+  @Published var page = PanelPages.homeIndex
 
-  var pager = PanelPager(pageCount: PanelPages.count)
+  var pager = PanelPager(pageCount: PanelPages.count, index: PanelPages.homeIndex)
+
+  /// System-wide spatial audio, driven from the common sheet. Device-independent.
+  let spatial = SpatialAudioController()
+
+  /// Camera head tracking, feeding the spatialiser's listener orientation. It follows
+  /// the spatialiser's life: orientation goes nowhere without a running engine, and
+  /// when the spatialiser goes off the camera must not keep running for nothing.
+  let headTracking = HeadTrackingController()
+
+  /// Whether the default output is headphones. Spatial audio is HRTF binaural — on
+  /// speakers it falls apart — so the route gates the whole feature: no enabling on
+  /// speakers, and pulling the headphones off turns it (and the camera, via the
+  /// cascade below) straight off.
+  let outputRoute = OutputRouteWatcher()
+  private var headTrackingGate: AnyCancellable?
+  private var routeGate: AnyCancellable?
+
+  init() {
+    headTracking.applyPose = { [weak self] orientation, distanceRatio in
+      self?.spatial.updateListenerPose(orientation, distanceRatio: distanceRatio)
+    }
+    headTrackingGate = spatial.$isEnabled.sink { [weak self] enabled in
+      if !enabled {
+        self?.headTracking.setEnabled(false)
+      }
+    }
+    routeGate = outputRoute.$isHeadphones.sink { [weak self] headphones in
+      if !headphones {
+        self?.spatial.setEnabled(false)
+      }
+    }
+  }
 
   /// Sends a change and refreshes from what the device actually reports back.
   ///
@@ -58,6 +92,19 @@ final class AppModel: ObservableObject {
   /// device that takes a moment to apply a mode change cannot snap the picker back.
   private var listeningAdjustment = AdjustmentGuard()
 
+  /// Device writes land in the order they were asked. Each write is its own Task, and
+  /// two independent Tasks can reach the session actor in either order — a rule switch
+  /// whose "restore the old value" landed *after* the new rule's write was exactly that
+  /// race. Every write hops onto the tail of the previous one instead.
+  private var deviceWriteChain: Task<Void, Never>?
+  private func enqueueDeviceWrite(_ operation: @escaping @MainActor () async -> Void) {
+    let previous = deviceWriteChain
+    deviceWriteChain = Task { @MainActor in
+      await previous?.value
+      await operation()
+    }
+  }
+
   func applyListening(_ target: TandemListeningSelection, using service: SessionService) {
     guard let current = panel.listeningMode else { return }
     let savedRoom: TandemListeningRoom
@@ -68,21 +115,21 @@ final class AppModel: ObservableObject {
       selection: target,
       savedRoom: savedRoom
     )
-    Task {
+    enqueueDeviceWrite { [weak self] in
       let session = await service.session
       try? await session.apply(listeningSelection: target)
-      await refresh(from: service)
-      listeningAdjustment.end(token)
+      await self?.refresh(from: service)
+      self?.listeningAdjustment.end(token)
     }
   }
 
   func applyNoiseControl(_ target: TandemNoiseControlState, using service: SessionService) {
     levelDrag?.cancel()
     levelAdjustment.cancel()
-    Task {
+    enqueueDeviceWrite { [weak self] in
       let session = await service.session
       try? await session.apply(noiseControl: target)
-      await refresh(from: service)
+      await self?.refresh(from: service)
     }
   }
 
@@ -148,11 +195,11 @@ final class AppModel: ObservableObject {
       selectedPreset: identifier,
       bandSteps: bandSteps.isEmpty ? reading.bandSteps : bandSteps.map(Int.init)
     )
-    Task {
+    enqueueDeviceWrite { [weak self] in
       let session = await service.session
       try? await session.apply(equalizerPreset: identifier, bandSteps: bandSteps)
-      await refresh(from: service)
-      equalizerAdjustment.end(token)
+      await self?.refresh(from: service)
+      self?.equalizerAdjustment.end(token)
     }
   }
 
@@ -227,10 +274,14 @@ final class AppModel: ObservableObject {
     // sitting between them.
     let nowPlaying = playerQueriesAllowed ? await nowPlayingService.read() : nil
     let session = await service.session
-    let phase = await session.phase
-    let fingerprint = await session.deviceFingerprint
-    let reason = await session.unsupportedReason
-    let acceptsWrites = await session.acceptsWrites
+    // One consistent hop: read piecemeal, an invalidation could land mid-read and show
+    // a ready phase with no model name for a frame — which device-scoped rules read as
+    // "no rule", flapping the settings. See SessionCoordinator.Snapshot.
+    let snap = await session.snapshot
+    let phase = snap.phase
+    let fingerprint = snap.fingerprint
+    let reason = snap.unsupportedReason
+    let acceptsWrites = snap.acceptsWrites
 
     var next = PanelModel()
     next.summary.status = unreachableDebounce.present(
@@ -240,7 +291,7 @@ final class AppModel: ObservableObject {
     next.summary.firmwareVersion = fingerprint?.firmwareVersion
     next.summary.acceptsWrites = acceptsWrites
 
-    let readings = await session.readings
+    let readings = snap.readings
     next.summary.codec = readings.codec?.description
     next.equalizer = equalizerAdjustment.isHolding ? panel.equalizer : readings.equalizer
     next.listeningMode = listeningAdjustment.isHolding ? panel.listeningMode : readings.listeningMode
@@ -273,12 +324,39 @@ final class AppModel: ObservableObject {
       && (next.summary.modelName != nil || next.battery != .unknown)
     if hasContent, !hadContent {
       arrivalAnnounceUntil = ContinuousClock.now.advanced(by: .seconds(5))
+      // A device arriving always turns spatial audio off. Arriving mid-capture — the
+      // headset pulled over from another host above all — lands while the tap still
+      // mutes the system and the engine is mid-rebuild, and the Mac ends up silent.
+      // Connecting is a fresh start; spatial audio is explicit-on by design anyway
+      // (the switch is never persisted), so it goes off and waits to be asked.
+      spatial.setEnabled(false)
     }
     if !hasContent { arrivalAnnounceUntil = nil }
     hadContent = hasContent
     next.announcesArrival = arrivalAnnounceUntil.map { ContinuousClock.now < $0 } ?? false
 
+    // The view collapses the device sheets into one status sheet while nothing is
+    // readable (NotchPanelView.displayedPages); the pager must agree on the stop
+    // count, or swipes dead-zone against stops that are not on screen — after a
+    // disconnect from the fourth sheet, a swipe would "move" through pages that no
+    // longer exist before anything visibly changed.
+    let stops = Self.pagerStops(for: next.summary.status)
+    if pager.pageCount != stops {
+      pager.setPageCount(stops)
+      page = min(page, stops - 1)
+    }
+
     if panel != next { panel = next }
+  }
+
+  /// How many stops the pager offers for a device state — the same shape
+  /// `NotchPanelView.displayedPages` renders: every sheet with a readable device,
+  /// else the common sheets plus the one status sheet.
+  static func pagerStops(for status: DeviceSummary.Status) -> Int {
+    switch status {
+    case .ready, .unverified: PanelPages.count
+    default: PanelPages.commonPageIDs.count + 1
+    }
   }
 
   private let nowPlayingService = NowPlayingService(onAutomationDenied: {
@@ -288,6 +366,47 @@ final class AppModel: ObservableObject {
   func nowPlayingPlayPause() { nowPlayingService.playPause() }
   func nowPlayingNext() { nowPlayingService.next() }
   func nowPlayingPrevious() { nowPlayingService.previous() }
+
+  /// Whether a re-injected headphone gesture should fall back to a system media key
+  /// rather than scripting Spotify/Music. The ScriptingBridge path holds whenever the
+  /// panel shows a track — playing *or paused*: a paused player is exactly the one a
+  /// tap must be able to resume, and scripting needs no extra permission. Only with no
+  /// scriptable track at all (a browser video, a game) does the system key take over.
+  static func reinjectionUsesSystemKey(nowPlaying: PanelModel.NowPlaying?) -> Bool {
+    nowPlaying == nil
+  }
+
+  // The headphone touch panel's re-injected transport. It scripts the player whose
+  // track the notch shows (playing or paused — the pause/resume pair must land on the
+  // same player), and with no such track re-issues the system media key the held
+  // channel suppressed, which reaches a browser or any other player. Posting that key
+  // needs Accessibility trust, asked for on first use with the system's own dialog.
+  func reinjectPlayPause() {
+    if Self.reinjectionUsesSystemKey(nowPlaying: panel.nowPlaying) {
+      SystemMediaKey.requestTrustIfNeeded()
+      SystemMediaKey.playPause.post()
+    } else {
+      nowPlayingService.playPause()
+    }
+  }
+
+  func reinjectNext() {
+    if Self.reinjectionUsesSystemKey(nowPlaying: panel.nowPlaying) {
+      SystemMediaKey.requestTrustIfNeeded()
+      SystemMediaKey.next.post()
+    } else {
+      nowPlayingService.next()
+    }
+  }
+
+  func reinjectPrevious() {
+    if Self.reinjectionUsesSystemKey(nowPlaying: panel.nowPlaying) {
+      SystemMediaKey.requestTrustIfNeeded()
+      SystemMediaKey.previous.post()
+    } else {
+      nowPlayingService.previous()
+    }
+  }
 
   private var speakToChatAdjustment = AdjustmentGuard()
 
@@ -395,7 +514,7 @@ final class AppModel: ObservableObject {
   }
   private var ruleHold: RuleHold?
 
-  func playingSource() async -> String? { await nowPlayingService.playingBundleID() }
+  func playingNow() async -> NowPlayingService.PlayingAnswer { await nowPlayingService.playing() }
 
   /// Applies the matched rule, first undoing whichever rule held before it.
   ///
@@ -865,9 +984,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let mediaGestures = MediaGestureForwarder(
       service: service,
       transport: .init(
-        playPause: { [model] in model.nowPlayingPlayPause() },
-        next: { [model] in model.nowPlayingNext() },
-        previous: { [model] in model.nowPlayingPrevious() }
+        playPause: { [model] in model.reinjectPlayPause() },
+        next: { [model] in model.reinjectNext() },
+        previous: { [model] in model.reinjectPrevious() }
       )
     )
     mediaGestures.start()
@@ -887,30 +1006,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
           // releasing an existing hold may run under it: the engine freezes as it
           // stands and resumes once the preview ends.
         } else if settingsStore.isRulesEnabled, !settingsStore.rules.isEmpty {
-          // The playing player is what the ears are on; while none plays, a rule's
-          // app matches by being frontmost and site rules speak through the visible
-          // tabs. The rule list's order settles any tie.
-          let playing = await model.playingSource()
+          let rules = settingsStore.rules
+          // The playing player is what the ears are on; while none plays, an app rule
+          // matches by being frontmost and site rules speak through the visible tabs.
+          let answer = await model.playingNow()
+          // "Could not be asked" is not "nothing is playing": a hung player or a
+          // pending prompt must not send the pass down to the browser tiers while
+          // music actually plays. Judgement is withheld; the current hold stands.
+          guard answer != .unknown else {
+            try? await Task.sleep(for: .seconds(2))
+            continue
+          }
+          var playing: NowPlayingService.Playing?
+          if case .playing(let current) = answer { playing = current }
           let frontmost =
             playing == nil ? NSWorkspace.shared.frontmostApplication?.bundleIdentifier : nil
-          // Browsers are only asked while a site rule could use the answer: the
-          // query is what surfaces the automation-permission prompts and reads the
-          // open tabs, and a rule set of app triggers justifies neither.
-          let hasSiteRule = settingsStore.rules.contains { rule in
-            if case .site = rule.trigger { return true }
+          // Browsers are only asked while a rule could use the answer, and only while no
+          // player is playing: the query is what surfaces the automation prompts and
+          // reads the tabs. Hosts feed site rules; titles feed artist rules for the video
+          // pages the player APIs cannot see. An app-only rule set justifies neither.
+          let idle = playing == nil
+          let hasSiteRule = rules.contains {
+            if case .site = $0.trigger { return true }
             return false
           }
-          let hosts =
-            playing == nil && hasSiteRule ? await SiteWatcher.visibleTabHosts() : []
-          let matched = settingsStore.rules.first { rule in
-            switch rule.trigger {
-            case .app(let bundleID):
-              playing == bundleID || (playing == nil && frontmost == bundleID)
-            case .site(let domain):
-              playing == nil && SiteWatcher.matches(hosts: hosts, sites: [domain])
-            }
+          let hasArtistRule = rules.contains {
+            if case .artist = $0.trigger { return true }
+            return false
           }
-          model.applyRule(matched, using: service)
+          let hosts = idle && hasSiteRule ? await SiteWatcher.visibleTabHosts() : []
+          // Titles are trusted only from browsers that audibly play right now: an open
+          // search page naming an artist is what is being read, not what is being heard.
+          let titles =
+            idle && hasArtistRule
+            ? await SiteWatcher.visibleTabTitles(audible: AudibleProcesses.outputtingBundleIDs())
+            : []
+          let context = RuleMatcher.Context(
+            deviceModel: model.panel.summary.modelName,
+            playingBundleID: playing?.bundleID,
+            playingArtist: playing?.artist,
+            frontmostBundleID: frontmost,
+            browserHosts: hosts,
+            browserTitles: titles
+          )
+          model.applyRule(RuleMatcher.match(rules, in: context), using: service)
         } else {
           model.applyRule(nil, using: service)
         }
@@ -941,6 +1080,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     if let scrollMonitor { NSEvent.removeMonitor(scrollMonitor) }
     mediaGestures?.stop()
     updateChecker.stop()
+    // The camera must not outlive the app either; stopping the tracker first also
+    // spares one pointless "face lost" fade while the spatializer is torn down.
+    model.headTracking.setEnabled(false)
+    // The spatializer mutes the system's own output while it runs; it must give that
+    // back before the process dies, or the quit leaves the Mac silent. setEnabled(false)
+    // tears the tap down synchronously.
+    model.spatial.setEnabled(false)
     controller?.stop()
     // The process dies when this returns, and a fire-and-forget task has no
     // guarantee of running before it does. Wait for the session to actually stop —

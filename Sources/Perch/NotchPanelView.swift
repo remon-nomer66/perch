@@ -273,68 +273,83 @@ struct NotchPanelView: View {
 
   @ViewBuilder
   private var pageContent: some View {
-    switch model.summary.status {
-    case .ready, .unverified:
-      VStack(alignment: .leading, spacing: 0) {
-        // Every page sits side by side on one strip that slides as a whole, so the
-        // page being left really does exit toward the side the new one arrives from —
-        // the row of sheets the horizontal scroll and the dots have always implied.
-        PageStripLayout(progress: CGFloat(currentPage)) {
-          ForEach(pages) { panelPage in
-            panelPage.content
-              .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-              // The pages carry animations and transitions of their own; without an
-              // isolating group, a child mid-transition keeps rendering against the
-              // slot's stale geometry while the strip slides — which is how a pill
-              // ghost ended up floating over the artwork.
-              .geometryGroup()
-              // Each sheet is cut at its own slot: content wider than the page can
-              // never bleed into a neighbouring sheet mid-slide, or across the
-              // media zone on the way out.
-              .clipped()
-          }
-        }
-        // A read-only session still shows every reading, but its controls must not
-        // pretend: a write the coordinator will refuse is not offered. The caveat
-        // line below says why.
-        .disabled(!model.summary.acceptsWrites)
-
-        HStack(spacing: 8) {
-          if let caveat = model.summary.caveat {
-            Caveat(text: caveat)
-          }
-          Spacer(minLength: 0)
-          PageIndicator(count: pages.count, index: currentPage)
-          settingsGear
+    let shown = displayedPages
+    VStack(alignment: .leading, spacing: 0) {
+      // Every page sits side by side on one strip that slides as a whole, so the
+      // page being left really does exit toward the side the new one arrives from —
+      // the row of sheets the horizontal scroll and the dots have always implied.
+      PageStripLayout(progress: CGFloat(currentPage)) {
+        ForEach(shown) { panelPage in
+          panelPage.content
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            // The pages carry animations and transitions of their own; without an
+            // isolating group, a child mid-transition keeps rendering against the
+            // slot's stale geometry while the strip slides — which is how a pill
+            // ghost ended up floating over the artwork.
+            .geometryGroup()
+            // Each sheet is cut at its own slot: content wider than the page can
+            // never bleed into a neighbouring sheet mid-slide, or across the
+            // media zone on the way out.
+            .clipped()
+            // A read-only session must not offer device writes it will refuse — but
+            // the common (device-independent) sheets stay usable regardless.
+            .disabled(!panelPage.isCommon && !model.summary.acceptsWrites)
         }
       }
-      .clipped()
-      .animation(.easeOut(duration: 0.24), value: page)
 
-    case .noDevice:
-      notice(L("対応機器が音声の出力先になっていません", "No supported device is the sound output"))
-    case .connecting:
-      notice(L("接続しています", "Connecting"))
-    case .reading:
-      notice(L("機器の情報を読み取っています", "Reading device information"))
-    case .takenByAnotherDevice:
-      notice(L("別の端末が操作しています", "Another device is in control"), retry: retry)
-    case .unreachable:
-      notice(L("機器に接続できませんでした", "Could not connect to the device"), retry: retry)
+      HStack(spacing: 8) {
+        if let caveat = model.summary.caveat {
+          Caveat(text: caveat)
+        }
+        Spacer(minLength: 0)
+        PageIndicator(count: shown.count, index: currentPage, commonCount: PanelPages.homeIndex)
+        settingsGear
+      }
+    }
+    .clipped()
+    .animation(.easeOut(duration: 0.24), value: page)
+  }
+
+  /// The sheets to show for the current state. With a device present, its sheets follow
+  /// the common ones. Otherwise the device region collapses to a single status sheet at
+  /// the home slot, so the common (device-independent) sheets stay reachable to its left.
+  private var displayedPages: [PanelPage] {
+    switch model.summary.status {
+    case .ready, .unverified:
+      return pages
+    default:
+      return pages.filter(\.isCommon) + [statusPage]
     }
   }
 
-  /// A notice with the same bottom-right gear the sheets carry: the settings must
-  /// stay reachable from the panel with nothing connected at all. A retry closure
-  /// adds the way back for the states that only move on an explicit ask.
-  private func notice(_ text: String, retry: (() async -> Void)? = nil) -> some View {
-    VStack(alignment: .leading, spacing: 0) {
+  /// The device region's stand-in when nothing is readable: the reason it is not, plus
+  /// a retry for the states that only move on an explicit ask.
+  private var statusPage: PanelPage {
+    let content: AnyView
+    switch model.summary.status {
+    case .noDevice:
+      content = AnyView(Notice(text: L("対応機器が音声の出力先になっていません", "No supported device is the sound output")))
+    case .connecting:
+      content = AnyView(Notice(text: L("接続しています", "Connecting")))
+    case .reading:
+      content = AnyView(Notice(text: L("機器の情報を読み取っています", "Reading device information")))
+    case .takenByAnotherDevice:
+      content = AnyView(statusNotice(L("別の端末が操作しています", "Another device is in control"), retry: retry))
+    case .unreachable:
+      content = AnyView(statusNotice(L("機器に接続できませんでした", "Could not connect to the device"), retry: retry))
+    case .ready, .unverified:
+      content = AnyView(EmptyView())
+    }
+    // The stand-in offers no device writes — its only control is the session-level
+    // retry, which must stay pressable exactly in the read-only states that show it.
+    // Left write-gated it would disable that button in both of them.
+    return PanelPage(id: "device-status", isCommon: true, content: content)
+  }
+
+  private func statusNotice(_ text: String, retry: (() async -> Void)?) -> some View {
+    VStack(alignment: .leading, spacing: 8) {
       Notice(text: text)
-      HStack {
-        if let retry { RetryButton(action: retry) }
-        Spacer(minLength: 0)
-        settingsGear
-      }
+      if let retry { RetryButton(action: retry) }
     }
   }
 
@@ -356,7 +371,7 @@ struct NotchPanelView: View {
   }
 
   private var currentPage: Int {
-    min(page, max(pages.count - 1, 0))
+    min(page, max(displayedPages.count - 1, 0))
   }
 }
 
@@ -854,6 +869,9 @@ private struct BatteryPulse: ViewModifier {
 
 struct PanelPage: Identifiable {
   let id: String
+  /// A device-independent sheet (the common region, left of home). Stays usable with
+  /// nothing connected and is never disabled by the device's write state.
+  var isCommon = false
   let content: AnyView
 }
 
@@ -862,15 +880,30 @@ struct PanelPage: Identifiable {
 private struct PageIndicator: View {
   let count: Int
   let index: Int
+  /// The leading dots that stand for the common (device-independent) sheets. Drawn
+  /// hollow so the split from the device sheets reads at a glance.
+  var commonCount: Int = 0
 
   var body: some View {
     HStack(spacing: 4) {
       ForEach(0..<count, id: \.self) { position in
-        Circle()
-          .fill(.white.opacity(position == index ? 0.85 : 0.22))
-          .frame(width: 4, height: 4)
+        dot(at: position)
       }
     }
     .animation(.easeOut(duration: 0.15), value: index)
+  }
+
+  @ViewBuilder
+  private func dot(at position: Int) -> some View {
+    let selected = position == index
+    if position < commonCount && !selected {
+      Circle()
+        .strokeBorder(.white.opacity(0.45), lineWidth: 1)
+        .frame(width: 4, height: 4)
+    } else {
+      Circle()
+        .fill(.white.opacity(selected ? 0.85 : 0.22))
+        .frame(width: 4, height: 4)
+    }
   }
 }

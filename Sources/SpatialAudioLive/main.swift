@@ -1,0 +1,349 @@
+import AVFoundation
+import Darwin
+import Foundation
+import SpatialAudioKit
+
+// システム音のリアルタイム空間化（本命）。
+//
+//   引数 multiband : マルチバンド+M/S 空間化（本命）。低音は両耳へ直通、中高域を空間化。
+//   引数 auto      : multiband に自動バランスを重ねる。直近の音を測り、低音ゲインと
+//                    幅をゆっくり自動追従（曲が変わっても数秒で馴染む）。
+//   引数 wanderNN  : 音源をゆっくり漂わせる振れ幅（度）。既定6。例 wander10。nowander で無効。
+//   引数 beat[NN]  : 拍（スペクトルフラックスの onset）に反応して音場をパルスさせる。既定5度。例 beat8。
+//   引数 bgm[NNN] : 値で合成したBGM（既定120BPM・8分グリッド）を空間化して再生。
+//                    システム音は取得しないので許可も再生アプリも不要。拍検出の
+//                    答え合わせ用（拍リアクティブは既定ON）。例 bgm100。
+//   引数 tune     : 対話調整モード。再生しながらキー操作で音場を追い込む。
+//   引数 rotate   : リスナーの向きをゆっくり回す効果デモ。
+//   引数 nomute   : 原音をミュートしない（原音＋空間化版を同時に鳴らして比較）。
+// 実機・ヘッドホンで実行する。
+
+func fail(_ message: String) -> Never {
+  FileHandle.standardError.write(Data((message + "\n").utf8))
+  exit(1)
+}
+
+// 端末の生入力（1キーずつ取得）。終了時と割り込み時に必ず元へ戻す。
+nonisolated(unsafe) var savedTermios = termios()
+nonisolated(unsafe) var rawEnabled = false
+
+func enableRawInput() {
+  tcgetattr(STDIN_FILENO, &savedTermios)
+  var raw = savedTermios
+  raw.c_lflag &= ~(tcflag_t(ECHO) | tcflag_t(ICANON))
+  tcsetattr(STDIN_FILENO, TCSANOW, &raw)
+  rawEnabled = true
+}
+
+func disableRawInput() {
+  if rawEnabled {
+    tcsetattr(STDIN_FILENO, TCSANOW, &savedTermios)
+    rawEnabled = false
+  }
+}
+
+@available(macOS 14.4, *)
+func runLive() -> Never {
+  let arguments = Set(CommandLine.arguments.dropFirst())
+  let auto = arguments.contains("auto")
+  let multiband = arguments.contains("multiband") || auto
+  let tune = arguments.contains("tune")
+  let rotate = arguments.contains("rotate")
+  // 既定は空間化版だけを流す（調整・本番とも耳で判断しやすい）。nomute で無効化。
+  let muteOriginal = !arguments.contains("nomute")
+
+  // 揺らぎの振れ幅（度）。既定6、nowander で0、wanderNN で指定。
+  var wanderDegrees = 6.0
+  if arguments.contains("nowander") {
+    wanderDegrees = 0
+  } else if let token = arguments.first(where: { $0.hasPrefix("wander") && $0 != "wander" }),
+    let value = Double(token.dropFirst("wander".count)), value >= 0, value <= 30 {
+    wanderDegrees = value
+  }
+
+  // 拍リアクティブの振れ幅（度）。既定0（無効）、beat で5、beatNN で指定。
+  var beatDegrees = 0.0
+  if let token = arguments.first(where: { $0.hasPrefix("beat") }) {
+    if token == "beat" {
+      beatDegrees = 5
+    } else if let value = Double(token.dropFirst("beat".count)), value >= 0, value <= 30 {
+      beatDegrees = value
+    }
+  }
+
+  // 合成BGMモード: 値で作ったテンポ既知のBGMを流し、拍検出を答え合わせする。
+  if let token = arguments.first(where: { $0.hasPrefix("bgm") }) {
+    var bpm = 120.0
+    if let value = Double(token.dropFirst("bgm".count)), value >= 40, value <= 220 {
+      bpm = value
+    }
+    runBGM(
+      bpm: bpm, autoBalance: auto, wanderDegrees: wanderDegrees,
+      beatDegrees: beatDegrees > 0 ? beatDegrees : 5  // 拍の確認が主目的なので既定ON
+    )
+  }
+
+  if multiband {
+    runMultiband(
+      muteOriginal: muteOriginal, autoBalance: auto,
+      wanderDegrees: wanderDegrees, beatDegrees: beatDegrees
+    )
+  }
+
+  let live: LiveSpatializer
+  do {
+    live = try LiveSpatializer(
+      parameters: SpatialAudioParameters(isEnabled: true, field: StereoField(), quality: .high),
+      muteOriginal: muteOriginal
+    )
+  } catch {
+    fail("初期化に失敗: \(error)")
+  }
+
+  do {
+    try live.start()
+  } catch {
+    fail("開始に失敗: \(error)")
+  }
+
+  let format = live.captureFormat
+  print("システム音のリアルタイム空間化を開始しました。")
+  print(String(format: "  取得フォーマット: %.0f Hz / %u ch", format.mSampleRate, format.mChannelsPerFrame))
+  if muteOriginal {
+    print("  原音はミュート中。空間化版だけが流れます（音が消えたら Ctrl-C で復帰）。")
+  } else {
+    print("  原音ミュートなし。原音＋空間化版が同時に鳴ります（二重は正常）。")
+  }
+
+  if tune {
+    runTuner(live)
+  } else if rotate {
+    runRotateDemo(live)
+  } else {
+    print("正面固定で空間化中。Ctrl-C で停止。")
+    while true { Thread.sleep(forTimeInterval: 1.0) }
+  }
+}
+
+@available(macOS 14.4, *)
+func runMultiband(muteOriginal: Bool, autoBalance: Bool, wanderDegrees: Double, beatDegrees: Double) -> Never {
+  // タップは出力デバイスのレートで届くので、グラフもそれに合わせて組む
+  // （48kHz 決め打ちだと 44.1kHz の機器で速度とピッチが狂う）。
+  let sampleRate = SystemAudioTap.defaultOutputNominalSampleRate() ?? 48_000
+  let spatializer: MultibandSpatializer
+  do {
+    spatializer = try MultibandSpatializer(
+      muteOriginal: muteOriginal, autoBalance: autoBalance,
+      wanderDegrees: wanderDegrees, beatDegrees: beatDegrees,
+      sampleRate: sampleRate
+    )
+  } catch {
+    fail("マルチバンド初期化に失敗: \(error)")
+  }
+  do {
+    try spatializer.start()
+  } catch {
+    fail("開始に失敗: \(error)")
+  }
+
+  let format = spatializer.captureFormat
+  print("マルチバンド + M/S 空間化中。低音は両耳へ直通、中高域を空間化しています。")
+  print(String(format: "  取得フォーマット: %.0f Hz / %u ch", format.mSampleRate, format.mChannelsPerFrame))
+  if autoBalance {
+    print("  自動バランス: ON。直近の音を測り、低音ゲインと幅をゆっくり追従します。")
+  }
+  if wanderDegrees > 0 {
+    print(String(format: "  揺らぎ: ±%.0f° で音源をゆっくり漂わせています。", wanderDegrees))
+  }
+  if beatDegrees > 0 {
+    print(String(format: "  拍リアクティブ: ON（±%.0f°）。音の立ち上がりで音場がパルスします。", beatDegrees))
+  }
+  if !muteOriginal {
+    print("  原音ミュートなし（原音＋空間化版）。")
+  }
+  print("何か音楽を再生してください。Ctrl-C で停止。\n")
+  runMovementDisplay(spatializer)
+}
+
+/// 値で合成したBGM（テンポ既知・8分グリッド）を空間化して再生する。
+/// システム音は取得しないので、許可も再生アプリも要らない。拍検出の答え合わせ用。
+@available(macOS 14.4, *)
+func runBGM(bpm: Double, autoBalance: Bool, wanderDegrees: Double, beatDegrees: Double) -> Never {
+  let spatializer: MultibandSpatializer
+  do {
+    spatializer = try MultibandSpatializer(
+      muteOriginal: false, autoBalance: autoBalance,
+      wanderDegrees: wanderDegrees, beatDegrees: beatDegrees
+    )
+    try spatializer.startWithoutCapture()
+  } catch {
+    fail("BGMモード初期化に失敗: \(error)")
+  }
+
+  print(String(format: "合成BGM（%.0f BPM・4小節ループ Am→F→C→G）を空間化して再生中。", bpm))
+  print(String(format: "  拍は %.2f 秒ごと、発音はすべて8分グリッド（%.3f 秒刻み）に載っています。", 60 / bpm, 30 / bpm))
+  print(String(format: "  拍リアクティブ: ±%.0f°。拍の数値がグリッドに合って跳ねるか確認してください。", beatDegrees))
+  print("Ctrl-C で停止。\n")
+
+  // 生成スレッド: 実時間より300msだけ先行して feed し続ける（ドリフトしない実時間追従）。
+  let generatorThread = Thread {
+    var generator = BGMGenerator(bpm: bpm)
+    let blockFrames = 4_800
+    let blockSeconds = Double(blockFrames) / generator.sampleRate
+    let start = Date()
+    var generatedSeconds = 0.0
+    while true {
+      let target = -start.timeIntervalSinceNow + 0.3
+      while generatedSeconds < target {
+        let (left, right) = generator.render(frameCount: blockFrames)
+        spatializer.feed(left: left, right: right)
+        generatedSeconds += blockSeconds
+      }
+      Thread.sleep(forTimeInterval: 0.05)
+    }
+  }
+  generatorThread.start()
+  runMovementDisplay(spatializer)
+}
+
+/// 揺らぎの角度・拍の強さ・推定テンポを、ゲージと数値でリアルタイム表示し続ける。
+@available(macOS 14.4, *)
+func runMovementDisplay(_ spatializer: MultibandSpatializer) -> Never {
+  while true {
+    let state = spatializer.movementState
+    // ♪ は揺らぎがテンポに同期していることを示す。
+    let syncMark = state.wanderSyncWeight > 0.7 ? "♪" : " "
+    let tempoText = state.estimatedBPM.map { String(format: "%3.0f", $0) } ?? "---"
+    let line =
+      "\r揺らぎ  "
+      + "中央 " + gauge(state.centerAzimuth) + String(format: "%+5.1f°", state.centerAzimuth)
+      + "  左 " + gauge(state.leftAzimuth) + String(format: "%+5.1f°", state.leftAzimuth)
+      + "  右 " + gauge(state.rightAzimuth) + String(format: "%+5.1f°", state.rightAzimuth)
+      + "  拍 " + String(format: "%4.2f ", state.beatLevel) + beatBar(state.beatLevel)
+      + "  テンポ " + tempoText + " BPM" + syncMark + "   "
+    print(line, terminator: "")
+    fflush(stdout)
+    Thread.sleep(forTimeInterval: 0.05)
+  }
+}
+
+/// 方位角（度）を中央基準の横ゲージにする。左が負、右が正。
+func gauge(_ degrees: Double, span: Double = 15, width: Int = 9) -> String {
+  let half = width / 2
+  let clamped = max(-span, min(span, degrees))
+  let position = half + Int((clamped / span) * Double(half))
+  var cells = Array(repeating: "·", count: width)
+  cells[half] = "|"  // 中央（基準位置）
+  cells[max(0, min(width - 1, position))] = "●"
+  return "[" + cells.joined() + "]"
+}
+
+/// 拍の強さ（0〜1）を縦棒のバーにする。
+func beatBar(_ level: Double, width: Int = 6) -> String {
+  let filled = max(0, min(width, Int(level * Double(width) + 0.5)))
+  return String(repeating: "▇", count: filled) + String(repeating: "·", count: width - filled)
+}
+
+@available(macOS 14.4, *)
+func runRotateDemo(_ live: LiveSpatializer) -> Never {
+  print("向きをゆっくり回します（効果デモ）。Ctrl-C で停止。\n")
+  var yaw = 0.0
+  while true {
+    live.updateListener(ListenerOrientation(yaw: yaw * .pi / 180, pitch: 0, roll: 0))
+    print(String(format: "\rlistener yaw = %3.0f°", yaw), terminator: "")
+    fflush(stdout)
+    yaw += 15
+    if yaw >= 360 { yaw -= 360 }
+    Thread.sleep(forTimeInterval: 1.5)
+  }
+}
+
+// MARK: - 対話調整モード
+
+@available(macOS 14.4, *)
+func runTuner(_ live: LiveSpatializer) -> Never {
+  // 割り込みでも端末を必ず戻す。
+  signal(SIGINT) { _ in
+    disableRawInput()
+    _exit(0)
+  }
+
+  var spreadDegrees = 30.0  // 中央から左右各スピーカーまでの開き角
+  var distance = 1.0        // メートル
+  var elevationDegrees = 0.0
+  var aimDegrees = 0.0      // 音場全体の向き（リスナーの yaw）
+
+  func clamp(_ v: Double, _ lo: Double, _ hi: Double) -> Double { min(max(v, lo), hi) }
+
+  func apply() {
+    let field = StereoField(
+      spread: spreadDegrees * .pi / 180,
+      elevation: elevationDegrees * .pi / 180,
+      distance: distance
+    )
+    live.apply(SpatialAudioParameters(isEnabled: true, field: field, quality: .high))
+    live.updateListener(ListenerOrientation(yaw: aimDegrees * .pi / 180, pitch: 0, roll: 0))
+    print(
+      String(
+        format: "\r幅=±%2.0f°  距離=%.2fm  高さ=%+3.0f°  向き=%+4.0f°        ",
+        spreadDegrees, distance, elevationDegrees, aimDegrees
+      ),
+      terminator: ""
+    )
+    fflush(stdout)
+  }
+
+  print("""
+
+    ── 調整モード ──  音を鳴らしながらキーで音場を動かせます。
+      幅   : [ 狭く   ] 広く
+      距離 : - 近く   = 遠く
+      高さ : s 下げる w 上げる
+      向き : a 左へ   d 右へ
+      r 既定に戻す    p 現在値を確定表示    q 終了
+    """)
+  apply()
+
+  enableRawInput()
+  defer { disableRawInput() }
+
+  var byte: UInt8 = 0
+  while read(STDIN_FILENO, &byte, 1) == 1 {
+    switch Character(UnicodeScalar(byte)) {
+    case "[": spreadDegrees = clamp(spreadDegrees - 5, 0, 90)
+    case "]": spreadDegrees = clamp(spreadDegrees + 5, 0, 90)
+    case "-", "_": distance = clamp(distance - 0.25, 0.25, 5)
+    case "=", "+": distance = clamp(distance + 0.25, 0.25, 5)
+    case "s": elevationDegrees = clamp(elevationDegrees - 5, -80, 80)
+    case "w": elevationDegrees = clamp(elevationDegrees + 5, -80, 80)
+    case "a": aimDegrees = clamp(aimDegrees - 5, -180, 180)
+    case "d": aimDegrees = clamp(aimDegrees + 5, -180, 180)
+    case "r":
+      spreadDegrees = 30; distance = 1; elevationDegrees = 0; aimDegrees = 0
+    case "p":
+      print(
+        String(
+          format: "\n確定値: 幅=±%2.0f° 距離=%.2fm 高さ=%+3.0f° 向き=%+4.0f°",
+          spreadDegrees, distance, elevationDegrees, aimDegrees
+        )
+      )
+    case "q":
+      disableRawInput()
+      live.stop()
+      print("\n終了しました。")
+      exit(0)
+    default:
+      continue
+    }
+    apply()
+  }
+  disableRawInput()
+  live.stop()
+  exit(0)
+}
+
+if #available(macOS 14.4, *) {
+  runLive()
+} else {
+  fail("Core Audio プロセスタップは macOS 14.4 以降が必要です。")
+}
