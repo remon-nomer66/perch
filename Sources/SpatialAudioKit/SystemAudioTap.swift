@@ -19,6 +19,8 @@ public final class SystemAudioTap {
     case createAggregateFailed(OSStatus)
     case createIOProcFailed(OSStatus)
     case startFailed(OSStatus)
+    /// 自プロセスの除外が必須なのに、自分のプロセスオブジェクトを特定できなかった。
+    case resolveCurrentProcessFailed
   }
 
   /// 取得した1ブロックぶんの音声。オーディオスレッドから呼ばれる。
@@ -53,8 +55,13 @@ public final class SystemAudioTap {
 
   public func start() throws {
     // 1. タップ記述。システム全体を取得（必要なら自プロセスを除外）。
+    // 除外が必須の構成（空間化した音を自分で再生する）で自分を特定できないまま
+    // 進むと、自分の出力を再取得するフィードバックループになる。開始しない。
     var excluded: [AudioObjectID] = []
-    if excludeCurrentProcess, let ownObject = Self.currentProcessObjectID() {
+    if excludeCurrentProcess {
+      guard let ownObject = Self.currentProcessObjectID() else {
+        throw TapError.resolveCurrentProcessFailed
+      }
       excluded = [ownObject]
     }
     let description = CATapDescription(stereoGlobalTapButExcludeProcesses: excluded)
@@ -156,6 +163,33 @@ public final class SystemAudioTap {
 
   deinit {
     cleanUp()
+  }
+
+  /// 既定出力デバイスの公称サンプルレート。タップはこのレートでフレームを届けるので、
+  /// 空間化グラフをこれに合わせて組むために読む。読めなければ nil。
+  public static func defaultOutputNominalSampleRate() -> Double? {
+    var deviceAddress = AudioObjectPropertyAddress(
+      mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+      mScope: kAudioObjectPropertyScopeGlobal,
+      mElement: kAudioObjectPropertyElementMain
+    )
+    var device = AudioObjectID(kAudioObjectUnknown)
+    var deviceSize = UInt32(MemoryLayout<AudioObjectID>.size)
+    let deviceStatus = AudioObjectGetPropertyData(
+      AudioObjectID(kAudioObjectSystemObject), &deviceAddress, 0, nil, &deviceSize, &device
+    )
+    guard deviceStatus == noErr, device != AudioObjectID(kAudioObjectUnknown) else { return nil }
+
+    var rateAddress = AudioObjectPropertyAddress(
+      mSelector: kAudioDevicePropertyNominalSampleRate,
+      mScope: kAudioObjectPropertyScopeGlobal,
+      mElement: kAudioObjectPropertyElementMain
+    )
+    var rate = Float64(0)
+    var rateSize = UInt32(MemoryLayout<Float64>.size)
+    let rateStatus = AudioObjectGetPropertyData(device, &rateAddress, 0, nil, &rateSize, &rate)
+    guard rateStatus == noErr, rate > 0 else { return nil }
+    return rate
   }
 
   /// 自プロセスの pid を Core Audio のプロセスオブジェクトIDへ変換する。

@@ -340,7 +340,10 @@ struct NotchPanelView: View {
     case .ready, .unverified:
       content = AnyView(EmptyView())
     }
-    return PanelPage(id: "device-status", content: content)
+    // The stand-in offers no device writes — its only control is the session-level
+    // retry, which must stay pressable exactly in the read-only states that show it.
+    // Left write-gated it would disable that button in both of them.
+    return PanelPage(id: "device-status", isCommon: true, content: content)
   }
 
   private func statusNotice(_ text: String, retry: (() async -> Void)?) -> some View {

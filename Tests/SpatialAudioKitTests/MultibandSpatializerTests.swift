@@ -68,3 +68,70 @@ import Testing
   )
   #expect(mixed.center.count == 1)
 }
+
+// MARK: - サンプルレート照合
+
+@available(macOS 14.4, *)
+@Test func theTapsReportedRateMustMatchTheGraphsRate() {
+  // 一致（微小な浮動小数差込み）は通す。実レートが違えば弾く — 48kHz 決め打ちのまま
+  // 44.1kHz の機器で動かすと全システム音の速度とピッチが狂うため。
+  #expect(MultibandSpatializer.sampleRateMatches(expected: 48_000, reported: 48_000))
+  #expect(MultibandSpatializer.sampleRateMatches(expected: 44_100, reported: 44_100.0001))
+  #expect(!MultibandSpatializer.sampleRateMatches(expected: 48_000, reported: 44_100))
+  #expect(!MultibandSpatializer.sampleRateMatches(expected: 48_000, reported: 96_000))
+}
+
+@available(macOS 14.4, *)
+@Test func anUnreadableTapRateDoesNotBlockStarting() {
+  // 0 は「フォーマットを読めていない」— 照合できない以上、開始は妨げない。
+  #expect(MultibandSpatializer.sampleRateMatches(expected: 48_000, reported: 0))
+  #expect(MultibandSpatializer.sampleRateMatches(expected: 48_000, reported: -1))
+}
+
+// MARK: - 取得確認の無音判定
+
+@available(macOS 14.4, *)
+@Test func signalInOnlyTheRightChannelStillProvesCapture() throws {
+  // ハードパンされた素材は片チャンネルにしか信号を持たない。左だけを見ていると
+  // 「音声が検出できない」と誤判定して 12 秒後にオフへ戻してしまう。
+  let spatializer = try MultibandSpatializer(muteOriginal: false)
+  let silent = [Float](repeating: 0, count: 256)
+  var rightOnly = [Float](repeating: 0, count: 256)
+  rightOnly[10] = 0.5
+  #expect(!spatializer.hasAudioSignal)
+  spatializer.feed(left: silent, right: rightOnly)
+  #expect(spatializer.hasAudioSignal)
+}
+
+@available(macOS 14.4, *)
+@Test func silenceInBothChannelsDoesNotProveCapture() throws {
+  let spatializer = try MultibandSpatializer(muteOriginal: false)
+  let silent = [Float](repeating: 0, count: 256)
+  spatializer.feed(left: silent, right: silent)
+  #expect(!spatializer.hasAudioSignal)
+  #expect(spatializer.hasReceivedAudio)
+}
+
+// MARK: - 出力構成の変更通知
+
+@available(macOS 14.4, *)
+@Test func anEngineConfigurationChangeReachesTheOwner() throws {
+  // エンジンは構成変更で黙って止まる。所有者が作り直せるよう、通知が転送されること。
+  let spatializer = try MultibandSpatializer(muteOriginal: false)
+  let hit = OSAllocatedUnfairLockedBox(false)
+  spatializer.onConfigurationChange = { hit.set(true) }
+  NotificationCenter.default.post(
+    name: .AVAudioEngineConfigurationChange,
+    object: spatializer.graphEngineForNotifications
+  )
+  #expect(hit.get())
+}
+
+/// 通知クロージャ（@Sendable）から書ける最小の箱。
+private final class OSAllocatedUnfairLockedBox: @unchecked Sendable {
+  private let lock = NSLock()
+  private var value: Bool
+  init(_ value: Bool) { self.value = value }
+  func set(_ newValue: Bool) { lock.lock(); value = newValue; lock.unlock() }
+  func get() -> Bool { lock.lock(); defer { lock.unlock() }; return value }
+}

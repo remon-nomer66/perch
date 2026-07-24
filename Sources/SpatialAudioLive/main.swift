@@ -127,11 +127,15 @@ func runLive() -> Never {
 
 @available(macOS 14.4, *)
 func runMultiband(muteOriginal: Bool, autoBalance: Bool, wanderDegrees: Double, beatDegrees: Double) -> Never {
+  // タップは出力デバイスのレートで届くので、グラフもそれに合わせて組む
+  // （48kHz 決め打ちだと 44.1kHz の機器で速度とピッチが狂う）。
+  let sampleRate = SystemAudioTap.defaultOutputNominalSampleRate() ?? 48_000
   let spatializer: MultibandSpatializer
   do {
     spatializer = try MultibandSpatializer(
       muteOriginal: muteOriginal, autoBalance: autoBalance,
-      wanderDegrees: wanderDegrees, beatDegrees: beatDegrees
+      wanderDegrees: wanderDegrees, beatDegrees: beatDegrees,
+      sampleRate: sampleRate
     )
   } catch {
     fail("マルチバンド初期化に失敗: \(error)")

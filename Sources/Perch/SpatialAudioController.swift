@@ -47,6 +47,7 @@ final class SpatialAudioController: ObservableObject {
   private var engine: AnyObject?
   private var verifyTask: Task<Void, Never>?
   private var tempoTask: Task<Void, Never>?
+  private var configRebuildTask: Task<Void, Never>?
   private let defaults: UserDefaults
 
   /// Core Audio process taps — how the system audio is captured — arrived in macOS 14.4.
@@ -75,12 +76,32 @@ final class SpatialAudioController: ObservableObject {
 
   @available(macOS 14.4, *)
   private func makeAndStartEngine() throws -> MultibandSpatializer {
+    // タップは出力デバイスのレートでフレームを届けるので、グラフもそれに合わせて組む。
+    // 48kHz 決め打ちだと 44.1kHz の機器（AAC 接続の Bluetooth 等）で全システム音の
+    // 速度とピッチが狂う。読めなければ従来通り 48kHz で試み、開始時の照合が実レートを
+    // 教えてくれたらそのレートで一度だけ作り直す。
+    let preferred = SystemAudioTap.defaultOutputNominalSampleRate() ?? 48_000
+    do {
+      return try makeAndStartEngine(sampleRate: preferred)
+    } catch SpatializerStartError.sampleRateMismatch(_, let actual) where actual > 0 {
+      return try makeAndStartEngine(sampleRate: actual)
+    }
+  }
+
+  @available(macOS 14.4, *)
+  private func makeAndStartEngine(sampleRate: Double) throws -> MultibandSpatializer {
     let spatializer = try MultibandSpatializer(
       muteOriginal: true,
       autoBalance: autoBalance,
       wanderDegrees: wander ? 6 : 0,
-      beatDegrees: beat ? 5 : 0
+      beatDegrees: beat ? 5 : 0,
+      sampleRate: sampleRate
     )
+    spatializer.onConfigurationChange = { [weak self] in
+      Task { @MainActor [weak self] in
+        self?.handleEngineConfigurationChange()
+      }
+    }
     try spatializer.start()
     return spatializer
   }
@@ -184,6 +205,28 @@ final class SpatialAudioController: ObservableObject {
     spatializer?.setListenerDistance(ratio: distanceRatio)
   }
 
+  /// The output configuration changed under a live engine — headphones swapped for
+  /// other headphones, a sample-rate change, a wake from sleep. AVAudioEngine stops
+  /// itself and stays stopped, but the tap keeps muting the system: without a rebuild
+  /// the whole Mac goes silent while the toggle still shows on. The route gate cannot
+  /// catch this — headphones-to-headphones never flips `isHeadphones`. Rebuild here;
+  /// if the new route is not headphones after all, the gate turns the feature off
+  /// right after, which is the intended cascade.
+  private func handleEngineConfigurationChange() {
+    guard #available(macOS 14.4, *), isEnabled || isStarting else { return }
+    configRebuildTask?.cancel()
+    configRebuildTask = Task { @MainActor [weak self] in
+      // A device switch fires a burst of these; rebuild once, after it settles.
+      try? await Task.sleep(for: .milliseconds(350))
+      guard let self, !Task.isCancelled else { return }
+      if self.isEnabled {
+        self.reconfigureIfRunning()
+      } else if self.isStarting {
+        self.start()
+      }
+    }
+  }
+
   /// A running engine with new options: rebuild in place, staying on. Capture is already
   /// confirmed, so no prompt and no waiting are involved.
   private func reconfigureIfRunning() {
@@ -229,6 +272,8 @@ final class SpatialAudioController: ObservableObject {
     verifyTask = nil
     tempoTask?.cancel()
     tempoTask = nil
+    configRebuildTask?.cancel()
+    configRebuildTask = nil
     estimatedBPM = nil
     if #available(macOS 14.4, *) {
       (engine as? MultibandSpatializer)?.stop()

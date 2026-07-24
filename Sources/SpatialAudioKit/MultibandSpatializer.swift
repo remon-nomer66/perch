@@ -1,6 +1,7 @@
 import AVFoundation
 import CoreAudio
 import Foundation
+import os
 
 /// マルチバンド + ミッド/サイドの設定。
 public struct MultibandConfig: Sendable, Equatable {
@@ -46,6 +47,13 @@ public struct MultibandConfig: Sendable, Equatable {
   }
 }
 
+/// 開始時に取得系の前提が崩れていた場合の失敗。
+public enum SpatializerStartError: Error, Equatable {
+  /// タップの実サンプルレートがグラフの構築レートと一致しない。実レートのまま処理すると
+  /// 全システム音の再生速度・ピッチ・BPM がずれるので開始しない。`actual` で作り直せば整合する。
+  case sampleRateMismatch(expected: Double, actual: Double)
+}
+
 /// システム音をマルチバンド + M/S で空間化する。
 ///
 /// **低域は HRTF を通さず、両耳へフルレベルで直通**する（無指向性の低音は空間化すると
@@ -63,15 +71,39 @@ public final class MultibandSpatializer: @unchecked Sendable {
   private var tap: SystemAudioTap?
   private let muteOriginal: Bool
 
-  /// True once any capture callback has arrived at all.
-  private var receivedAudio = false
-  public var hasReceivedAudio: Bool { receivedAudio }
+  /// オーディオ・解析・メインの3スレッドが共有するミラー値。Swift ではロック無しの
+  /// 共有可変状態はスカラでも未定義動作なので、まとめて一つの unfair lock で守る。
+  /// どの臨界区間も数個のスカラのコピーだけで、レンダースレッドが取るのは一瞬。
+  private struct SharedState {
+    /// True once any capture callback has arrived at all.
+    var receivedAudio = false
+    /// True once a non-silent sample has been captured. A denied system-audio
+    /// permission still fires callbacks, but with silence — so callbacks arriving is
+    /// not proof of capture. Real (non-zero) audio is.
+    var receivedSignal = false
+    // 耳合わせ用の可変ゲイン（メインが書き、オーディオが読む。autoBalance 時は
+    // オーディオ側が書き戻す）。
+    var lowGain: Float
+    var midGain: Float
+    var sideWidth: Float
+    // ヘッドトラッキングの距離連動（メインが書き、オーディオが読む）。
+    var listenerDistanceRatio = 1.0
+    // 拍解析の結果ミラー（解析キューが書き、オーディオが読んで消費する）。
+    var pendingBeatStrength = 0.0
+    var analysisBPM = Double.nan  // NaN = テンポ不明
+    // 表示用スナップショット（オーディオが書き、メインが読む）。
+    var display = MovementState(
+      centerAzimuth: 0, centerElevation: 0, leftAzimuth: 0, rightAzimuth: 0,
+      beatLevel: 0, estimatedBPM: nil, wanderSyncWeight: 0
+    )
+  }
 
-  /// True once a non-silent sample has been captured. A denied system-audio permission
-  /// still fires callbacks, but with silence — so callbacks arriving is not proof of
-  /// capture. Real (non-zero) audio is. Used to confirm that capture actually works.
-  private var receivedSignal = false
-  public var hasAudioSignal: Bool { receivedSignal }
+  private let shared: OSAllocatedUnfairLock<SharedState>
+
+  public var hasReceivedAudio: Bool { shared.withLock { $0.receivedAudio } }
+  public var hasAudioSignal: Bool { shared.withLock { $0.receivedSignal } }
+  /// 無音走査の打ち切りゲート。オーディオスレッドだけが触る（ロック不要）。
+  private var signalSeen = false
   private static let silenceThreshold: Float = 0.0005
 
   // 音源の基準位置（揺らぎはこれに加算する）と、ゆっくり漂わせる揺らぎ。
@@ -85,16 +117,14 @@ public final class MultibandSpatializer: @unchecked Sendable {
 
   // 拍リアクティブ: スペクトルフラックスの onset で音場をパルス状に動かす。
   // 解析（FFT・自己相関）は音声コールバックの締切を脅かさないよう専用キューで行い、
-  // 結果は単純な数値のミラー越しに受け取る（audio スレッドが読む。競合は無害）。
+  // 結果は `shared` のミラー越しに受け取る。
   private var onsetDetector: SpectralFluxDetector?
   private let analysisQueue = DispatchQueue(label: "SpatialAudioKit.beat-analysis", qos: .userInitiated)
-  private var pendingBeatStrength: Double = 0
-  private var analysisBPM: Double = .nan  // NaN = テンポ不明
   private var beatPulse = BeatPulse()
   private let beatAmplitude: Double  // ラジアン。0 なら拍リアクティブ無効。
 
-  // 表示用: 各音源の現在の揺らぎ量（基準位置からのズレ、ラジアン）。
-  // オーディオスレッドが書き、表示スレッドが読む（表示用途なので競合は無害）。
+  // 各音源の現在の揺らぎ量（基準位置からのズレ、ラジアン）。オーディオスレッドだけが
+  // 触り、ブロック末尾に `shared.display` へスナップショットする。
   private var offCenterAzimuth = 0.0
   private var offCenterElevation = 0.0
   private var offLeftAzimuth = 0.0
@@ -106,13 +136,22 @@ public final class MultibandSpatializer: @unchecked Sendable {
   private var appliedElevation = [Double](repeating: .nan, count: 3)
   private static let positionEpsilon = 0.05 * Double.pi / 180
 
-  // オーディオスレッドから読む可変ゲイン（耳合わせ用。単純なFloatなので競合は軽微）。
-  public var lowGain: Float
-  public var midGain: Float
-  public var sideWidth: Float
+  // 耳合わせ用の可変ゲイン。実体は `shared` にあり、外部にはこれまで通りの
+  // プロパティとして見せる。
+  public var lowGain: Float {
+    get { shared.withLock { $0.lowGain } }
+    set { shared.withLock { $0.lowGain = newValue } }
+  }
+  public var midGain: Float {
+    get { shared.withLock { $0.midGain } }
+    set { shared.withLock { $0.midGain = newValue } }
+  }
+  public var sideWidth: Float {
+    get { shared.withLock { $0.sideWidth } }
+    set { shared.withLock { $0.sideWidth = newValue } }
+  }
 
-  // ヘッドトラッキングの距離連動（lowGain と同じ扱いでオーディオスレッドが読む）。
-  private var listenerDistanceRatio = 1.0
+  // 距離のこもりフィルタ。オーディオスレッドだけが触る。
   private var distanceLowpassLeft = OnePoleLowpass()
   private var distanceLowpassRight = OnePoleLowpass()
 
@@ -132,9 +171,11 @@ public final class MultibandSpatializer: @unchecked Sendable {
   ) throws {
     self.muteOriginal = muteOriginal
     self.sampleRate = sampleRate
-    lowGain = config.lowGain
-    midGain = config.midGain
-    sideWidth = config.sideWidth
+    shared = OSAllocatedUnfairLock(
+      initialState: SharedState(
+        lowGain: config.lowGain, midGain: config.midGain, sideWidth: config.sideWidth
+      )
+    )
     sideSpread = config.sideSpreadDegrees * .pi / 180
     wander = PositionWander(degrees: wanderDegrees)
     beatAmplitude = max(0, beatDegrees) * .pi / 180
@@ -165,7 +206,22 @@ public final class MultibandSpatializer: @unchecked Sendable {
       self.process(bufferListPointer)
     }
     try newTap.start()
+    // タップは出力デバイスのレートでフレームを届ける。グラフの構築レートとずれたまま
+    // 進むと全システム音の速度・ピッチ・BPM が狂うので、ここで照合して弾く。
+    // 呼び出し側は actual で作り直せばよい。
+    let reported = Double(newTap.streamFormat.mSampleRate)
+    guard Self.sampleRateMatches(expected: sampleRate, reported: reported) else {
+      newTap.stop()
+      graph.stop()
+      throw SpatializerStartError.sampleRateMismatch(expected: sampleRate, actual: reported)
+    }
     tap = newTap
+  }
+
+  /// 構築レートとタップの実レートが同じとみなせるか。0 は「読めていない」なので通す
+  /// （照合できない以上、開始を妨げない）。
+  static func sampleRateMatches(expected: Double, reported: Double) -> Bool {
+    reported <= 0 || abs(expected - reported) <= 1
   }
 
   /// システム音の取得なしで開始する（合成BGMのデモ・検証用）。音は feed で供給する。
@@ -182,6 +238,16 @@ public final class MultibandSpatializer: @unchecked Sendable {
     tap?.streamFormat ?? AudioStreamBasicDescription()
   }
 
+  /// 出力構成の変化でエンジンが止まった時の通知（PositionedSourceGraph へ転送）。
+  /// `start()` の前に設定すること。
+  public var onConfigurationChange: (@Sendable () -> Void)? {
+    get { graph.onConfigurationChange }
+    set { graph.onConfigurationChange = newValue }
+  }
+
+  /// テスト用: グラフのエンジン（構成変更通知の object 一致に使う）。
+  var graphEngineForNotifications: AVAudioEngine { graph.engineForNotifications }
+
   public func updateListener(_ orientation: ListenerOrientation) {
     graph.updateListener(orientation)
   }
@@ -189,7 +255,7 @@ public final class MultibandSpatializer: @unchecked Sendable {
   /// ヘッドトラッキングの相対距離（較正時=1.0）。リスナーを幾何のまま後退させ、
   /// 中高域には距離のこもり（一次ローパス）を掛ける。
   public func setListenerDistance(ratio: Double) {
-    listenerDistanceRatio = ratio
+    shared.withLock { $0.listenerDistanceRatio = ratio }
     graph.setListenerZ(DistanceRendering.listenerOffset(ratio: ratio))
   }
 
@@ -260,16 +326,7 @@ public final class MultibandSpatializer: @unchecked Sendable {
   }
 
   public var movementState: MovementState {
-    let toDegrees = 180.0 / Double.pi
-    return MovementState(
-      centerAzimuth: offCenterAzimuth * toDegrees,
-      centerElevation: offCenterElevation * toDegrees,
-      leftAzimuth: offLeftAzimuth * toDegrees,
-      rightAzimuth: offRightAzimuth * toDegrees,
-      beatLevel: beatPulse.level,
-      estimatedBPM: analysisBPM.isNaN ? nil : analysisBPM,
-      wanderSyncWeight: musicalClock.syncWeight
-    )
+    shared.withLock { $0.display }
   }
 
   /// 拍のパルスによる位置オフセット。拍で左右が外へ開き、中央は軽く上へ跳ねる。
@@ -295,15 +352,25 @@ public final class MultibandSpatializer: @unchecked Sendable {
   }
 
   private func processStereo(left: [Float], right: [Float]) {
-    receivedAudio = true
+    // 共有ミラーはブロックあたり数回、ひとまとめに読む（レンダースレッドが
+    // ロックを握るのはスカラのコピーの間だけ）。
+    var (lowGain, midGain, sideWidth, distanceRatio) = shared.withLock {
+      state -> (Float, Float, Float, Double) in
+      state.receivedAudio = true
+      return (state.lowGain, state.midGain, state.sideWidth, state.listenerDistanceRatio)
+    }
     guard !left.isEmpty, !right.isEmpty else { return }
 
     // Prove real capture, not just that the callback fired: a denied permission delivers
-    // silent buffers. Stop scanning once any signal has been seen.
-    if !receivedSignal {
-      for sample in left where abs(sample) > Self.silenceThreshold {
-        receivedSignal = true
-        break
+    // silent buffers. Both channels count — hard-panned material may carry signal in
+    // only one. Stop scanning once any signal has been seen.
+    if !signalSeen {
+      scan: for channel in [left, right] {
+        for sample in channel where abs(sample) > Self.silenceThreshold {
+          signalSeen = true
+          shared.withLock { $0.receivedSignal = true }
+          break scan
+        }
       }
     }
     let (lowLeft, splitHighLeft) = crossoverLeft.split(left)
@@ -311,7 +378,7 @@ public final class MultibandSpatializer: @unchecked Sendable {
 
     // 距離のこもり: 遠ざかっているときだけ中高域を暗くする。低音（両耳直通）は
     // 距離でほとんど鈍らないので触らない。
-    let distanceCutoff = DistanceRendering.lowpassCutoff(ratio: listenerDistanceRatio)
+    let distanceCutoff = DistanceRendering.lowpassCutoff(ratio: distanceRatio)
     let highLeft = distanceLowpassLeft.process(
       splitHighLeft, cutoff: distanceCutoff, sampleRate: sampleRate
     )
@@ -331,8 +398,14 @@ public final class MultibandSpatializer: @unchecked Sendable {
           sideRMS: Self.rmsOfDifference(highLeft, highRight, count: count),
           dt: dt
         )
-        lowGain = analyzer!.lowGain
-        sideWidth = analyzer!.sideWidth
+        let balancedLow = analyzer!.lowGain
+        let balancedWidth = analyzer!.sideWidth
+        lowGain = balancedLow
+        sideWidth = balancedWidth
+        shared.withLock {
+          $0.lowGain = balancedLow
+          $0.sideWidth = balancedWidth
+        }
       }
 
       // 拍・テンポの解析は専用キューへ。ここ（音声スレッド）では投げるだけ。
@@ -341,24 +414,42 @@ public final class MultibandSpatializer: @unchecked Sendable {
         for index in 0..<count {
           mono[index] = (left[index] + right[index]) * 0.5
         }
-        analysisQueue.async { [self] in
+        analysisQueue.async { [self, mono] in
           let strength = onsetDetector.observe(mono: mono)
-          if strength > pendingBeatStrength { pendingBeatStrength = strength }
-          analysisBPM = onsetDetector.estimatedBPM ?? .nan
+          let bpm = onsetDetector.estimatedBPM ?? .nan
+          shared.withLock { state in
+            if strength > state.pendingBeatStrength { state.pendingBeatStrength = strength }
+            state.analysisBPM = bpm
+          }
         }
       }
 
       // 拍パルス: 解析結果を取り込み、短いアタックで滑らかに立ち上げて減衰させる。
-      let strength = pendingBeatStrength
-      if strength > 0 { pendingBeatStrength = 0 }
+      let (strength, bpm) = shared.withLock { state -> (Double, Double) in
+        let pending = state.pendingBeatStrength
+        state.pendingBeatStrength = 0
+        return (pending, state.analysisBPM)
+      }
       beatPulse.advance(strength: strength, dt: dt)
-      let bpm = analysisBPM
       musicalClock.advance(dt: dt, bpm: bpm.isNaN ? nil : bpm)
 
       // ゆっくりの揺らぎ ＋ 拍のパルスで音源を動かす（動く設定の時だけ）。
       if wander.amplitude > 0 || beatAmplitude > 0 {
         applyMovement(time: elapsedTime)
       }
+
+      // 表示用スナップショット（メインスレッドは movementState でこれを読む）。
+      let toDegrees = 180.0 / Double.pi
+      let display = MovementState(
+        centerAzimuth: offCenterAzimuth * toDegrees,
+        centerElevation: offCenterElevation * toDegrees,
+        leftAzimuth: offLeftAzimuth * toDegrees,
+        rightAzimuth: offRightAzimuth * toDegrees,
+        beatLevel: beatPulse.level,
+        estimatedBPM: bpm.isNaN ? nil : bpm,
+        wanderSyncWeight: musicalClock.syncWeight
+      )
+      shared.withLock { $0.display = display }
     }
 
     let mixed = Self.mix(

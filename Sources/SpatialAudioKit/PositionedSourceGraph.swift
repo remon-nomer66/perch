@@ -16,6 +16,13 @@ public final class PositionedSourceGraph: @unchecked Sendable {
   private let monoFormat: AVAudioFormat
   private let stereoFormat: AVAudioFormat
 
+  /// 出力構成の変化（既定出力の切替・サンプルレート変更）でエンジンが自ら止まった時に
+  /// 呼ばれる。止まったエンジンは戻らないので、所有者が作り直す必要がある。放置すると
+  /// タップの原音ミュートだけが生き残り、システム全体が無音のままになる。
+  /// `start()` の前に設定すること（通知は任意スレッドから届く）。
+  public var onConfigurationChange: (@Sendable () -> Void)?
+  private var configurationObserver: (any NSObjectProtocol)?
+
   public init(sampleRate: Double = 48_000, sourceCount: Int) throws {
     guard let mono = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 1),
       let stereo = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 2)
@@ -40,9 +47,24 @@ public final class PositionedSourceGraph: @unchecked Sendable {
     environment.outputType = .headphones
     environment.listenerPosition = AVAudio3DPoint(x: 0, y: 0, z: 0)
     environment.listenerAngularOrientation = ListenerOrientation.forward.audioOrientation
+
+    configurationObserver = NotificationCenter.default.addObserver(
+      forName: .AVAudioEngineConfigurationChange, object: engine, queue: nil
+    ) { [weak self] _ in
+      self?.onConfigurationChange?()
+    }
+  }
+
+  deinit {
+    if let configurationObserver {
+      NotificationCenter.default.removeObserver(configurationObserver)
+    }
   }
 
   public var sourceCount: Int { players.count }
+
+  /// テストが構成変更通知を差し込むための内部フック（通知は object 一致で届くため）。
+  var engineForNotifications: AVAudioEngine { engine }
 
   public func setAlgorithm(_ quality: SpatialRenderingQuality) {
     for player in players {
