@@ -232,10 +232,14 @@ final class AppModel: ObservableObject {
     // sitting between them.
     let nowPlaying = playerQueriesAllowed ? await nowPlayingService.read() : nil
     let session = await service.session
-    let phase = await session.phase
-    let fingerprint = await session.deviceFingerprint
-    let reason = await session.unsupportedReason
-    let acceptsWrites = await session.acceptsWrites
+    // One consistent hop: read piecemeal, an invalidation could land mid-read and show
+    // a ready phase with no model name for a frame — which device-scoped rules read as
+    // "no rule", flapping the settings. See SessionCoordinator.Snapshot.
+    let snap = await session.snapshot
+    let phase = snap.phase
+    let fingerprint = snap.fingerprint
+    let reason = snap.unsupportedReason
+    let acceptsWrites = snap.acceptsWrites
 
     var next = PanelModel()
     next.summary.status = unreachableDebounce.present(
@@ -245,7 +249,7 @@ final class AppModel: ObservableObject {
     next.summary.firmwareVersion = fingerprint?.firmwareVersion
     next.summary.acceptsWrites = acceptsWrites
 
-    let readings = await session.readings
+    let readings = snap.readings
     next.summary.codec = readings.codec?.description
     next.equalizer = equalizerAdjustment.isHolding ? panel.equalizer : readings.equalizer
     next.listeningMode = listeningAdjustment.isHolding ? panel.listeningMode : readings.listeningMode
@@ -283,7 +287,28 @@ final class AppModel: ObservableObject {
     hadContent = hasContent
     next.announcesArrival = arrivalAnnounceUntil.map { ContinuousClock.now < $0 } ?? false
 
+    // The view collapses the device sheets into one status sheet while nothing is
+    // readable (NotchPanelView.displayedPages); the pager must agree on the stop
+    // count, or swipes dead-zone against stops that are not on screen — after a
+    // disconnect from the fourth sheet, a swipe would "move" through pages that no
+    // longer exist before anything visibly changed.
+    let stops = Self.pagerStops(for: next.summary.status)
+    if pager.pageCount != stops {
+      pager.setPageCount(stops)
+      page = min(page, stops - 1)
+    }
+
     if panel != next { panel = next }
+  }
+
+  /// How many stops the pager offers for a device state — the same shape
+  /// `NotchPanelView.displayedPages` renders: every sheet with a readable device,
+  /// else the common sheets plus the one status sheet.
+  static func pagerStops(for status: DeviceSummary.Status) -> Int {
+    switch status {
+    case .ready, .unverified: PanelPages.count
+    default: PanelPages.commonPageIDs.count + 1
+    }
   }
 
   private let nowPlayingService = NowPlayingService(onAutomationDenied: {
@@ -295,18 +320,22 @@ final class AppModel: ObservableObject {
   func nowPlayingPrevious() { nowPlayingService.previous() }
 
   /// Whether a re-injected headphone gesture should fall back to a system media key
-  /// rather than scripting Spotify/Music. It falls back whenever Spotify/Music is not
-  /// the thing playing — so a browser video is controlled — while a playing scriptable
-  /// player keeps the precise, already-proven ScriptingBridge path untouched.
-  static func reinjectionUsesSystemKey(isPlaying: Bool?) -> Bool { isPlaying != true }
+  /// rather than scripting Spotify/Music. The ScriptingBridge path holds whenever the
+  /// panel shows a track — playing *or paused*: a paused player is exactly the one a
+  /// tap must be able to resume, and scripting needs no extra permission. Only with no
+  /// scriptable track at all (a browser video, a game) does the system key take over.
+  static func reinjectionUsesSystemKey(nowPlaying: PanelModel.NowPlaying?) -> Bool {
+    nowPlaying == nil
+  }
 
-  // The headphone touch panel's re-injected transport. Distinct from the notch's
-  // on-screen buttons (which always mean the displayed track): a physical tap should do
-  // what it did natively — control whatever is actually playing. So it scripts a playing
-  // Spotify/Music, and otherwise re-issues the system media key the held channel
-  // suppressed, which reaches a browser or any other player.
+  // The headphone touch panel's re-injected transport. It scripts the player whose
+  // track the notch shows (playing or paused — the pause/resume pair must land on the
+  // same player), and with no such track re-issues the system media key the held
+  // channel suppressed, which reaches a browser or any other player. Posting that key
+  // needs Accessibility trust, asked for on first use with the system's own dialog.
   func reinjectPlayPause() {
-    if Self.reinjectionUsesSystemKey(isPlaying: panel.nowPlaying?.isPlaying) {
+    if Self.reinjectionUsesSystemKey(nowPlaying: panel.nowPlaying) {
+      SystemMediaKey.requestTrustIfNeeded()
       SystemMediaKey.playPause.post()
     } else {
       nowPlayingService.playPause()
@@ -314,7 +343,8 @@ final class AppModel: ObservableObject {
   }
 
   func reinjectNext() {
-    if Self.reinjectionUsesSystemKey(isPlaying: panel.nowPlaying?.isPlaying) {
+    if Self.reinjectionUsesSystemKey(nowPlaying: panel.nowPlaying) {
+      SystemMediaKey.requestTrustIfNeeded()
       SystemMediaKey.next.post()
     } else {
       nowPlayingService.next()
@@ -322,7 +352,8 @@ final class AppModel: ObservableObject {
   }
 
   func reinjectPrevious() {
-    if Self.reinjectionUsesSystemKey(isPlaying: panel.nowPlaying?.isPlaying) {
+    if Self.reinjectionUsesSystemKey(nowPlaying: panel.nowPlaying) {
+      SystemMediaKey.requestTrustIfNeeded()
       SystemMediaKey.previous.post()
     } else {
       nowPlayingService.previous()
@@ -987,6 +1018,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     if let scrollMonitor { NSEvent.removeMonitor(scrollMonitor) }
     mediaGestures?.stop()
     updateChecker.stop()
+    // The spatializer mutes the system's own output while it runs; it must give that
+    // back before the process dies, or the quit leaves the Mac silent. setEnabled(false)
+    // tears the tap down synchronously.
+    model.spatial.setEnabled(false)
     controller?.stop()
     // The process dies when this returns, and a fire-and-forget task has no
     // guarantee of running before it does. Wait for the session to actually stop —

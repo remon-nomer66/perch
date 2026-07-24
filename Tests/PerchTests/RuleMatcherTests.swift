@@ -27,6 +27,8 @@ func artistBeatsApp() {
 
 @Test("A rule scoped to another model does not apply; a nil scope applies anywhere")
 func deviceGate() {
+  // The scope is strict by the user's own design: each model gets its own rules, and
+  // an equaliser preset means something different per device.
   let scoped = [rule(.artist("YOASOBI"), device: "WH-1000XM6")]
   #expect(
     RuleMatcher.match(scoped, in: .init(deviceModel: "WF-1000XM6", playingArtist: "YOASOBI")) == nil

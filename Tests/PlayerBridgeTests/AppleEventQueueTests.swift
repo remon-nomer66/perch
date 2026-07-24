@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import os
 
 @testable import PlayerBridge
 
@@ -63,6 +64,39 @@ func gateSkipsWhileAnEarlierRoundRuns() async {
 
   blocker.signal()
   _ = await first.value
+}
+
+@Test("A transport command stuck behind a blocked queue past its deadline is dropped")
+func postGoesStaleBehindABlockedQueue() async {
+  let queue = AppleEventQueue(label: "PlayerBridgeTests.stale")
+  let blocker = DispatchSemaphore(value: 0)
+  let (started, startedIn) = AsyncStream<Void>.makeStream()
+  let ran = OSAllocatedUnfairLock(initialState: false)
+
+  // A hung target stands in as the item that holds the serial queue.
+  queue.post { startedIn.yield(); blocker.wait() }
+  var iterator = started.makeAsyncIterator()
+  await iterator.next()
+
+  // Enqueued behind the blocker with a short deadline; it only reaches the front once
+  // the queue is released, long after that deadline — so it must be dropped, not fired.
+  queue.post(staleAfter: .milliseconds(20)) { ran.withLock { $0 = true } }
+  try? await Task.sleep(for: .milliseconds(100))
+  blocker.signal()
+  try? await Task.sleep(for: .milliseconds(200))
+
+  #expect(ran.withLock { $0 } == false, "a stale transport command fired late")
+}
+
+@Test("A transport command that reaches the front in time still runs")
+func postRunsWhenPrompt() async {
+  let queue = AppleEventQueue(label: "PlayerBridgeTests.prompt")
+  let ran = OSAllocatedUnfairLock(initialState: false)
+  queue.post { ran.withLock { $0 = true } }
+  for _ in 0..<50 where !(ran.withLock { $0 }) {
+    try? await Task.sleep(for: .milliseconds(10))
+  }
+  #expect(ran.withLock { $0 } == true)
 }
 
 @Test("Distinct gates do not skip for each other")

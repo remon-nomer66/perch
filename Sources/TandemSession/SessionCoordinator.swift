@@ -166,6 +166,29 @@ public actor SessionCoordinator {
   public var unsupportedReason: TandemDeviceVerificationFailure? { rejection }
   public var readings: DeviceReadings { latestReadings }
 
+  /// Everything a panel refresh needs, read in one actor hop so the fields are always
+  /// of the same instant. Taken one accessor at a time, an `invalidate()` could land
+  /// between them and hand the panel a `.ready` phase with a nil fingerprint for a
+  /// frame; with device-scoped rules that momentary nil model name unmatched a rule and
+  /// set noise/EQ flapping. A single hop cannot be interrupted.
+  public struct Snapshot: Sendable {
+    public let phase: SessionState.Phase
+    public let fingerprint: TandemDeviceFingerprint?
+    public let unsupportedReason: TandemDeviceVerificationFailure?
+    public let acceptsWrites: Bool
+    public let readings: DeviceReadings
+  }
+
+  public var snapshot: Snapshot {
+    Snapshot(
+      phase: state.phase,
+      fingerprint: fingerprint,
+      unsupportedReason: rejection,
+      acceptsWrites: acceptsWrites,
+      readings: latestReadings
+    )
+  }
+
   public private(set) lazy var deviceNotifications: AsyncStream<TandemFrame> = {
     let (stream, continuation) = AsyncStream<TandemFrame>.makeStream(
       bufferingPolicy: .bufferingNewest(64)

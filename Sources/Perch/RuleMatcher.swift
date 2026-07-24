@@ -34,8 +34,12 @@ enum RuleMatcher {
   /// The matching rule, or nil. Artist beats app beats site: the artist is the most
   /// specific thing about what is heard, so it wins wherever it can be told — over the app
   /// playing it and over any site. Within a tier the earlier rule in the list wins, as
-  /// before. A rule scoped to a model is skipped on any other; an unscoped rule (the
-  /// grandfathered nil) applies anywhere.
+  /// before.
+  ///
+  /// The device scope is strict: a rule pinned to a model applies on that model only —
+  /// the user writes each model its own rules, and even the "same" setting (an
+  /// equaliser preset above all) means something different per device. An unscoped rule
+  /// (the grandfathered nil) applies anywhere.
   static func match(_ rules: [SoundRule], in context: Context) -> SoundRule? {
     func deviceMatches(_ rule: SoundRule) -> Bool {
       rule.deviceModel == nil || rule.deviceModel == context.deviceModel
