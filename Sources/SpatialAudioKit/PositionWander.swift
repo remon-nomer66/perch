@@ -28,4 +28,21 @@ public struct PositionWander: Sendable {
     )
     return (azimuth, elevation)
   }
+
+  /// テンポ同期版: 位相を秒ではなく拍数 `beats` で刻む。2小節（8拍）で1往復の
+  /// 主揺らぎに、8小節（32拍）のゆったりした副揺らぎを重ねる。フレーズと同じ周期で
+  /// 漂うのでテンポに乗って聞こえ、かつ角速度が緩やかでジッパーノイズを出さない。
+  public func offset(source: Int, beats: Double) -> (azimuth: Double, elevation: Double) {
+    guard amplitude > 0 else { return (0, 0) }
+    let phase = Double(source)
+    let azimuth = amplitude * (
+      0.6 * sin(2 * .pi * beats / 8 + phase * 1.7)
+        + 0.4 * sin(2 * .pi * beats / 32 + phase * 2.9)
+    )
+    let elevation = amplitude * 0.5 * (
+      0.6 * sin(2 * .pi * beats / 16 + phase * 2.3)
+        + 0.4 * sin(2 * .pi * beats / 32 + phase * 0.8)
+    )
+    return (azimuth, elevation)
+  }
 }

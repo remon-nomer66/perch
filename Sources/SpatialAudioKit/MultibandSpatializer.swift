@@ -80,12 +80,18 @@ public final class MultibandSpatializer: @unchecked Sendable {
   private var rightBase: SphericalDirection
   private let wander: PositionWander
   private var elapsedTime: Double = 0
+  // 揺らぎのテンポ同期: 推定BPMで拍を刻み、読めている間だけ同期揺らぎへ寄せる。
+  private var musicalClock = MusicalClock()
 
-  // 拍リアクティブ: 低音のオンセットで音場をパルス状に動かす。
-  private var beatDetector: BeatDetector?
-  private var beatLevel: Double = 0
+  // 拍リアクティブ: スペクトルフラックスの onset で音場をパルス状に動かす。
+  // 解析（FFT・自己相関）は音声コールバックの締切を脅かさないよう専用キューで行い、
+  // 結果は単純な数値のミラー越しに受け取る（audio スレッドが読む。競合は無害）。
+  private var onsetDetector: SpectralFluxDetector?
+  private let analysisQueue = DispatchQueue(label: "SpatialAudioKit.beat-analysis", qos: .userInitiated)
+  private var pendingBeatStrength: Double = 0
+  private var analysisBPM: Double = .nan  // NaN = テンポ不明
+  private var beatPulse = BeatPulse()
   private let beatAmplitude: Double  // ラジアン。0 なら拍リアクティブ無効。
-  private static let beatDecayTimeConstant = 0.12
 
   // 表示用: 各音源の現在の揺らぎ量（基準位置からのズレ、ラジアン）。
   // オーディオスレッドが書き、表示スレッドが読む（表示用途なので競合は無害）。
@@ -93,6 +99,12 @@ public final class MultibandSpatializer: @unchecked Sendable {
   private var offCenterElevation = 0.0
   private var offLeftAzimuth = 0.0
   private var offRightAzimuth = 0.0
+
+  // 前回 HRTF に適用した位置。実際に動いた時だけ setPosition を呼び、
+  // フィルタの無駄な切り替え（ノイズの種）を起こさないための記録。
+  private var appliedAzimuth = [Double](repeating: .nan, count: 3)
+  private var appliedElevation = [Double](repeating: .nan, count: 3)
+  private static let positionEpsilon = 0.05 * Double.pi / 180
 
   // オーディオスレッドから読む可変ゲイン（耳合わせ用。単純なFloatなので競合は軽微）。
   public var lowGain: Float
@@ -131,9 +143,9 @@ public final class MultibandSpatializer: @unchecked Sendable {
     if autoBalance {
       analyzer = BalanceAnalyzer(baselineLowGain: config.lowGain, baselineWidth: config.sideWidth)
     }
-    if beatAmplitude > 0 {
-      beatDetector = BeatDetector()
-    }
+    // 拍検出は常時走らせる（拍の表示とテンポ推定のため）。音場を動かすかどうかは
+    // beatAmplitude だけで決まる。既定構成（2の冪の FFT サイズ）では失敗しない。
+    onsetDetector = SpectralFluxDetector(sampleRate: sampleRate)
 
     centerBase = SphericalDirection(azimuth: 0, elevation: 0, distance: config.centerDistance)
     leftBase = SphericalDirection(azimuth: -sideSpread, elevation: 0, distance: config.sideDistance)
@@ -154,6 +166,16 @@ public final class MultibandSpatializer: @unchecked Sendable {
     }
     try newTap.start()
     tap = newTap
+  }
+
+  /// システム音の取得なしで開始する（合成BGMのデモ・検証用）。音は feed で供給する。
+  public func startWithoutCapture() throws {
+    try graph.start()
+  }
+
+  /// 外部のステレオブロックを、取得音と同じ経路（帯域分割→空間化→拍検出）で処理する。
+  public func feed(left: [Float], right: [Float]) {
+    processStereo(left: left, right: right)
   }
 
   public var captureFormat: AudioStreamBasicDescription {
@@ -191,18 +213,27 @@ public final class MultibandSpatializer: @unchecked Sendable {
   }
 
   private func reposition(_ index: Int, base: SphericalDirection, source: Int, time: Double) {
-    let drift = wander.offset(source: source, time: time)
+    // 自由揺らぎ（壁時計）とテンポ同期揺らぎ（拍）を、同期の重みで滑らかに混ぜる。
+    let free = wander.offset(source: source, time: time)
+    let synced = wander.offset(source: source, beats: musicalClock.beats)
+    let weight = musicalClock.syncWeight
     let beat = beatOffset(source: source)
-    let azimuthOffset = drift.azimuth + beat.azimuth
-    let elevationOffset = drift.elevation + beat.elevation
-    graph.setPosition(
-      index,
-      SphericalDirection(
-        azimuth: base.azimuth + azimuthOffset,
-        elevation: base.elevation + elevationOffset,
-        distance: base.distance
+    let azimuthOffset = free.azimuth * (1 - weight) + synced.azimuth * weight + beat.azimuth
+    let elevationOffset =
+      free.elevation * (1 - weight) + synced.elevation * weight + beat.elevation
+    let azimuth = base.azimuth + azimuthOffset
+    let elevation = base.elevation + elevationOffset
+    // 実際に動いた時だけ HRTF へ適用する。
+    if appliedAzimuth[source].isNaN
+      || abs(azimuth - appliedAzimuth[source]) > Self.positionEpsilon
+      || abs(elevation - appliedElevation[source]) > Self.positionEpsilon {
+      appliedAzimuth[source] = azimuth
+      appliedElevation[source] = elevation
+      graph.setPosition(
+        index,
+        SphericalDirection(azimuth: azimuth, elevation: elevation, distance: base.distance)
       )
-    )
+    }
     switch source {
     case SourceIndex.center:
       offCenterAzimuth = azimuthOffset
@@ -216,13 +247,16 @@ public final class MultibandSpatializer: @unchecked Sendable {
     }
   }
 
-  /// 表示用の、現在の揺らぎ状態（基準位置からのズレ、度）。
+  /// 表示用の、現在の揺らぎ状態（基準位置からのズレ、度）と拍・テンポ。
   public struct MovementState: Sendable {
     public let centerAzimuth: Double
     public let centerElevation: Double
     public let leftAzimuth: Double
     public let rightAzimuth: Double
     public let beatLevel: Double
+    public let estimatedBPM: Double?
+    /// 揺らぎがテンポに同期している度合い（0〜1）。
+    public let wanderSyncWeight: Double
   }
 
   public var movementState: MovementState {
@@ -232,14 +266,16 @@ public final class MultibandSpatializer: @unchecked Sendable {
       centerElevation: offCenterElevation * toDegrees,
       leftAzimuth: offLeftAzimuth * toDegrees,
       rightAzimuth: offRightAzimuth * toDegrees,
-      beatLevel: beatLevel
+      beatLevel: beatPulse.level,
+      estimatedBPM: analysisBPM.isNaN ? nil : analysisBPM,
+      wanderSyncWeight: musicalClock.syncWeight
     )
   }
 
   /// 拍のパルスによる位置オフセット。拍で左右が外へ開き、中央は軽く上へ跳ねる。
   private func beatOffset(source: Int) -> (azimuth: Double, elevation: Double) {
-    guard beatAmplitude > 0, beatLevel > 0 else { return (0, 0) }
-    let push = beatAmplitude * beatLevel
+    guard beatAmplitude > 0, beatPulse.level > 0 else { return (0, 0) }
+    let push = beatAmplitude * beatPulse.level
     switch source {
     case SourceIndex.left: return (-push, 0)
     case SourceIndex.right: return (push, 0)
@@ -254,8 +290,12 @@ public final class MultibandSpatializer: @unchecked Sendable {
   }
 
   private func process(_ bufferListPointer: UnsafePointer<AudioBufferList>) {
-    receivedAudio = true
     let (left, right) = LiveSpatializer.extractStereo(bufferListPointer)
+    processStereo(left: left, right: right)
+  }
+
+  private func processStereo(left: [Float], right: [Float]) {
+    receivedAudio = true
     guard !left.isEmpty, !right.isEmpty else { return }
 
     // Prove real capture, not just that the callback fired: a denied permission delivers
@@ -283,13 +323,10 @@ public final class MultibandSpatializer: @unchecked Sendable {
     if count > 0 {
       let dt = Double(count) / sampleRate
       elapsedTime += dt
-      let lowRMS = (analyzer != nil || beatDetector != nil)
-        ? Self.rmsOfMean(lowLeft, lowRight, count: count) : 0
-
       // 自動バランス: 各帯域のレベルを測り、低音ゲインと幅をゆっくり追従させる。
       if analyzer != nil {
         analyzer!.observe(
-          lowRMS: lowRMS,
+          lowRMS: Self.rmsOfMean(lowLeft, lowRight, count: count),
           midRMS: Self.rmsOfMean(highLeft, highRight, count: count),
           sideRMS: Self.rmsOfDifference(highLeft, highRight, count: count),
           dt: dt
@@ -298,15 +335,28 @@ public final class MultibandSpatializer: @unchecked Sendable {
         sideWidth = analyzer!.sideWidth
       }
 
-      // 拍リアクティブ: 低音のオンセットでパルスを立て、拍ごとに減衰させる。
-      if beatDetector != nil {
-        let strength = beatDetector!.observe(level: lowRMS, dt: dt)
-        beatLevel *= exp(-dt / Self.beatDecayTimeConstant)
-        if strength > beatLevel { beatLevel = strength }
+      // 拍・テンポの解析は専用キューへ。ここ（音声スレッド）では投げるだけ。
+      if let onsetDetector {
+        var mono = [Float](repeating: 0, count: count)
+        for index in 0..<count {
+          mono[index] = (left[index] + right[index]) * 0.5
+        }
+        analysisQueue.async { [self] in
+          let strength = onsetDetector.observe(mono: mono)
+          if strength > pendingBeatStrength { pendingBeatStrength = strength }
+          analysisBPM = onsetDetector.estimatedBPM ?? .nan
+        }
       }
 
-      // ゆっくりの揺らぎ ＋ 拍のパルスで音源を動かす。
-      if wander.amplitude > 0 || beatLevel > 0.001 {
+      // 拍パルス: 解析結果を取り込み、短いアタックで滑らかに立ち上げて減衰させる。
+      let strength = pendingBeatStrength
+      if strength > 0 { pendingBeatStrength = 0 }
+      beatPulse.advance(strength: strength, dt: dt)
+      let bpm = analysisBPM
+      musicalClock.advance(dt: dt, bpm: bpm.isNaN ? nil : bpm)
+
+      // ゆっくりの揺らぎ ＋ 拍のパルスで音源を動かす（動く設定の時だけ）。
+      if wander.amplitude > 0 || beatAmplitude > 0 {
         applyMovement(time: elapsedTime)
       }
     }
