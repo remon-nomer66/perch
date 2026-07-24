@@ -19,20 +19,45 @@ struct NotchSettingsView: View {
 
   var body: some View {
     Form {
+      // Shown only to Macs with no cutout of their own — the one audience these
+      // controls are for. A notched Mac never sees them.
       if !hasNotch {
-        Section {
-          Text(
-            L(
-              "現在、ノッチのある画面が接続されていないため、ノッチは表示されません。"
-                + "機器の操作は「一般」タブから行えます。ここの設定は、ノッチのある画面が"
-                + "使われるようになった時に反映されます。",
-              "No screen with a notch is connected right now, so the notch is not shown. "
-                + "The device can be controlled from the “General” tab. These settings take "
-                + "effect once a notched screen is in use."
-            )
+        Section(L("仮想ノッチ", "Virtual notch")) {
+          Toggle(
+            L("ノッチが無い画面に仮想ノッチを表示", "Show a virtual notch on screens without one"),
+            isOn: $settings.isVirtualNotchEnabled
           )
-          .font(.system(size: 11))
-          .foregroundStyle(.orange)
+
+          if settings.isVirtualNotchEnabled {
+            Text(
+              L(
+                "この Mac にはノッチが無いため、画面上端の中央に細いバーを常駐させます。"
+                  + "ポインタを載せると縮小ノッチ、クリックで展開します。",
+                "This Mac has no notch, so a thin bar rests at the top-centre of the "
+                  + "screen. It grows to a compact notch while the pointer is on it, and "
+                  + "expands on click."
+              )
+            )
+            .font(.system(size: 11))
+            .foregroundStyle(.secondary)
+
+            Field(
+              title: L("待機時の高さ", "Resting height"),
+              value: binding(\.restingHeight),
+              range: limits.restingHeight
+            )
+          } else {
+            Text(
+              L(
+                "オフのままだと、この Mac にノッチは作られません。機器の操作は「一般」タブと"
+                  + "メニューバーのアイコンから行えます。",
+                "Left off, no notch is made on this Mac. The device can be controlled from "
+                  + "the “General” tab and the menu bar icon."
+              )
+            )
+            .font(.system(size: 11))
+            .foregroundStyle(.secondary)
+          }
         }
       }
 

@@ -17,6 +17,13 @@ final class AppSettingsStore: ObservableObject {
     didSet { defaults.set(isNotchEnabled, forKey: Keys.notchEnabled) }
   }
 
+  /// Put a notch on a Mac that has none, so its intuitive interface is reachable there
+  /// too. Only ever consulted on a display without a real cutout; where one exists the
+  /// hardware notch is used and this is moot.
+  @Published var isVirtualNotchEnabled: Bool {
+    didSet { defaults.set(isVirtualNotchEnabled, forKey: Keys.virtualNotchEnabled) }
+  }
+
   /// Step aside while the notch screen is taken full screen: the menu bar hides
   /// there, and the bar would hover over the movie otherwise.
   @Published var hidesNotchInFullScreen: Bool {
@@ -56,6 +63,7 @@ final class AppSettingsStore: ObservableObject {
 
   private enum Keys {
     static let notchEnabled = "AppSettings.notchEnabled"
+    static let virtualNotchEnabled = "AppSettings.virtualNotchEnabled"
     static let hideInFullScreen = "AppSettings.hidesNotchInFullScreen"
     static let displayMode = "AppSettings.notchDisplayMode"
     static let language = "AppSettings.language"
@@ -71,6 +79,9 @@ final class AppSettingsStore: ObservableObject {
     self.defaults = defaults
     // The notch is the app's face; it starts on and stays on until switched off.
     isNotchEnabled = defaults.object(forKey: Keys.notchEnabled) as? Bool ?? true
+    // A Mac with no cutout gets one made for it by default: the whole point is that the
+    // notch interface should be there for everyone, not only notched hardware.
+    isVirtualNotchEnabled = defaults.object(forKey: Keys.virtualNotchEnabled) as? Bool ?? true
     // Following the menu bar out of the way is what full screen means; staying put
     // is the opt-out.
     hidesNotchInFullScreen = defaults.object(forKey: Keys.hideInFullScreen) as? Bool ?? true

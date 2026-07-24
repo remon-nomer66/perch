@@ -690,14 +690,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let settingsStore = self.settingsStore
     let service = self.service
     let controller = NotchController(
-      appearance: { appearanceStore.appearance }
-    ) { presentation in
+      appearance: { appearanceStore.appearance },
+      virtualNotchEnabled: { settingsStore.isVirtualNotchEnabled }
+    ) { render in
       NotchPanelBridge(
         model: model,
         appearanceStore: appearanceStore,
         settingsStore: settingsStore,
         service: service,
-        presentation: presentation,
+        render: render,
         openSettings: { [weak self] in
           MainActor.assumeIsolated {
             // The gear hands the stage over: the panel shrinks back into the notch
@@ -760,6 +761,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       if show { controller.start() } else { controller.stop() }
     }
     .store(in: &cancellables)
+
+    // Turning the virtual notch on or off does not change the geometry — no screen was
+    // plugged or unplugged — so the screen-parameter observer never fires. Re-evaluate
+    // the choice of notch directly. `dropFirst` skips the value `start()` already
+    // reflected at launch; `refresh` is a no-op while the notch is switched off.
+    settingsStore.$isVirtualNotchEnabled
+      .removeDuplicates()
+      .dropFirst()
+      .sink { [weak controller] _ in controller?.refresh() }
+      .store(in: &cancellables)
 
     // The panel lives in a non-activating panel, so scroll events reach it only
     // through a monitor.
@@ -1097,13 +1108,17 @@ private struct NotchPanelBridge: View {
   /// Observed for the language: a switch re-renders the open panel in place.
   @ObservedObject var settingsStore: AppSettingsStore
   let service: SessionService
-  let presentation: NotchPresenter.Presentation
+  /// The state and geometry the controller resolved, including a notch it synthesised
+  /// on a screen with no cutout — the panel reads the cutout from here rather than
+  /// asking `NSScreen`, which does not know about a virtual notch.
+  let render: NotchRender
   let openSettings: () -> Void
 
   var body: some View {
     NotchPanelView(
-      presentation: presentation,
-      notchRect: NSScreen.withNotch?.notchGeometry?.rect ?? .zero,
+      presentation: render.presentation,
+      notchRect: render.notchRect,
+      isVirtual: render.isVirtual,
       appearance: appearanceStore.appearance,
       displayMode: settingsStore.notchDisplayMode,
       model: model.panel,
