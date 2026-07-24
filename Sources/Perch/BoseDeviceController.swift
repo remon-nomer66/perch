@@ -45,6 +45,9 @@ final class BoseDeviceController: ObservableObject {
   private var firmwareVersion: String?
   /// The last full snapshot, so a periodic partial re-read keeps name and equalizer.
   private var snapshot = BoseDeviceSnapshot()
+  /// The audio-mode list (Quiet/Aware/Immersion/…), read once per connection; only the
+  /// current selection and the active mode's preset are re-read each refresh.
+  private var modeList: [BoseAudioMode] = []
 
   private var loopTask: Task<Void, Never>?
 
@@ -121,14 +124,23 @@ final class BoseDeviceController: ObservableObject {
   /// none, so `getServiceRecord` returns empty there. It reads cached records (no live
   /// query), so it does not block; only opening a channel is slow, and that is async.
   private func currentBoseControlAddress() -> String? {
-    let outputOUI: String?
-    switch audio.current() {
-    case .identified(let device): outputOUI = Self.oui(of: device.rawValue)
-    case .unidentifiedBluetooth(let uid): outputOUI = Self.oui(of: uid)
-    case .other: outputOUI = nil
+    guard let outputOUI = currentOutputOUI() else { return nil }
+    // Fast path: still connected to a device of this OUI. The SDP scan below does
+    // synchronous CoreBluetooth XPC, so it is skipped while the session holds — only a
+    // change of audio output re-runs it, keeping the steady state off that XPC path.
+    if session != nil, let active = activeAddress, Self.oui(of: active) == outputOUI {
+      return active
     }
-    guard let outputOUI else { return nil }
     return bmapDeviceAddresses().first { Self.oui(of: $0) == outputOUI }
+  }
+
+  /// The OUI of the current default audio output, or `nil` when it is not Bluetooth.
+  private func currentOutputOUI() -> String? {
+    switch audio.current() {
+    case .identified(let device): return Self.oui(of: device.rawValue)
+    case .unidentifiedBluetooth(let uid): return Self.oui(of: uid)
+    case .other: return nil
+    }
   }
 
   // MARK: - Session lifecycle
@@ -168,6 +180,7 @@ final class BoseDeviceController: ObservableObject {
     snapshot.battery = fresh.battery
     snapshot.noiseCancellation = fresh.noiseCancellation
     snapshot.liveNoiseControl = fresh.liveNoiseControl
+    snapshot.audioModes = fresh.audioModes
     panelModel?.apply(snapshot: snapshot)
     publishReadout(status: .ready)
   }
@@ -180,6 +193,7 @@ final class BoseDeviceController: ObservableObject {
     panelModel = nil
     firmwareVersion = nil
     snapshot = BoseDeviceSnapshot()
+    modeList = []
     if !keepingAddress { activeAddress = nil }
   }
 
@@ -205,6 +219,7 @@ final class BoseDeviceController: ObservableObject {
     if includingStable {
       snap.modelName = try? await readModelName(session)
       snap.equalizerBands = try? await readEqualizer(session)
+      modeList = (try? await readModeList(session)) ?? []
     } else {
       snap.modelName = snapshot.modelName
       snap.equalizerBands = snapshot.equalizerBands
@@ -217,14 +232,25 @@ final class BoseDeviceController: ObservableObject {
     }
     // Noise cancellation level [1.5] — the CNC range and current ambient/ANC balance.
     snap.noiseCancellation = try? await readNoiseCancellation(session)
-    // Live noise control [31.10] — ANC on/off, wind, and immersive (spatial). Read via a
-    // GET; if the device does not answer a GET here these controls stay hidden rather
-    // than showing an invented state.
-    snap.liveNoiseControl = try? await readLiveNoiseControl(session)
+
+    // Audio modes (block 31). Ultra 2's live [31.10] answers a GET with
+    // functionNotSupported, so the current ANC / spatial / wind state is read from the
+    // *active mode's* [31.6] config — that also drives the mode list and selection.
+    var currentMode: Int?
+    if config.supportsModeBlock {
+      currentMode = try? await readCurrentMode(session)
+      if let currentMode, let cfg = try? await readModeConfig(session, index: currentMode) {
+        snap.liveNoiseControl = cfg.noiseControl
+      }
+      if !modeList.isEmpty {
+        snap.audioModes = BoseAudioModes(modes: modeList, selectedSlot: currentMode)
+      }
+    }
 
     // If nothing at all came back, treat the link as gone.
     let gotAnything = !snap.battery.isEmpty || snap.noiseCancellation != nil
       || snap.liveNoiseControl != nil || snap.modelName != nil || snap.equalizerBands != nil
+      || snap.audioModes != nil
     snap.isControllable = gotAnything
     return snap
   }
@@ -254,14 +280,29 @@ final class BoseDeviceController: ObservableObject {
     return try BmapNoiseCancellationReader.parse(frame)
   }
 
-  private func readLiveNoiseControl(_ session: BoseSession) async throws -> BmapNoiseControlSetting {
-    let request = try BmapFrame(
-      fblock: BmapFunctionAddress.noiseControlLiveWrite.fblock,
-      function: BmapFunctionAddress.noiseControlLiveWrite.function,
-      op: .get
-    )
-    let frame = try await session.request(request)
-    return try BmapNoiseControlLiveWrite.parse(frame)
+  /// Reads every mode slot's [31.6] config and keeps the configured (named) ones. Slots
+  /// 0...10 cover the presets (Quiet/Aware/Immersion/Cinema) and the user slots; empty
+  /// slots report the name "None" and are dropped.
+  private func readModeList(_ session: BoseSession) async throws -> [BoseAudioMode] {
+    var modes: [BoseAudioMode] = []
+    for index in 0...10 {
+      guard
+        let frame = try? await session.request(try BmapAudioMode.configRequest(index: index)),
+        let cfg = try? BmapAudioMode.parseConfig(frame), cfg.isConfigured
+      else { continue }
+      modes.append(BoseAudioMode(slot: cfg.index, name: cfg.name, isEditable: cfg.isUserEditable))
+    }
+    return modes
+  }
+
+  private func readCurrentMode(_ session: BoseSession) async throws -> Int {
+    let frame = try await session.request(try BmapAudioMode.currentModeRequest())
+    return try BmapAudioMode.parseCurrentMode(frame)
+  }
+
+  private func readModeConfig(_ session: BoseSession, index: Int) async throws -> BmapModeConfig {
+    let frame = try await session.request(try BmapAudioMode.configRequest(index: index))
+    return try BmapAudioMode.parseConfig(frame)
   }
 
   private func readEqualizer(_ session: BoseSession) async throws -> [BmapEqualizerBand] {

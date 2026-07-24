@@ -214,13 +214,22 @@ public final class BosePanelModel: ObservableObject {
 
   // MARK: - Modes ([31.6]) and sidetone — optimistic only for now
 
-  /// Selects an audio mode. No BoseCore builder exists for block 31 yet (the block is
-  /// partly unresolved in the frozen spec, §4), so this updates the panel optimistically;
-  /// stage 6 adds the [31.6] SETGET and reconciles against the device.
+  /// Selects an audio mode via [31.3]. Updates the panel optimistically for
+  /// responsiveness, then sends the switch; the periodic refresh reconciles the current
+  /// mode and its noise-control preset (CNC / spatial / ANC) against the device.
   public func selectMode(_ slot: Int) {
     guard let modes = snapshot.audioModes else { return }
     snapshot.audioModes = BoseAudioModes(modes: modes.modes, selectedSlot: slot)
     reproject()
+    Task { [weak self] in await self?.sendModeSelect(slot) }
+  }
+
+  private func sendModeSelect(_ slot: Int) async {
+    guard let session else { return }
+    guard let frame = try? BmapAudioMode.selectModeRequest(index: slot) else { return }
+    // The START answers with a RESULT at [31.3]; success is enough — the refresh reads
+    // the new current mode and its config back.
+    _ = try? await session.request(frame)
   }
 
   /// Sets the sidetone level. Its wire mapping is not yet reverse-engineered, so this is

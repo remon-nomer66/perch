@@ -336,6 +336,37 @@ func probe(address: String, config: BoseDeviceConfig) async -> Bool {
       let reading = try BmapNoiseCancellationReader.parse(frame)
       print("  nc level:\(hex(frame)) → current \(reading.currentStep)/max \(reading.maximumStep)")
     }
+
+    // Raw GET probe of block-31 (audio modes / live noise control) and [1.6]. Shows what
+    // op and payload each function answers with — the app's [31.10] GET returns nothing,
+    // so spatial/ANC/wind never populate. This reveals whether GET is answered at all, or
+    // only STATUS/SETGET, and what block 31 exposes (modes).
+    func rawGet(_ label: String, fblock: UInt8, function: UInt8, timeout: Duration = .seconds(2)) async {
+      do {
+        let req = try BmapFrame(fblock: fblock, function: function, op: .get)
+        let frame = try await session.request(req, responseTimeout: timeout)
+        print("  \(label) [\(fblock).\(function)] GET → op=\(frame.op) payload=\(hex(frame))")
+      } catch {
+        print("  \(label) [\(fblock).\(function)] GET → \(error)")
+      }
+    }
+    func rawGetPayload(_ label: String, fblock: UInt8, function: UInt8, payload: [UInt8]) async {
+      do {
+        let req = try BmapFrame(fblock: fblock, function: function, op: .get, payload: Data(payload))
+        let frame = try await session.request(req, responseTimeout: .seconds(2))
+        print("  \(label) → op=\(frame.op) len=\(frame.payload.count) payload=\(hex(frame))")
+      } catch {
+        print("  \(label) → \(error)")
+      }
+    }
+    print("  --- modes ---")
+    await rawGet("  current[31.3]", fblock: 31, function: 3)
+    await rawGet("  b31.2", fblock: 31, function: 2)
+    // ModeConfig STATUS per mode index (0=Quiet 1=Aware 2=Immersion 3=Cinema 4=Home).
+    for index in UInt8(0)...UInt8(6) {
+      await rawGetPayload("  modeCfg[31.6] idx=\(index)", fblock: 31, function: 6, payload: [index])
+    }
+
     await session.close()
     return true
   } catch {
