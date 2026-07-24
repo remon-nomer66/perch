@@ -683,6 +683,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   private var cancellables: Set<AnyCancellable> = []
   private var mediaGestures: MediaGestureForwarder?
   private let fullScreen = FullScreenMonitor()
+  /// Looks for a newer release on GitHub. Lazy because it reads `settingsStore`; a bare
+  /// `swift run` binary carries no version, so `SemanticVersion` is nil there and the
+  /// checker quietly does nothing.
+  private lazy var updateChecker = UpdateChecker(
+    currentVersion: SemanticVersion(SupportIssue.appVersion),
+    fetcher: GitHubReleaseFetcher(repository: SupportIssue.repository),
+    settings: settingsStore
+  )
 
   func applicationDidFinishLaunching(_ notification: Notification) {
     let model = self.model
@@ -815,6 +823,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       .sink { [weak self] connected in self?.updateStatusIcon(connected: connected) }
       .store(in: &cancellables)
 
+    // When an update becomes available (or is dismissed), rebuild the menu so the
+    // "download" item comes and goes. Only availability flips rebuild it — not the
+    // checking→result churn — so the menu is not torn down mid-open on every poll.
+    updateChecker.$status
+      .map(\.availableRelease)
+      .removeDuplicates()
+      .receive(on: RunLoop.main)
+      .sink { [weak self] _ in
+        guard let self else { return }
+        self.statusItem?.menu = self.buildStatusMenu(current: self.settingsStore.language)
+      }
+      .store(in: &cancellables)
+    updateChecker.begin()
+
     Task {
       await service.start()
       while !Task.isCancelled {
@@ -918,6 +940,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     if let scrollMonitor { NSEvent.removeMonitor(scrollMonitor) }
     mediaGestures?.stop()
+    updateChecker.stop()
     controller?.stop()
     // The process dies when this returns, and a fire-and-forget task has no
     // guarantee of running before it does. Wait for the session to actually stop —
@@ -1014,6 +1037,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   /// runs off the store's publisher, which fires before the property itself updates.
   private func buildStatusMenu(current: AppLanguage) -> NSMenu {
     let menu = NSMenu()
+
+    // Surfaced only while an update is waiting, so someone who never opens settings
+    // still learns a new version exists and can reach the download in one click.
+    if case .available(let info) = updateChecker.status {
+      let update = NSMenuItem(
+        title: L("アップデートがあります…", "Update available…"),
+        action: #selector(openUpdateDownload(_:)),
+        keyEquivalent: ""
+      )
+      update.target = self
+      update.representedObject = info.bestDownloadURL
+      menu.addItem(update)
+      menu.addItem(.separator())
+    }
+
     let settings = NSMenuItem(
       title: L("設定…", "Settings…"),
       action: #selector(openSettings),
@@ -1056,6 +1094,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     settingsStore.language = choice
   }
 
+  @objc private func openUpdateDownload(_ sender: NSMenuItem) {
+    guard let url = sender.representedObject as? URL else { return }
+    NSWorkspace.shared.open(url)
+  }
+
   @objc private func openSettings() {
     if let settingsWindow {
       settingsWindow.makeKeyAndOrderFront(nil)
@@ -1077,6 +1120,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model: model,
         appearanceStore: appearanceStore,
         settingsStore: settingsStore,
+        updateChecker: updateChecker,
         service: service
       )
     )

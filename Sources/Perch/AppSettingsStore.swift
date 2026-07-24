@@ -34,6 +34,28 @@ final class AppSettingsStore: ObservableObject {
     didSet { defaults.set(notchDisplayMode.rawValue, forKey: Keys.displayMode) }
   }
 
+  /// Look for a newer published release on GitHub at launch (and once a day while the
+  /// app keeps running). Only reads a public feed; opening the download is the user's
+  /// click. On by default; the opt-out lives in the About tab beside the check.
+  @Published var checksForUpdatesAtLaunch: Bool {
+    didSet { defaults.set(checksForUpdatesAtLaunch, forKey: Keys.checksForUpdates) }
+  }
+
+  /// When the last update check actually reached the network. Bookkeeping for the
+  /// once-a-day throttle, not UI state, so it is read/written directly rather than
+  /// published.
+  var lastUpdateCheck: Date? {
+    get { defaults.object(forKey: Keys.lastUpdateCheck) as? Date }
+    set { defaults.set(newValue, forKey: Keys.lastUpdateCheck) }
+  }
+
+  /// A release tag the user chose to skip; that exact version is not offered again, but
+  /// a later, higher one still is.
+  var skippedUpdateVersion: String? {
+    get { defaults.string(forKey: Keys.skippedUpdateVersion) }
+    set { defaults.set(newValue, forKey: Keys.skippedUpdateVersion) }
+  }
+
   /// The interface language. `L10n.language` is kept in step here so every `L(_:_:)`
   /// pair reads the new language on its next render.
   @Published var language: AppLanguage {
@@ -67,6 +89,9 @@ final class AppSettingsStore: ObservableObject {
     static let hideInFullScreen = "AppSettings.hidesNotchInFullScreen"
     static let displayMode = "AppSettings.notchDisplayMode"
     static let language = "AppSettings.language"
+    static let checksForUpdates = "AppSettings.checksForUpdatesAtLaunch"
+    static let lastUpdateCheck = "AppSettings.lastUpdateCheck"
+    static let skippedUpdateVersion = "AppSettings.skippedUpdateVersion"
     static let rulesEnabled = "AppSettings.rulesEnabled"
     static let rules = "AppSettings.rules"
     static let customBands = "AppSettings.customBandSteps"
@@ -88,6 +113,8 @@ final class AppSettingsStore: ObservableObject {
     // The bar being visible is how the app has always looked; quieting it is a choice.
     notchDisplayMode =
       defaults.string(forKey: Keys.displayMode).flatMap(NotchDisplayMode.init) ?? .always
+    // Checking for updates is the neighbourly default; the About tab opts out.
+    checksForUpdatesAtLaunch = defaults.object(forKey: Keys.checksForUpdates) as? Bool ?? true
 
     let language =
       defaults.string(forKey: Keys.language).flatMap(AppLanguage.init) ?? .systemDefault

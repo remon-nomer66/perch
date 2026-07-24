@@ -12,6 +12,7 @@ struct SettingsView: View {
   @ObservedObject var model: AppModel
   @ObservedObject var appearanceStore: NotchAppearanceStore
   @ObservedObject var settingsStore: AppSettingsStore
+  @ObservedObject var updateChecker: UpdateChecker
   let service: SessionService
   @StateObject private var loginItem = LoginItemModel()
 
@@ -31,7 +32,7 @@ struct SettingsView: View {
       NotchSettingsView(store: appearanceStore, settings: settingsStore)
         .tabItem { Label(L("ノッチ", "Notch"), systemImage: "macwindow") }
         .tag(Tab.notch)
-      AboutTab()
+      AboutTab(updateChecker: updateChecker, settings: settingsStore)
         .tabItem { Label(L("情報", "About"), systemImage: "info.circle") }
         .tag(Tab.about)
     }
@@ -632,6 +633,9 @@ final class LoginItemModel: ObservableObject {
 // MARK: - About
 
 private struct AboutTab: View {
+  @ObservedObject var updateChecker: UpdateChecker
+  @ObservedObject var settings: AppSettingsStore
+
   var body: some View {
     VStack(spacing: 10) {
       Group {
@@ -652,6 +656,8 @@ private struct AboutTab: View {
       Text("\(L("バージョン", "Version")) \(version)")
         .font(.system(size: 11))
         .foregroundStyle(.secondary)
+
+      updateSection
       Text(
         L(
           "対応ヘッドホン・イヤホンをノッチから操作するユーティリティ",
@@ -687,6 +693,127 @@ private struct AboutTab: View {
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity)
     .padding(24)
+  }
+
+  // MARK: - Update check
+
+  @ViewBuilder
+  private var updateSection: some View {
+    VStack(alignment: .leading, spacing: 8) {
+      HStack(spacing: 8) {
+        Image(systemName: updateGlyph)
+          .foregroundStyle(updateTint)
+        Text(updateHeadline)
+          .font(.system(size: 12, weight: .medium))
+        if updateChecker.status == .checking {
+          ProgressView().controlSize(.small)
+        }
+        Spacer()
+        Button(L("更新を確認", "Check for Updates")) {
+          Task { await updateChecker.checkNow() }
+        }
+        .controlSize(.small)
+        .disabled(updateChecker.status == .checking)
+      }
+
+      if case .available(let info) = updateChecker.status {
+        Text(updateDetail(info))
+          .font(.system(size: 11))
+          .foregroundStyle(.secondary)
+        HStack(spacing: 12) {
+          Button(L("ダウンロード", "Download")) {
+            NSWorkspace.shared.open(info.bestDownloadURL)
+          }
+          .controlSize(.small)
+          Button(L("リリースノート", "Release Notes")) {
+            NSWorkspace.shared.open(info.releaseURL)
+          }
+          .buttonStyle(.link)
+          Button(L("このバージョンを飛ばす", "Skip This Version")) {
+            updateChecker.skipAvailable()
+          }
+          .buttonStyle(.link)
+        }
+        Text(
+          L(
+            "ダウンロードした .dmg を開き、Perch をアプリケーションフォルダにドラッグして"
+              + "置き換えてください。設定はそのまま引き継がれます。",
+            "Open the downloaded .dmg and drag Perch onto your Applications folder to "
+              + "replace it. Your settings carry over."
+          )
+        )
+        .font(.system(size: 11))
+        .foregroundStyle(.secondary)
+      } else if case .failed(let reason) = updateChecker.status {
+        Text(Self.failureText(reason))
+          .font(.system(size: 11))
+          .foregroundStyle(.orange)
+      }
+
+      Toggle(
+        L("起動時に更新を確認", "Check for updates at launch"),
+        isOn: $settings.checksForUpdatesAtLaunch
+      )
+      .font(.system(size: 11))
+      .toggleStyle(.checkbox)
+      .padding(.top, 2)
+    }
+    .padding(12)
+    .frame(maxWidth: 420, alignment: .leading)
+    .background(
+      RoundedRectangle(cornerRadius: 8)
+        .strokeBorder(.quaternary, lineWidth: 1)
+    )
+    .padding(.top, 8)
+  }
+
+  private var updateGlyph: String {
+    switch updateChecker.status {
+    case .available: "arrow.down.circle.fill"
+    case .upToDate: "checkmark.circle.fill"
+    case .failed: "exclamationmark.triangle.fill"
+    default: "arrow.triangle.2.circlepath"
+    }
+  }
+
+  private var updateTint: Color {
+    switch updateChecker.status {
+    case .available: .accentColor
+    case .upToDate: .green
+    case .failed: .orange
+    default: .secondary
+    }
+  }
+
+  private var updateHeadline: String {
+    switch updateChecker.status {
+    case .idle: L("アップデート", "Updates")
+    case .checking: L("確認しています…", "Checking…")
+    case .upToDate: L("最新です", "Up to date")
+    case .available: L("新しいバージョンがあります", "An update is available")
+    case .failed: L("更新を確認できませんでした", "Couldn’t check for updates")
+    }
+  }
+
+  private func updateDetail(_ info: ReleaseInfo) -> String {
+    L(
+      "バージョン \(info.version) が公開されています（現在 \(version)）。",
+      "Version \(info.version) is available (you have \(version))."
+    )
+  }
+
+  private static func failureText(_ reason: UpdateCheckFailure) -> String {
+    switch reason {
+    case .offlineOrUnreachable:
+      L(
+        "ネットワークに接続できませんでした。時間をおいて再度お試しください。",
+        "Couldn’t reach the network. Please try again later."
+      )
+    case .developmentBuild:
+      L("開発ビルドのため確認できません。", "Can’t check for updates from a development build.")
+    case .malformedResponse:
+      L("応答を読み取れませんでした。", "Couldn’t read the response from the server.")
+    }
   }
 
   private var appName: String {
