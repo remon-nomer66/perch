@@ -6,11 +6,17 @@ import TandemSession
 /// thing, and every control on them reflects a value read from the device.
 @MainActor
 enum PanelPages {
-  /// The pages in display order — the one source `count` and `all` both follow, so
-  /// the pager is built with the right number of stops before the pages themselves
-  /// exist.
-  static let pageIDs = ["noise", "equalizer", "listening", "speakToChat"]
+  /// Device-independent sheets live to the LEFT of the device sheets, so they are
+  /// reachable even with nothing connected. The device sheets follow. The one source
+  /// `count`, `homeIndex` and `all` all agree on, so the pager is built with the right
+  /// number of stops before the pages themselves exist.
+  static let commonPageIDs = ["spatial"]
+  static let devicePageIDs = ["noise", "equalizer", "listening", "speakToChat"]
+  static let pageIDs = commonPageIDs + devicePageIDs
   static var count: Int { pageIDs.count }
+  /// The first device sheet — the panel's home, shown on open whether or not a device
+  /// is connected. The common sheets sit to its left (index 0 … homeIndex-1).
+  static var homeIndex: Int { commonPageIDs.count }
 
   static func all(
     equalizer: EqualizerReading?,
@@ -27,7 +33,10 @@ enum PanelPages {
     sidetone: SidetoneReading?,
     applySidetone: @escaping (Bool) -> Void
   ) -> [PanelPage] {
-    let pages = [
+    let common = [
+      PanelPage(id: "spatial", isCommon: true, content: AnyView(SpatialAudioPage())),
+    ]
+    let devicePages = [
       PanelPage(id: "noise", content: AnyView(NoiseControlPage(reading: noiseControl, apply: applyNoiseControl, dragLevel: dragNoiseLevel))),
       PanelPage(id: "equalizer", content: AnyView(EqualizerPage(
         equalizer: equalizer,
@@ -44,8 +53,28 @@ enum PanelPages {
         applySidetone: applySidetone
       ))),
     ]
+    let pages = common + devicePages
     assert(pages.map(\.id) == pageIDs, "the built pages must follow pageIDs")
     return pages
+  }
+}
+
+/// The first common (device-independent) sheet. Structure placeholder for now: the
+/// spatial-audio controls will live here. Nothing on it depends on the connected model.
+private struct SpatialAudioPage: View {
+  var body: some View {
+    VStack(alignment: .leading, spacing: 9) {
+      PageTitle(text: L("空間オーディオ", "Spatial Audio"))
+      Text(
+        L(
+          "機種に依存しない共通機能です。ここに空間オーディオの設定が入ります（準備中）。",
+          "A device-independent feature. Spatial audio controls will live here (coming soon)."
+        )
+      )
+        .font(.system(size: 10))
+        .foregroundStyle(.white.opacity(0.5))
+        .fixedSize(horizontal: false, vertical: true)
+    }
   }
 }
 
