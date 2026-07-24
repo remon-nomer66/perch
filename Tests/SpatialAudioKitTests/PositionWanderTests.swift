@@ -43,13 +43,28 @@ import Testing
 
 // MARK: - テンポ同期版
 
-@Test func theTempoSyncedWanderRepeatsEvery16Beats() {
-  // 主揺らぎ4拍＋副揺らぎ16拍 → 16拍（4小節）でぴったり一周する。
+@Test func theTempoSyncedWanderRepeatsEvery32Beats() {
+  // 主揺らぎ8拍（2小節）＋副揺らぎ32拍 → 32拍（8小節）でぴったり一周する。
   let wander = PositionWander(degrees: 8)
   let a = wander.offset(source: 0, beats: 3.2)
-  let b = wander.offset(source: 0, beats: 3.2 + 16)
+  let b = wander.offset(source: 0, beats: 3.2 + 32)
   #expect(abs(a.azimuth - b.azimuth) < 1e-9)
   #expect(abs(a.elevation - b.elevation) < 1e-9)
+}
+
+@Test func theTempoSyncedWanderMovesGently() {
+  // ジッパーノイズ防止: 120BPM相当（1秒=2拍）でも角速度が緩やかであること。
+  let wander = PositionWander(degrees: 6)
+  var maxStep = 0.0
+  var previous = wander.offset(source: 0, beats: 0).azimuth
+  for step in 1..<2000 {
+    let beats = Double(step) * 0.0214  // 10.7msブロック×120BPM
+    let now = wander.offset(source: 0, beats: beats).azimuth
+    maxStep = max(maxStep, abs(now - previous))
+    previous = now
+  }
+  // 1ブロックの歩幅が約0.1°未満（旧・自由揺らぎの数倍以内）。
+  #expect(maxStep < 0.1 * .pi / 180)
 }
 
 @Test func theTempoSyncedWanderStaysWithinTheAmplitude() {
