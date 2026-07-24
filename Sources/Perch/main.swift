@@ -319,6 +319,7 @@ final class AppModel: ObservableObject {
       // so the header shows no read-only caveat — matching the writable Bose controls.
       next.summary.acceptsWrites = true
       next.battery = bose.battery
+      next.isBose = true
     }
 
     next.nowPlaying = nowPlaying.map {
@@ -360,7 +361,15 @@ final class AppModel: ObservableObject {
     // count, or swipes dead-zone against stops that are not on screen — after a
     // disconnect from the fourth sheet, a swipe would "move" through pages that no
     // longer exist before anything visibly changed.
-    let stops = Self.pagerStops(for: next.summary.status)
+    // A Bose device declares its own feature set, so its readable stops come from the
+    // sheets it actually has, not the fixed Sony count. The non-readable states collapse
+    // to the common sheets plus one status sheet for either brand.
+    let stops: Int
+    if next.isBose, next.summary.isControllable, let boseModel = bose.panelModel {
+      stops = BoseNotchLayout.pageCount(for: boseModel.state)
+    } else {
+      stops = Self.pagerStops(for: next.summary.status)
+    }
     if pager.pageCount != stops {
       pager.setPageCount(stops)
       page = min(page, stops - 1)
@@ -1341,7 +1350,7 @@ private struct NotchPanelBridge: View {
       displayMode: settingsStore.notchDisplayMode,
       model: model.panel,
       page: $model.page,
-      pages: model.panelPages(using: service),
+      pages: notchPages,
       transport: NowPlayingTransport(
         playPause: { model.nowPlayingPlayPause() },
         next: { model.nowPlayingNext() },
@@ -1350,9 +1359,21 @@ private struct NotchPanelBridge: View {
       openSettings: openSettings,
       retry: { await service.session.handle(.manualRetry) }
     )
+    // The Bose sheets observe the Bose model themselves, so a drag redraws them even
+    // though this bridge does not; the identity below still rebuilds on a language switch.
     // The pages bake their strings when built; a new identity rebuilds them in the
     // newly chosen language.
     .id(settingsStore.language)
+  }
+
+  /// The sheets the notch shows: a connected Bose device brings its own (equalizer, modes,
+  /// spatial/sidetone), matching the General tab; otherwise the Sony sheets are shown, which
+  /// also carry the common spatial sheet when no device is connected at all.
+  private var notchPages: [PanelPage] {
+    if model.panel.isBose, let boseModel = model.bose.panelModel {
+      return model.bosePanelPages(boseModel)
+    }
+    return model.panelPages(using: service)
   }
 }
 

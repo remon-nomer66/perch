@@ -82,6 +82,38 @@ struct BosePanelModelTests {
     #expect(mid?.value == -4)
   }
 
+  @Test("A periodic refresh that did not re-read EQ never reverts a raised band")
+  func eqSurvivesStaleRefresh() {
+    // The bug: the 4-second refresh reads only battery and noise control, so it carries a
+    // stale connect-time EQ (all flat). Applying it must not snap the just-raised band back
+    // — the model owns the equalizer once the user has touched it.
+    let model = ultra2Model()
+    model.dragEqualizerBand(bandId: 1, value: -4, isFinal: true)
+
+    // A refresh snapshot exactly as the controller builds it: fresh battery/noise, but the
+    // equalizer bands carried over unchanged from connect (all 0).
+    let staleRefresh = BoseDeviceSnapshot(
+      modelName: "QC Ultra 2",
+      noiseCancellation: BmapNoiseCancellationReading(
+        currentStep: 5, maximumStep: 10, isEnabled: true, rawFlags: 0x03
+      ),
+      liveNoiseControl: BmapNoiseControlSetting(
+        cnc: 5, spatial: .off, windBlock: false, ancEnabled: true
+      ),
+      equalizerBands: [
+        BmapEqualizerBand(bandId: 0, minimum: -10, maximum: 10, current: 0),
+        BmapEqualizerBand(bandId: 1, minimum: -10, maximum: 10, current: 0),
+        BmapEqualizerBand(bandId: 2, minimum: -10, maximum: 10, current: 0),
+      ],
+      isControllable: true,
+      acceptsWrites: true
+    )
+    model.apply(snapshot: staleRefresh)
+
+    let mid = model.state.equalizer?.bands.first { $0.bandId == 1 }
+    #expect(mid?.value == -4)
+  }
+
   @Test("Selecting a mode updates the selection")
   func selectMode() {
     let model = ultra2Model()

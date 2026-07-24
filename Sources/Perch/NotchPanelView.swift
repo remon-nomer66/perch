@@ -24,6 +24,10 @@ struct PanelModel: Equatable {
   var speakToChat: SpeakToChatReading?
   var sidetone: SidetoneReading?
   var nowPlaying: NowPlaying?
+  /// True when a Bose device owns the panel (Sony has no controllable device). The notch
+  /// then draws the Bose sheets instead of the Sony ones, and the pager counts its stops
+  /// from the Bose feature set.
+  var isBose = false
   /// True for a few seconds after a device arrives; the quiet mode shows the bar for
   /// exactly this window. Decided by the model, not view state, so a transition the
   /// view was not alive to see still announces itself.

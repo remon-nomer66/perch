@@ -93,6 +93,19 @@ struct BosePanelStateProjectionTests {
     #expect(state.cnc?.wireValue == 5)
   }
 
+  @Test("The earbuds config hides wind reduction while keeping the rest of the family")
+  func earbudsHideWindReduction() {
+    // The snapshot carries a wind byte (as the [31.10] block always does), but the earbuds
+    // do not physically have the feature, so their config withholds the switch while ANC,
+    // CNC, and spatial — which share the block — stay.
+    let state = BosePanelState.project(from: ultra2Snapshot(), config: .qcUltra2Earbuds)
+
+    #expect(state.windReduction == nil)
+    #expect(state.ancEnabled == true)
+    #expect(state.spatial == .head)
+    #expect(state.cnc?.wireValue == 5)
+  }
+
   @Test("An empty snapshot hides every feature")
   func emptySnapshotHidesEverything() {
     let state = BosePanelState.project(from: BoseDeviceSnapshot(), config: .qcUltra2)

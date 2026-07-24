@@ -39,7 +39,7 @@ public enum BoseCatalog {
       productId: 0x4062,
       codename: "edith",
       productName: "QC Ultra Earbuds (2nd Gen)",
-      config: .qcUltra2
+      config: .qcUltra2Earbuds
     ),
     0x4020: BoseDeviceModel(
       productId: 0x4020,

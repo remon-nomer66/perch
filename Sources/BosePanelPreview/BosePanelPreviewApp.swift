@@ -44,6 +44,20 @@ struct BosePanelPreviewApp {
       to: outputDirectory, name: "bose-panel-full"
     )
 
+    // The settings-window layout: the same features stacked as scrolling cards, drawn
+    // from the earbuds config so wind reduction is (correctly) absent.
+    let earbudsState = BosePanelState.project(from: fixtureSnapshot, config: .qcUltra2Earbuds)
+    render(
+      backdrop {
+        BosePanelStackView(state: earbudsState)
+          .frame(width: panelWidth)
+          .padding(16)
+          .background(Color(white: 0.12))
+      },
+      size: CGSize(width: panelWidth + backdropPad * 2 + 32, height: 760),
+      to: outputDirectory, name: "bose-panel-stack"
+    )
+
     // The closed notch bar.
     render(
       backdrop {

@@ -86,6 +86,90 @@ public struct BosePanelView: View {
   }
 }
 
+/// The Bose controls stacked as one scrolling column of cards, one per declared feature —
+/// the shape the settings window wants, where there is room to scroll rather than page.
+///
+/// This is the same content `BosePanelView` pages through, but laid out vertically and, in
+/// place of the pager's "not declared" sheets, simply omitting any feature the device does
+/// not carry: a card appears only when its feature is present, so nothing dead or empty is
+/// ever shown. The notch keeps `BosePanelView` (a fixed slot must page); the window uses
+/// this.
+public struct BosePanelStackView: View {
+  public let state: BosePanelState
+  public let actions: BosePanelActions
+
+  public init(state: BosePanelState, actions: BosePanelActions = BosePanelActions()) {
+    self.state = state
+    self.actions = actions
+  }
+
+  public var body: some View {
+    VStack(spacing: 12) {
+      // Noise control is deliberately omitted here: on the Ultra family the noise state
+      // lives on the listening mode, so the audio-modes card below is the single place it
+      // is chosen — a separate slider/switch card only duplicated it (see `BoseModesPage`).
+      if state.equalizer != nil {
+        card { BoseEqualizerPage(state: state, actions: actions) }
+      }
+      if hasModes {
+        card { BoseModesPage(state: state, actions: actions) }
+      }
+      if hasExtras {
+        card { BoseExtrasPage(state: state, actions: actions) }
+      }
+    }
+    // Every card here is a device control: a read-only session shows the readings but
+    // must not offer a write it would refuse, matching the pager and the Sony cards.
+    .disabled(!state.acceptsWrites)
+  }
+
+  private var hasModes: Bool {
+    (state.audioModes?.modes.isEmpty == false)
+  }
+
+  private var hasExtras: Bool {
+    state.spatial != nil || state.sidetone != nil
+  }
+
+  /// One black card, matching the Sony settings cards: the pages draw for a black
+  /// backdrop, so each feature is given its own.
+  private func card<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
+    content()
+      .frame(maxWidth: .infinity, alignment: .topLeading)
+      .padding(14)
+      .background(RoundedRectangle(cornerRadius: 10).fill(.black))
+  }
+}
+
+/// One Bose feature sheet, wired to the live model so it redraws as the device (or the
+/// user) changes it — the unit the notch pager slides between, mirroring how the Sony
+/// sheets sit in the notch. Each `PanelPage` in the notch wraps one of these; observing the
+/// model here means a drag on a sheet updates it even when the pager around it does not
+/// rebuild. The sheets are the same views the paged panel and the settings stack draw.
+public struct BosePanelSheet: View {
+  public enum Kind: String, Sendable, CaseIterable {
+    case equalizer
+    case modes
+    case extras
+  }
+
+  @ObservedObject private var model: BosePanelModel
+  private let kind: Kind
+
+  public init(model: BosePanelModel, kind: Kind) {
+    self.model = model
+    self.kind = kind
+  }
+
+  public var body: some View {
+    switch kind {
+    case .equalizer: BoseEqualizerPage(state: model.state, actions: model.actions)
+    case .modes: BoseModesPage(state: model.state, actions: model.actions)
+    case .extras: BoseExtrasPage(state: model.state, actions: model.actions)
+    }
+  }
+}
+
 /// The closed notch bar for a Bose device: the model name at the left edge, the charge at
 /// the right. The same shape and margins the shared closed bar uses, drawn here so the Bose
 /// panel can be previewed end to end.

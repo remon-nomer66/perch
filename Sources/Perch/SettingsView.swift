@@ -93,6 +93,46 @@ extension AppModel {
       }
     )
   }
+
+  /// The notch sheets for a connected Bose device, in the Sony pattern: the common
+  /// (device-independent) sheet first, then one sheet per Bose feature the device actually
+  /// declares — the same items the General tab's Bose cards show, and in the same order.
+  /// A model that declares a feature gets its sheet; one that does not is simply absent,
+  /// so the pager never stops on a dead sheet. The header (name, charge) and the media
+  /// column are the notch's own and need nothing from here.
+  func bosePanelPages(_ boseModel: BosePanelModel) -> [PanelPage] {
+    var pages = PanelPages.commonPages(
+      spatial: spatial, headTracking: headTracking, outputRoute: outputRoute
+    )
+    for kind in BoseNotchLayout.deviceSheets(for: boseModel.state) {
+      pages.append(
+        PanelPage(id: "bose-\(kind.rawValue)", content: AnyView(
+          BosePanelSheet(model: boseModel, kind: kind)
+        ))
+      )
+    }
+    return pages
+  }
+}
+
+/// The single source of truth for which Bose device sheets exist for a given state, so the
+/// pager's stop count (decided in the refresh, before any view is built) and the sheets the
+/// notch renders can never disagree. Noise control is deliberately absent — on the Ultra
+/// family it lives on the listening mode, so the modes sheet is its one home.
+@MainActor
+enum BoseNotchLayout {
+  static func deviceSheets(for state: BosePanelState) -> [BosePanelSheet.Kind] {
+    var sheets: [BosePanelSheet.Kind] = []
+    if state.equalizer != nil { sheets.append(.equalizer) }
+    if state.audioModes?.modes.isEmpty == false { sheets.append(.modes) }
+    if state.spatial != nil || state.sidetone != nil { sheets.append(.extras) }
+    return sheets
+  }
+
+  /// Total notch stops for a Bose device: the common sheet(s) plus each declared feature.
+  static func pageCount(for state: BosePanelState) -> Int {
+    PanelPages.commonPageIDs.count + deviceSheets(for: state).count
+  }
 }
 
 // MARK: - General (device controls)
@@ -142,10 +182,16 @@ private struct GeneralTab: View {
 
         // The common (device-independent) sheets — spatial audio above all — need no
         // device at all, so neither the missing device nor a read-only session may
-        // hide or disable them; only the device sheets are gated.
+        // hide or disable them; only the device sheets are gated. When a Bose device is
+        // connected it owns the device controls (its own cards above), so the Sony
+        // device sheets — which would only draw "not declared" here — are dropped, and
+        // just the common sheets follow.
         ForEach(
           model.panelPages(using: service)
-            .filter { model.panel.summary.isControllable || $0.isCommon }
+            .filter { page in
+              if bose.panelModel != nil { return page.isCommon }
+              return model.panel.summary.isControllable || page.isCommon
+            }
         ) { page in
           page.content
             .frame(maxWidth: .infinity, alignment: .topLeading)
@@ -162,28 +208,16 @@ private struct GeneralTab: View {
   }
 }
 
-/// The Bose device's live controls in the settings window: a page selector over the
-/// Bose panel (noise control + ambient level, equalizer, audio modes, immersive audio),
-/// driven by the same `BosePanelModel` the notch panel will use. Reads every feature
-/// back over the live session and writes gestures straight to the device.
+/// The Bose device's live controls in the settings window: the Bose panel's features
+/// (noise control + ambient level, equalizer, audio modes, immersive audio) stacked as
+/// one scrolling column of cards rather than paged behind tabs, so the window reads like
+/// the Sony one below it. Driven by the same `BosePanelModel` the notch panel uses; only
+/// the features the device actually declares get a card, so nothing irrelevant is shown.
 private struct BoseControlsSection: View {
   @ObservedObject var model: BosePanelModel
-  @State private var page = 0
 
   var body: some View {
-    VStack(alignment: .leading, spacing: 10) {
-      Picker("", selection: $page) {
-        Text(L("ノイズ", "Noise")).tag(0)
-        Text(L("イコライザー", "EQ")).tag(1)
-        Text(L("モード", "Modes")).tag(2)
-        Text(L("空間", "Spatial")).tag(3)
-      }
-      .pickerStyle(.segmented)
-      .labelsHidden()
-
-      BosePanelView(state: model.state, page: page, actions: model.actions)
-        .frame(height: 300)
-    }
+    BosePanelStackView(state: model.state, actions: model.actions)
   }
 }
 

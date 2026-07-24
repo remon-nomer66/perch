@@ -66,7 +66,11 @@ extension BosePanelState {
       battery: batteryReading(from: snapshot.battery),
       cnc: cncState(from: snapshot, config: config),
       ancEnabled: liveField(snapshot, config) { $0.ancEnabled },
-      windReduction: liveField(snapshot, config) { $0.windBlock },
+      // Withheld on models that do not physically carry wind reduction, even though the
+      // [31.10] wind byte is always present on the wire (see `supportsWindReduction`).
+      windReduction: config.supportsWindReduction
+        ? liveField(snapshot, config) { $0.windBlock }
+        : nil,
       equalizer: equalizerState(from: snapshot, config: config),
       audioModes: config.supportsModeBlock ? snapshot.audioModes : nil,
       spatial: liveField(snapshot, config) { $0.spatial },

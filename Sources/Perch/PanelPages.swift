@@ -18,6 +18,21 @@ enum PanelPages {
   /// is connected. The common sheets sit to its left (index 0 … homeIndex-1).
   static var homeIndex: Int { commonPageIDs.count }
 
+  /// The device-independent sheets, built alone so the Bose notch can carry the same
+  /// spatial-audio sheet the Sony notch does — the common region is brand-agnostic, so both
+  /// panels show one and the same sheet to its left of the device controls.
+  static func commonPages(
+    spatial: SpatialAudioController,
+    headTracking: HeadTrackingController,
+    outputRoute: OutputRouteWatcher
+  ) -> [PanelPage] {
+    [
+      PanelPage(id: "spatial", isCommon: true, content: AnyView(
+        SpatialAudioPage(controller: spatial, headTracking: headTracking, outputRoute: outputRoute)
+      )),
+    ]
+  }
+
   static func all(
     spatial: SpatialAudioController,
     headTracking: HeadTrackingController,
@@ -36,11 +51,7 @@ enum PanelPages {
     sidetone: SidetoneReading?,
     applySidetone: @escaping (Bool) -> Void
   ) -> [PanelPage] {
-    let common = [
-      PanelPage(id: "spatial", isCommon: true, content: AnyView(
-        SpatialAudioPage(controller: spatial, headTracking: headTracking, outputRoute: outputRoute)
-      )),
-    ]
+    let common = commonPages(spatial: spatial, headTracking: headTracking, outputRoute: outputRoute)
     let devicePages = [
       PanelPage(id: "noise", content: AnyView(NoiseControlPage(reading: noiseControl, apply: applyNoiseControl, dragLevel: dragNoiseLevel))),
       PanelPage(id: "equalizer", content: AnyView(EqualizerPage(

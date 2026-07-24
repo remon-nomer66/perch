@@ -23,6 +23,12 @@ public struct BoseDeviceConfig: Equatable, Sendable {
   public let editableSlots: Range<Int>?
   /// The preset (locked) mode slots, or `nil` without block 31. Preset = 0..<4.
   public let presetSlots: Range<Int>?
+  /// Whether the model actually exposes wind-noise reduction. The [31.10] block always
+  /// carries a wind byte for the Ultra 2 family, so its presence in the payload cannot
+  /// tell headphones (which have the feature) from earbuds (which do not). This axis
+  /// gates the switch so a model without the physical feature never shows it, even
+  /// though the wire byte is there.
+  public let supportsWindReduction: Bool
 
   public init(
     rfcommChannel: Int,
@@ -30,7 +36,8 @@ public struct BoseDeviceConfig: Equatable, Sendable {
     features: Set<BmapFunctionAddress>,
     batteryLayout: BmapBattery.Layout,
     editableSlots: Range<Int>?,
-    presetSlots: Range<Int>?
+    presetSlots: Range<Int>?,
+    supportsWindReduction: Bool = true
   ) {
     self.rfcommChannel = rfcommChannel
     self.initializeAddress = initializeAddress
@@ -38,6 +45,7 @@ public struct BoseDeviceConfig: Equatable, Sendable {
     self.batteryLayout = batteryLayout
     self.editableSlots = editableSlots
     self.presetSlots = presetSlots
+    self.supportsWindReduction = supportsWindReduction
   }
 
   /// Whether the model exposes the audio-modes block (block 31).
@@ -75,6 +83,27 @@ extension BoseDeviceConfig {
     batteryLayout: .componentGroups,
     editableSlots: 4..<11,
     presetSlots: 0..<4
+  )
+
+  /// QC Ultra Earbuds (2nd Gen): the same Ultra 2 dialect as the headphones, but the
+  /// earbuds do not carry wind-noise reduction, so the switch is withheld even though the
+  /// [31.10] wind byte is present on the wire.
+  public static let qcUltra2Earbuds = BoseDeviceConfig(
+    rfcommChannel: 2,
+    initializeAddress: nil,
+    features: [
+      .battery,
+      .noiseCancellationRead,
+      .equalizer,
+      .noiseControlLiveWrite,
+      .modeConfig,
+      .firmwareVersion,
+      .deviceName,
+    ],
+    batteryLayout: .componentGroups,
+    editableSlots: 4..<11,
+    presetSlots: 0..<4,
+    supportsWindReduction: false
   )
 
   /// QC35 family (QC35, QC35 II): channel 8, a required [0.1] connect init, adaptive

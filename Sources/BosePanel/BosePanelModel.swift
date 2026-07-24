@@ -52,7 +52,6 @@ public final class BosePanelModel: ObservableObject {
   private let session: BoseSession?
 
   private var cncAdjustment = BoseAdjustmentGuard()
-  private var equalizerAdjustment = BoseAdjustmentGuard()
   private var cncDrag: Task<Void, Never>?
   private var bandDrags: [UInt8: Task<Void, Never>] = [:]
 
@@ -75,9 +74,12 @@ public final class BosePanelModel: ObservableObject {
       merged.noiseCancellation = snapshot.noiseCancellation
       merged.liveNoiseControl = snapshot.liveNoiseControl
     }
-    if equalizerAdjustment.isHolding {
-      merged.equalizerBands = snapshot.equalizerBands
-    }
+    // The equalizer is authoritative in this model: it changes only through a drag here,
+    // each reconciled against the device by `writeThenPoll`, and the periodic refresh does
+    // not re-read it — so the snapshot it carries holds a stale connect-time copy that
+    // would snap a just-raised band back to its old value. The model's own bands always
+    // win; a fresh full read seeds them through the initializer, never through here.
+    merged.equalizerBands = snapshot.equalizerBands
     snapshot = merged
     reproject()
   }
@@ -173,7 +175,6 @@ public final class BosePanelModel: ObservableObject {
 
   public func dragEqualizerBand(bandId: UInt8, value: Int, isFinal: Bool) {
     guard state.equalizer != nil else { return }
-    let token = equalizerAdjustment.begin()
     snapshot = snapshot.settingEqualizerBand(bandId: bandId, value: value)
     reproject()
 
@@ -183,12 +184,11 @@ public final class BosePanelModel: ObservableObject {
         try? await Task.sleep(for: .milliseconds(90))
         if Task.isCancelled { return }
       }
-      await self?.sendEqualizerBand(bandId: bandId, value: value, final: isFinal, token: token)
+      await self?.sendEqualizerBand(bandId: bandId, value: value, final: isFinal)
     }
   }
 
-  private func sendEqualizerBand(bandId: UInt8, value: Int, final: Bool, token: Int) async {
-    defer { if final { equalizerAdjustment.end(token) } }
+  private func sendEqualizerBand(bandId: UInt8, value: Int, final: Bool) async {
     guard let session else { return }
     let range = snapshot.equalizerBands?.first { $0.bandId == bandId }
       .map { $0.minimum...$0.maximum }

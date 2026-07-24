@@ -20,10 +20,14 @@ import Testing
   #expect(try model.config.makeInitializeFrame() == nil)
 }
 
-@Test func earbudsReuseUltraConfig() throws {
+@Test func earbudsUseUltraEarbudsConfig() throws {
   let model = try #require(BoseCatalog.model(forProductId: 0x4062))
   #expect(model.codename == "edith")
-  #expect(model.config == .qcUltra2)
+  // The earbuds share the Ultra 2 dialect but withhold wind reduction, which they do
+  // not carry — so they take the earbuds variant, not the headphones' config.
+  #expect(model.config == .qcUltra2Earbuds)
+  #expect(model.config.supportsWindReduction == false)
+  #expect(BoseDeviceConfig.qcUltra2.supportsWindReduction == true)
 }
 
 @Test func catalogResolvesQC35() throws {

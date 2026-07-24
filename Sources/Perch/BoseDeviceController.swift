@@ -157,7 +157,15 @@ final class BoseDeviceController: ObservableObject {
 
       firmwareVersion = try? await readFirmware(session)
       snapshot = await readSnapshot(session, includingStable: true)
-      panelModel = BosePanelModel(snapshot: snapshot, config: config, session: session)
+      // The session talks the Ultra 2 dialect for every model in the family, but the panel
+      // display config is chosen once the device has named itself: the earbuds withhold
+      // wind reduction while the headphones keep it. Product ids are not yet plumbed from
+      // SDP, so the device-reported product name is the only signal that tells them apart.
+      panelModel = BosePanelModel(
+        snapshot: snapshot,
+        config: Self.displayConfig(forModelName: snapshot.modelName),
+        session: session
+      )
       publishReadout(status: .ready)
       Self.log.notice("bose connected: controllable")
     } catch {
@@ -253,6 +261,16 @@ final class BoseDeviceController: ObservableObject {
       || snap.audioModes != nil
     snap.isControllable = gotAnything
     return snap
+  }
+
+  /// The panel display config for a device that has named itself. Every Ultra 2 device
+  /// shares the protocol config, so this differs from `config` only in the display axes
+  /// that hardware, not the wire, decides — today just wind reduction, which the earbuds
+  /// lack. An unread or unrecognised name keeps the headphones' full-feature default.
+  private static func displayConfig(forModelName modelName: String?) -> BoseDeviceConfig {
+    guard let name = modelName?.lowercased() else { return .qcUltra2 }
+    let isEarbuds = name.contains("earbud") || name.contains("buds")
+    return isEarbuds ? .qcUltra2Earbuds : .qcUltra2
   }
 
   private func readModelName(_ session: BoseSession) async throws -> String {
