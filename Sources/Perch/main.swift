@@ -57,8 +57,8 @@ final class AppModel: ObservableObject {
   private var headTrackingGate: AnyCancellable?
 
   init() {
-    headTracking.applyOrientation = { [weak self] orientation in
-      self?.spatial.updateListener(orientation)
+    headTracking.applyPose = { [weak self] orientation, distanceRatio in
+      self?.spatial.updateListenerPose(orientation, distanceRatio: distanceRatio)
     }
     headTrackingGate = spatial.$isEnabled.sink { [weak self] enabled in
       if !enabled {

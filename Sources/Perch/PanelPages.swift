@@ -171,6 +171,14 @@ private struct SpatialAudioPage: View {
             L("空間オーディオをオンにすると使えます。", "Turn on Spatial Audio to use this.")
           )
         } else {
+          if headTracking.isEnabled {
+            SwitchRow(
+              title: L("距離も反映（実験的）", "Distance too (experimental)"),
+              isOn: headTracking.distanceEnabled
+            ) {
+              headTracking.distanceEnabled = $0
+            }
+          }
           trackingStatus
         }
       } else {

@@ -163,16 +163,20 @@ final class SpatialAudioController: ObservableObject {
     }
   }
 
-  /// The last listener orientation from head tracking, kept so an engine rebuild
-  /// (options changed mid-listen) does not snap the sound field to front for the
-  /// frames until the camera speaks again.
+  /// The last listener pose from head tracking, kept so an engine rebuild (options
+  /// changed mid-listen) does not snap the sound field to front for the frames until
+  /// the camera speaks again.
   private var listenerOrientation: SpatialAudioKit.ListenerOrientation?
+  private var listenerDistanceRatio = 1.0
 
-  /// The listener orientation from head tracking. Only a running engine cares.
-  func updateListener(_ orientation: SpatialAudioKit.ListenerOrientation) {
+  /// The listener pose from head tracking. Only a running engine cares.
+  func updateListenerPose(_ orientation: SpatialAudioKit.ListenerOrientation, distanceRatio: Double) {
     guard isEnabled, #available(macOS 14.4, *) else { return }
     listenerOrientation = orientation
-    (engine as? MultibandSpatializer)?.updateListener(orientation)
+    listenerDistanceRatio = distanceRatio
+    let spatializer = engine as? MultibandSpatializer
+    spatializer?.updateListener(orientation)
+    spatializer?.setListenerDistance(ratio: distanceRatio)
   }
 
   /// A running engine with new options: rebuild in place, staying on. Capture is already
@@ -186,7 +190,9 @@ final class SpatialAudioController: ObservableObject {
     do {
       engine = try makeAndStartEngine()
       if let listenerOrientation {
-        (engine as? MultibandSpatializer)?.updateListener(listenerOrientation)
+        let spatializer = engine as? MultibandSpatializer
+        spatializer?.updateListener(listenerOrientation)
+        spatializer?.setListenerDistance(ratio: listenerDistanceRatio)
       }
       errorMessage = nil
     } catch {
@@ -205,6 +211,7 @@ final class SpatialAudioController: ObservableObject {
     isEnabled = false
     isStarting = false
     listenerOrientation = nil
+    listenerDistanceRatio = 1.0
   }
 
   private enum Keys {

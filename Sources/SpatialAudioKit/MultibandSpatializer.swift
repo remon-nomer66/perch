@@ -99,6 +99,11 @@ public final class MultibandSpatializer: @unchecked Sendable {
   public var midGain: Float
   public var sideWidth: Float
 
+  // ヘッドトラッキングの距離連動（lowGain と同じ扱いでオーディオスレッドが読む）。
+  private var listenerDistanceRatio = 1.0
+  private var distanceLowpassLeft = OnePoleLowpass()
+  private var distanceLowpassRight = OnePoleLowpass()
+
   private enum SourceIndex {
     static let center = 0
     static let left = 1
@@ -157,6 +162,13 @@ public final class MultibandSpatializer: @unchecked Sendable {
 
   public func updateListener(_ orientation: ListenerOrientation) {
     graph.updateListener(orientation)
+  }
+
+  /// ヘッドトラッキングの相対距離（較正時=1.0）。リスナーを幾何のまま後退させ、
+  /// 中高域には距離のこもり（一次ローパス）を掛ける。
+  public func setListenerDistance(ratio: Double) {
+    listenerDistanceRatio = ratio
+    graph.setListenerZ(DistanceRendering.listenerOffset(ratio: ratio))
   }
 
   public func setMasterGain(_ gain: Float) { graph.setOutputVolume(gain) }
@@ -254,8 +266,18 @@ public final class MultibandSpatializer: @unchecked Sendable {
         break
       }
     }
-    let (lowLeft, highLeft) = crossoverLeft.split(left)
-    let (lowRight, highRight) = crossoverRight.split(right)
+    let (lowLeft, splitHighLeft) = crossoverLeft.split(left)
+    let (lowRight, splitHighRight) = crossoverRight.split(right)
+
+    // 距離のこもり: 遠ざかっているときだけ中高域を暗くする。低音（両耳直通）は
+    // 距離でほとんど鈍らないので触らない。
+    let distanceCutoff = DistanceRendering.lowpassCutoff(ratio: listenerDistanceRatio)
+    let highLeft = distanceLowpassLeft.process(
+      splitHighLeft, cutoff: distanceCutoff, sampleRate: sampleRate
+    )
+    let highRight = distanceLowpassRight.process(
+      splitHighRight, cutoff: distanceCutoff, sampleRate: sampleRate
+    )
 
     let count = min(lowLeft.count, lowRight.count, highLeft.count, highRight.count)
     if count > 0 {

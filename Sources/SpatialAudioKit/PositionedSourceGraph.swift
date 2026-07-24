@@ -59,6 +59,11 @@ public final class PositionedSourceGraph: @unchecked Sendable {
     environment.listenerAngularOrientation = orientation.audioOrientation
   }
 
+  /// リスナーを前後に動かす。+z が後退（前方 -z の音源から遠ざかる）。距離連動用。
+  public func setListenerZ(_ z: Double) {
+    environment.listenerPosition = AVAudio3DPoint(x: 0, y: 0, z: Float(z))
+  }
+
   public func start() throws {
     engine.prepare()
     try engine.start()

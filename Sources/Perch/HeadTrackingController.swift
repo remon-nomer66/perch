@@ -30,6 +30,14 @@ final class HeadTrackingController: ObservableObject {
 
   @Published private(set) var status: Status = .off
 
+  /// 距離連動（実験的）。較正点からの相対距離を減衰とこもりに写す。
+  /// オフでも測定は続く（較正だけは済ませておく）が、届ける比率は常に 1.0。
+  @Published var distanceEnabled: Bool {
+    didSet {
+      defaults.set(distanceEnabled, forKey: Keys.distance)
+    }
+  }
+
   /// トグルの見た目。許可待ち・較正中・見失い中もオンとして扱う。
   var isEnabled: Bool {
     switch status {
@@ -38,12 +46,14 @@ final class HeadTrackingController: ObservableObject {
     }
   }
 
-  /// 追従したリスナー向きの届け先（空間オーディオコントローラ）。
-  var applyOrientation: ((ListenerOrientation) -> Void)?
+  /// 追従したリスナーの姿勢の届け先（空間オーディオコントローラ）。
+  /// (向き, 相対距離比 — 距離連動オフのときは常に 1.0)。
+  var applyPose: ((ListenerOrientation, Double) -> Void)?
 
   private let providerFactory: @MainActor () -> any HeadPoseProvider
   private let authorization: () -> AVAuthorizationStatus
   private let requestAccess: () async -> Bool
+  private let defaults: UserDefaults
 
   private var provider: (any HeadPoseProvider)?
   private var pipeline: Task<Void, Never>?
@@ -51,6 +61,7 @@ final class HeadTrackingController: ObservableObject {
   private var center: PoseCenter
   private var filter = RotationOneEuroFilter()
   private var blend = TrackingBlend()
+  private var distance: RelativeDistanceEstimator?
   private var lastTime: Double?
   private var receivedAnySample = false
   /// 較正中に顔の取れないフレームが続いた数。閾値超えで「検出できない」と告げて止まる
@@ -63,14 +74,17 @@ final class HeadTrackingController: ObservableObject {
     providerFactory: @escaping @MainActor () -> any HeadPoseProvider = { CameraHeadPoseProvider() },
     authorization: @escaping () -> AVAuthorizationStatus = { CameraHeadPoseProvider.authorization },
     requestAccess: @escaping () async -> Bool = { await CameraHeadPoseProvider.requestAccess() },
+    defaults: UserDefaults = .standard,
     calibrationSamples: Int = 15,
     calibrationMissLimit: Int = 120
   ) {
     self.providerFactory = providerFactory
     self.authorization = authorization
     self.requestAccess = requestAccess
+    self.defaults = defaults
     self.calibrationSamples = calibrationSamples
     self.calibrationMissLimit = calibrationMissLimit
+    distanceEnabled = defaults.object(forKey: Keys.distance) as? Bool ?? false
     center = PoseCenter(sampleTarget: calibrationSamples)
   }
 
@@ -89,6 +103,7 @@ final class HeadTrackingController: ObservableObject {
     guard status == .tracking || status == .faceLost else { return }
     center = PoseCenter(sampleTarget: calibrationSamples)
     filter = RotationOneEuroFilter()
+    distance = nil
     calibrationMisses = 0
     status = .calibrating
   }
@@ -131,6 +146,7 @@ final class HeadTrackingController: ObservableObject {
     center = PoseCenter(sampleTarget: calibrationSamples)
     filter = RotationOneEuroFilter()
     blend = TrackingBlend()
+    distance = nil
     lastTime = nil
     receivedAnySample = false
     calibrationMisses = 0
@@ -181,6 +197,9 @@ final class HeadTrackingController: ObservableObject {
       if let rotation = sample.rotation {
         calibrationMisses = 0
         if center.add(rotation: rotation, pixelIPD: sample.pixelIPD) == .ready {
+          // 較正中に瞳が一度も取れなければ基準が無い — 距離連動は静かに諦め、
+          // 向きの追従だけで動く。
+          distance = center.referenceIPD.map { RelativeDistanceEstimator(referenceIPD: $0) }
           status = .tracking
         }
       } else {
@@ -199,12 +218,30 @@ final class HeadTrackingController: ObservableObject {
     }
 
     let tracked = sample.rotation.map { filter.filter(center.centered($0), dt: dt) }
-    let (output, _) = blend.advance(tracked: tracked, distanceRatio: nil, dt: dt)
+
+    // 距離: 測定は較正基準がある限り続け（トグルの切り替えで基準がずれない）、
+    // 届けるかどうかだけをトグルが決める。yaw ゲートはカメラに対する生の向きで判く。
+    var measuredRatio = 1.0
+    if var estimator = distance, let rotation = sample.rotation {
+      measuredRatio = estimator.update(
+        pixelIPD: sample.pixelIPD,
+        faceWidth: sample.faceWidth,
+        yaw: rotation.eulerAngles.yaw
+      )
+      distance = estimator
+    }
+    let ratioForBlend = distanceEnabled ? measuredRatio : 1.0
+
+    let (output, blendedRatio) = blend.advance(
+      tracked: tracked,
+      distanceRatio: tracked == nil ? nil : ratioForBlend,
+      dt: dt
+    )
     let nextStatus: Status = tracked == nil ? .faceLost : .tracking
     if status != nextStatus {
       status = nextStatus
     }
-    applyOrientation?(output.listenerOrientation)
+    applyPose?(output.listenerOrientation, blendedRatio)
   }
 
   /// 中断して理由を告げる。カメラは必ず止める（「使用中」の表示とランプを残さない）。
@@ -217,7 +254,7 @@ final class HeadTrackingController: ObservableObject {
     provider = nil
     lastTime = nil
     status = .failed(message)
-    applyOrientation?(.forward)
+    applyPose?(.forward, 1.0)
   }
 
   private func stopTracking() {
@@ -229,7 +266,11 @@ final class HeadTrackingController: ObservableObject {
     provider = nil
     lastTime = nil
     status = .off
-    // 追従の置き土産を残さない: 音場は正面へ戻す。
-    applyOrientation?(.forward)
+    // 追従の置き土産を残さない: 音場は正面・較正距離へ戻す。
+    applyPose?(.forward, 1.0)
+  }
+
+  private enum Keys {
+    static let distance = "HeadTracking.distance"
   }
 }
