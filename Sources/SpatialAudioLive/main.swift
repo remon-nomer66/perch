@@ -9,7 +9,7 @@ import SpatialAudioKit
 //   引数 auto      : multiband に自動バランスを重ねる。直近の音を測り、低音ゲインと
 //                    幅をゆっくり自動追従（曲が変わっても数秒で馴染む）。
 //   引数 wanderNN  : 音源をゆっくり漂わせる振れ幅（度）。既定6。例 wander10。nowander で無効。
-//   引数 beat[NN]  : 拍（低音のオンセット）に反応して音場をパルスさせる。既定5度。例 beat8。
+//   引数 beat[NN]  : 拍（スペクトルフラックスの onset）に反応して音場をパルスさせる。既定5度。例 beat8。
 //   引数 tune     : 対話調整モード。再生しながらキー操作で音場を追い込む。
 //   引数 rotate   : リスナーの向きをゆっくり回す効果デモ。
 //   引数 nomute   : 原音をミュートしない（原音＋空間化版を同時に鳴らして比較）。
@@ -137,7 +137,7 @@ func runMultiband(muteOriginal: Bool, autoBalance: Bool, wanderDegrees: Double, 
     print(String(format: "  揺らぎ: ±%.0f° で音源をゆっくり漂わせています。", wanderDegrees))
   }
   if beatDegrees > 0 {
-    print(String(format: "  拍リアクティブ: ON（±%.0f°）。低音の拍で音場がパルスします。", beatDegrees))
+    print(String(format: "  拍リアクティブ: ON（±%.0f°）。音の立ち上がりで音場がパルスします。", beatDegrees))
   }
   if !muteOriginal {
     print("  原音ミュートなし（原音＋空間化版）。")
