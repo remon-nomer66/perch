@@ -64,7 +64,7 @@ let package = Package(
     ),
     .executableTarget(
       name: "Perch",
-      dependencies: ["TandemCore", "TandemSession", "NotchKit", "PlayerBridge"],
+      dependencies: ["TandemCore", "TandemSession", "NotchKit", "PlayerBridge", "SpatialAudioKit"],
       exclude: agentNotes("Sources/Perch"),
       resources: [.process("Resources")]
     ),

@@ -47,6 +47,9 @@ final class AppModel: ObservableObject {
 
   var pager = PanelPager(pageCount: PanelPages.count, index: PanelPages.homeIndex)
 
+  /// System-wide spatial audio, driven from the common sheet. Device-independent.
+  let spatial = SpatialAudioController()
+
   /// Sends a change and refreshes from what the device actually reports back.
   ///
   /// The panel is not updated optimistically: on an unverified model the headset may
