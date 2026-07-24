@@ -67,25 +67,27 @@ private struct SpatialAudioPage: View {
   @ObservedObject var controller: SpatialAudioController
 
   var body: some View {
-    VStack(alignment: .leading, spacing: 8) {
-      PageTitle(text: L("空間オーディオ", "Spatial Audio"))
-
-      // Two fifths for spatial audio, three kept for head tracking: the switches want
-      // less width than the tracking controls that will land beside them, so the split
-      // leans right. The reader is given its height explicitly — outside the notch's
-      // fixed slot (the settings window's scrolling cards) it would otherwise collapse.
-      GeometryReader { proxy in
-        let spacing: CGFloat = 18
-        let fifth = (proxy.size.width - spacing) / 5
-        HStack(alignment: .top, spacing: spacing) {
+    // Two fifths for spatial audio, three kept for head tracking: the switches want less
+    // width than the tracking controls that will land beside them, so the split leans
+    // right. The section title lives in the left column so the head-tracking heading
+    // lines up with it across the top, rather than starting a row lower. The reader is
+    // given its height explicitly — outside the notch's fixed slot (the settings window's
+    // scrolling cards) it would otherwise collapse.
+    GeometryReader { proxy in
+      let spacing: CGFloat = 18
+      let fifth = (proxy.size.width - spacing) / 5
+      HStack(alignment: .top, spacing: spacing) {
+        VStack(alignment: .leading, spacing: 8) {
+          PageTitle(text: L("空間オーディオ", "Spatial Audio"))
           spatialColumn
-            .frame(width: fifth * 2, alignment: .topLeading)
-          headTrackingColumn
-            .frame(width: fifth * 3, alignment: .topLeading)
         }
+        .frame(width: fifth * 2, alignment: .topLeading)
+
+        headTrackingColumn
+          .frame(width: fifth * 3, alignment: .topLeading)
       }
-      .frame(height: 96)
     }
+    .frame(height: 118)
   }
 
   /// The spatial-audio switches, on the left two fifths. The toggles ride this column's
