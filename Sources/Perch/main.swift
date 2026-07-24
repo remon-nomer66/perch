@@ -289,6 +289,41 @@ final class AppModel: ObservableObject {
   func nowPlayingNext() { nowPlayingService.next() }
   func nowPlayingPrevious() { nowPlayingService.previous() }
 
+  /// Whether a re-injected headphone gesture should fall back to a system media key
+  /// rather than scripting Spotify/Music. It falls back whenever Spotify/Music is not
+  /// the thing playing — so a browser video is controlled — while a playing scriptable
+  /// player keeps the precise, already-proven ScriptingBridge path untouched.
+  static func reinjectionUsesSystemKey(isPlaying: Bool?) -> Bool { isPlaying != true }
+
+  // The headphone touch panel's re-injected transport. Distinct from the notch's
+  // on-screen buttons (which always mean the displayed track): a physical tap should do
+  // what it did natively — control whatever is actually playing. So it scripts a playing
+  // Spotify/Music, and otherwise re-issues the system media key the held channel
+  // suppressed, which reaches a browser or any other player.
+  func reinjectPlayPause() {
+    if Self.reinjectionUsesSystemKey(isPlaying: panel.nowPlaying?.isPlaying) {
+      SystemMediaKey.playPause.post()
+    } else {
+      nowPlayingService.playPause()
+    }
+  }
+
+  func reinjectNext() {
+    if Self.reinjectionUsesSystemKey(isPlaying: panel.nowPlaying?.isPlaying) {
+      SystemMediaKey.next.post()
+    } else {
+      nowPlayingService.next()
+    }
+  }
+
+  func reinjectPrevious() {
+    if Self.reinjectionUsesSystemKey(isPlaying: panel.nowPlaying?.isPlaying) {
+      SystemMediaKey.previous.post()
+    } else {
+      nowPlayingService.previous()
+    }
+  }
+
   private var speakToChatAdjustment = AdjustmentGuard()
 
   func applySpeakToChat(enabled: Bool, using service: SessionService) {
@@ -865,9 +900,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let mediaGestures = MediaGestureForwarder(
       service: service,
       transport: .init(
-        playPause: { [model] in model.nowPlayingPlayPause() },
-        next: { [model] in model.nowPlayingNext() },
-        previous: { [model] in model.nowPlayingPrevious() }
+        playPause: { [model] in model.reinjectPlayPause() },
+        next: { [model] in model.reinjectNext() },
+        previous: { [model] in model.reinjectPrevious() }
       )
     )
     mediaGestures.start()
