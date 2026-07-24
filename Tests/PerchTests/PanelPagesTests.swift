@@ -6,6 +6,7 @@ import Testing
 @MainActor
 func pagesFollowTheDeclaredOrder() {
   let pages = PanelPages.all(
+    spatial: SpatialAudioController(),
     equalizer: nil,
     noiseControl: nil,
     listeningMode: nil,

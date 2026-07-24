@@ -19,6 +19,7 @@ enum PanelPages {
   static var homeIndex: Int { commonPageIDs.count }
 
   static func all(
+    spatial: SpatialAudioController,
     equalizer: EqualizerReading?,
     noiseControl: NoiseControlReading?,
     listeningMode: TandemListeningReading?,
@@ -34,7 +35,7 @@ enum PanelPages {
     applySidetone: @escaping (Bool) -> Void
   ) -> [PanelPage] {
     let common = [
-      PanelPage(id: "spatial", isCommon: true, content: AnyView(SpatialAudioPage())),
+      PanelPage(id: "spatial", isCommon: true, content: AnyView(SpatialAudioPage(controller: spatial))),
     ]
     let devicePages = [
       PanelPage(id: "noise", content: AnyView(NoiseControlPage(reading: noiseControl, apply: applyNoiseControl, dragLevel: dragNoiseLevel))),
@@ -59,21 +60,62 @@ enum PanelPages {
   }
 }
 
-/// The first common (device-independent) sheet. Structure placeholder for now: the
-/// spatial-audio controls will live here. Nothing on it depends on the connected model.
+/// The first common (device-independent) sheet: system-wide spatial audio. It captures
+/// the Mac's own audio and spreads it outside the head, so nothing here depends on the
+/// connected model. Needs macOS 14.4+ (Core Audio taps); older systems say so.
 private struct SpatialAudioPage: View {
+  @ObservedObject var controller: SpatialAudioController
+
   var body: some View {
     VStack(alignment: .leading, spacing: 9) {
       PageTitle(text: L("空間オーディオ", "Spatial Audio"))
-      Text(
-        L(
-          "機種に依存しない共通機能です。ここに空間オーディオの設定が入ります（準備中）。",
-          "A device-independent feature. Spatial audio controls will live here (coming soon)."
+
+      if controller.isAvailable {
+        SwitchRow(
+          title: L("空間オーディオ", "Spatial Audio"),
+          isOn: controller.isEnabled
+        ) { controller.setEnabled($0) }
+
+        // The refinements only matter once it is on.
+        if controller.isEnabled {
+          SwitchRow(title: L("自動バランス", "Auto balance"), isOn: controller.autoBalance) {
+            controller.autoBalance = $0
+          }
+          SwitchRow(title: L("ゆらぎ", "Movement"), isOn: controller.wander) {
+            controller.wander = $0
+          }
+          SwitchRow(title: L("拍に反応", "Beat reactive"), isOn: controller.beat) {
+            controller.beat = $0
+          }
+        }
+
+        if let error = controller.errorMessage {
+          Text(error)
+            .font(.system(size: 10))
+            .foregroundStyle(.orange)
+            .fixedSize(horizontal: false, vertical: true)
+        } else {
+          Text(
+            L(
+              "システム全体の音を頭の外へ広げます。機種に依存しません。",
+              "Spreads all system audio outside your head. Works with any device."
+            )
+          )
+            .font(.system(size: 9))
+            .foregroundStyle(.white.opacity(0.4))
+            .fixedSize(horizontal: false, vertical: true)
+        }
+      } else {
+        Text(
+          L(
+            "空間オーディオは macOS 14.4 以降が必要です。",
+            "Spatial Audio requires macOS 14.4 or later."
+          )
         )
-      )
-        .font(.system(size: 10))
-        .foregroundStyle(.white.opacity(0.5))
-        .fixedSize(horizontal: false, vertical: true)
+          .font(.system(size: 10))
+          .foregroundStyle(.white.opacity(0.5))
+          .fixedSize(horizontal: false, vertical: true)
+      }
     }
   }
 }
