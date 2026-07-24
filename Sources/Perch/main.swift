@@ -324,6 +324,12 @@ final class AppModel: ObservableObject {
       && (next.summary.modelName != nil || next.battery != .unknown)
     if hasContent, !hadContent {
       arrivalAnnounceUntil = ContinuousClock.now.advanced(by: .seconds(5))
+      // A device arriving always turns spatial audio off. Arriving mid-capture — the
+      // headset pulled over from another host above all — lands while the tap still
+      // mutes the system and the engine is mid-rebuild, and the Mac ends up silent.
+      // Connecting is a fresh start; spatial audio is explicit-on by design anyway
+      // (the switch is never persisted), so it goes off and waits to be asked.
+      spatial.setEnabled(false)
     }
     if !hasContent { arrivalAnnounceUntil = nil }
     hadContent = hasContent
