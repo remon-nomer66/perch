@@ -75,3 +75,38 @@ func emptySiteNeverMatches() {
   #expect(!SiteWatcher.matches(hosts: ["example.com"], sites: [""]))
   #expect(!SiteWatcher.matches(hosts: [], sites: ["example.com"]))
 }
+
+// MARK: - 「音を出しているブラウザ」への紐付け
+
+@Test("A browser is audible through its helper processes")
+@MainActor
+func helperProcessesCountAsTheirBrowser() {
+  // ブラウザの音は本体ではなくヘルパープロセスから出る。
+  #expect(SiteWatcher.browserIsAudible(
+    "com.google.Chrome", outputting: ["com.google.Chrome.helper"]))
+  #expect(SiteWatcher.browserIsAudible(
+    "com.microsoft.edgemac", outputting: ["com.microsoft.edgemac.helper.renderer"]))
+  #expect(SiteWatcher.browserIsAudible(
+    "com.google.Chrome", outputting: ["com.google.Chrome"]))
+}
+
+@Test("Safari is audible through the WebKit media processes")
+@MainActor
+func safariIsAudibleThroughWebKit() {
+  // Safari の音声は WebKit の GPU プロセスから出る。
+  #expect(SiteWatcher.browserIsAudible(
+    "com.apple.Safari", outputting: ["com.apple.WebKit.GPU"]))
+  #expect(SiteWatcher.browserIsAudible(
+    "com.apple.Safari", outputting: ["com.apple.Safari"]))
+}
+
+@Test("An unrelated audible process does not make a browser audible")
+@MainActor
+func unrelatedProcessesDoNotCount() {
+  #expect(!SiteWatcher.browserIsAudible(
+    "com.google.Chrome", outputting: ["com.spotify.client", "com.apple.Music"]))
+  #expect(!SiteWatcher.browserIsAudible("com.google.Chrome", outputting: []))
+  // 前方一致は「.」区切りで行う。似た名前の別アプリを拾わない。
+  #expect(!SiteWatcher.browserIsAudible(
+    "com.google.Chrome", outputting: ["com.google.Chromecast"]))
+}

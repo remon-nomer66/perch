@@ -52,6 +52,41 @@ func artistFromBrowserTitle() {
   #expect(RuleMatcher.match(rules, in: context)?.trigger == .artist("Fujii Kaze"))
 }
 
+@Test("While a player plays, an open tab naming another artist does not hijack the artist rule")
+func aPlayingPlayerSilencesTabTitles() {
+  // 聴いているのは Vaundy。どこかのウィンドウに YOASOBI のタブが開いているだけで
+  // YOASOBI ルールに持っていかれてはいけない。
+  let rules = [rule(.artist("YOASOBI"))]
+  let context = RuleMatcher.Context(
+    playingBundleID: "com.spotify.client",
+    playingArtist: "Vaundy, Cory Wong",
+    browserTitles: ["YOASOBI「アイドル」 - YouTube"]
+  )
+  #expect(RuleMatcher.match(rules, in: context) == nil)
+}
+
+@Test("A player playing without artist info still keeps tab titles out of it")
+func aPlayerWithoutArtistInfoSilencesTabTitles() {
+  // プレーヤーが鳴っている限り、タブのタイトルは「聴いているもの」の証拠にならない。
+  let rules = [rule(.artist("YOASOBI"))]
+  let context = RuleMatcher.Context(
+    playingBundleID: "com.spotify.client",
+    browserTitles: ["YOASOBI「アイドル」 - YouTube"]
+  )
+  #expect(RuleMatcher.match(rules, in: context) == nil)
+}
+
+@Test("The playing player's own artist still matches while tabs are open")
+func thePlayingArtistStillMatches() {
+  let rules = [rule(.artist("Vaundy"))]
+  let context = RuleMatcher.Context(
+    playingBundleID: "com.spotify.client",
+    playingArtist: "Vaundy, Cory Wong",
+    browserTitles: ["YOASOBI「アイドル」 - YouTube"]
+  )
+  #expect(RuleMatcher.match(rules, in: context)?.trigger == .artist("Vaundy"))
+}
+
 @Test("An artist rule wins over a site rule")
 func artistBeatsSite() {
   let rules = [
