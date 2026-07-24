@@ -63,11 +63,16 @@ public final class MultibandSpatializer: @unchecked Sendable {
   private var tap: SystemAudioTap?
   private let muteOriginal: Bool
 
-  /// True once any capture callback has arrived. Lets a caller tell a tap that started
-  /// but never delivers audio (e.g. the system-audio permission was denied) from one
-  /// that is simply between sounds.
+  /// True once any capture callback has arrived at all.
   private var receivedAudio = false
   public var hasReceivedAudio: Bool { receivedAudio }
+
+  /// True once a non-silent sample has been captured. A denied system-audio permission
+  /// still fires callbacks, but with silence — so callbacks arriving is not proof of
+  /// capture. Real (non-zero) audio is. Used to confirm that capture actually works.
+  private var receivedSignal = false
+  public var hasAudioSignal: Bool { receivedSignal }
+  private static let silenceThreshold: Float = 0.0005
 
   // 音源の基準位置（揺らぎはこれに加算する）と、ゆっくり漂わせる揺らぎ。
   private var centerBase: SphericalDirection
@@ -240,6 +245,15 @@ public final class MultibandSpatializer: @unchecked Sendable {
     receivedAudio = true
     let (left, right) = LiveSpatializer.extractStereo(bufferListPointer)
     guard !left.isEmpty, !right.isEmpty else { return }
+
+    // Prove real capture, not just that the callback fired: a denied permission delivers
+    // silent buffers. Stop scanning once any signal has been seen.
+    if !receivedSignal {
+      for sample in left where abs(sample) > Self.silenceThreshold {
+        receivedSignal = true
+        break
+      }
+    }
     let (lowLeft, highLeft) = crossoverLeft.split(left)
     let (lowRight, highRight) = crossoverRight.split(right)
 
