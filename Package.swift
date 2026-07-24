@@ -24,9 +24,11 @@ let package = Package(
   products: [
     .library(name: "TandemCore", targets: ["TandemCore"]),
     .library(name: "BoseCore", targets: ["BoseCore"]),
+    .library(name: "BosePanel", targets: ["BosePanel"]),
     .library(name: "DeviceContract", targets: ["DeviceContract"]),
     .executable(name: "Perch", targets: ["Perch"]),
     .executable(name: "perch-probe", targets: ["PerchProbe"]),
+    .executable(name: "bose-panel-preview", targets: ["BosePanelPreview"]),
   ],
   targets: [
     // Brand-neutral vocabulary shared by every headset. Pure value types, no
@@ -53,6 +55,23 @@ let package = Package(
       name: "BoseSession",
       dependencies: ["BoseCore"],
       exclude: agentNotes("Sources/BoseSession")
+    ),
+    // Bose's own expanded panel UI: SwiftUI pages shaped to the Ultra 2 (continuous CNC,
+    // independent ANC/wind, three-band EQ, audio modes, spatial, sidetone), plus the
+    // view-model that projects a session snapshot onto panel state and turns gestures into
+    // BoseSession commands. Deliberately not shared with Sony's panel (see
+    // docs/bose-device-contract.md). No hardware — renders from synthetic state.
+    .target(
+      name: "BosePanel",
+      dependencies: ["BoseCore", "BoseSession", "DeviceContract"],
+      exclude: agentNotes("Sources/BosePanel")
+    ),
+    // Hardware-free tool that renders the Bose panel to PNG from frozen-spec fixture
+    // values, for reviewing the layout without a device or the app running.
+    .executableTarget(
+      name: "BosePanelPreview",
+      dependencies: ["BosePanel", "BoseCore", "DeviceContract"],
+      exclude: agentNotes("Sources/BosePanelPreview")
     ),
     .target(
       name: "TandemSession",
@@ -108,6 +127,11 @@ let package = Package(
       name: "BoseSessionTests",
       dependencies: ["BoseSession"],
       exclude: agentNotes("Tests/BoseSessionTests")
+    ),
+    .testTarget(
+      name: "BosePanelTests",
+      dependencies: ["BosePanel"],
+      exclude: agentNotes("Tests/BosePanelTests")
     ),
     .testTarget(
       name: "TandemSessionTests",
