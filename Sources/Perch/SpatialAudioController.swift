@@ -5,38 +5,42 @@ import SpatialAudioKit
 ///
 /// Device-independent: it captures and spatialises the Mac's own audio, so nothing here
 /// depends on the connected headphones. Requires macOS 14.4+ (Core Audio process taps).
-/// The on/off state is not persisted — a launch never starts capturing on its own; the
-/// user turns it on when they want it. The sub-options are remembered.
+///
+/// The switch reflects *confirmed* capture, not the mere attempt. Creating the tap
+/// succeeds immediately even while the system-audio permission prompt is still up, and
+/// audio only flows once it is granted — so turning on waits for real audio to arrive
+/// before it commits. A denial (no audio) reverts and says why. The on/off state is not
+/// persisted; a launch never starts capturing on its own. The sub-options are remembered.
 @MainActor
 final class SpatialAudioController: ObservableObject {
   @Published private(set) var isEnabled = false
+  /// The gap between the user asking for it and capture being confirmed — while the
+  /// system-audio prompt is up, or the first buffers are still on their way.
+  @Published private(set) var isStarting = false
   @Published private(set) var errorMessage: String?
 
   @Published var autoBalance: Bool {
     didSet {
       defaults.set(autoBalance, forKey: Keys.auto)
-      reapplyIfRunning()
+      reconfigureIfRunning()
     }
   }
   @Published var wander: Bool {
     didSet {
       defaults.set(wander, forKey: Keys.wander)
-      reapplyIfRunning()
+      reconfigureIfRunning()
     }
   }
   @Published var beat: Bool {
     didSet {
       defaults.set(beat, forKey: Keys.beat)
-      reapplyIfRunning()
+      reconfigureIfRunning()
     }
   }
 
   /// The running spatialiser, type-erased so this controller need not itself be gated to
   /// macOS 14.4 (it is created only inside availability checks).
   private var engine: AnyObject?
-  /// Fires shortly after start to catch a tap that never delivers audio — the shape a
-  /// denied system-audio permission can take (it starts without error, then stays silent
-  /// while the original audio is muted). Without this the user would sit in silence.
   private var verifyTask: Task<Void, Never>?
   private let defaults: UserDefaults
 
@@ -55,34 +59,40 @@ final class SpatialAudioController: ObservableObject {
 
   func setEnabled(_ on: Bool) {
     guard isAvailable else { return }
-    if on { start() } else { stop() }
+    if on {
+      guard !isEnabled, !isStarting else { return }
+      start()
+    } else {
+      errorMessage = nil
+      teardown()
+    }
   }
 
-  private func reapplyIfRunning() {
-    guard isEnabled else { return }
-    // The options are set at creation, so a change while running restarts the engine.
-    start()
+  @available(macOS 14.4, *)
+  private func makeAndStartEngine() throws -> MultibandSpatializer {
+    let spatializer = try MultibandSpatializer(
+      muteOriginal: true,
+      autoBalance: autoBalance,
+      wanderDegrees: wander ? 6 : 0,
+      beatDegrees: beat ? 5 : 0
+    )
+    try spatializer.start()
+    return spatializer
   }
 
   private func start() {
     guard #available(macOS 14.4, *) else { return }
-    stop()
+    teardown()
+    errorMessage = nil
     do {
-      let spatializer = try MultibandSpatializer(
-        muteOriginal: true,
-        autoBalance: autoBalance,
-        wanderDegrees: wander ? 6 : 0,
-        beatDegrees: beat ? 5 : 0
-      )
-      try spatializer.start()
-      engine = spatializer
-      isEnabled = true
-      errorMessage = nil
-      scheduleCaptureCheck()
+      engine = try makeAndStartEngine()
+      // Not on yet: the tap can start without error while the prompt is still up. Wait
+      // for real audio before committing the switch to on.
+      isStarting = true
+      confirmCapture()
     } catch {
-      engine = nil
-      isEnabled = false
       NSLog("Perch spatial: start failed: %@", String(describing: error))
+      teardown()
       errorMessage = L(
         "空間オーディオを開始できませんでした。システムオーディオ録音の許可を確認してください。",
         "Could not start Spatial Audio. Check the system audio recording permission."
@@ -90,7 +100,50 @@ final class SpatialAudioController: ObservableObject {
     }
   }
 
-  private func stop() {
+  /// Waits for capture to actually begin, giving a first-time permission prompt time to
+  /// be answered. On the first buffer it commits to on; if none arrives it reverts and
+  /// puts the original audio back, so a denial never strands the user in silence.
+  private func confirmCapture() {
+    verifyTask = Task { @MainActor [weak self] in
+      for _ in 0..<15 {
+        try? await Task.sleep(for: .milliseconds(400))
+        guard let self, !Task.isCancelled, self.isStarting else { return }
+        if #available(macOS 14.4, *),
+          (self.engine as? MultibandSpatializer)?.hasReceivedAudio == true {
+          self.isStarting = false
+          self.isEnabled = true
+          self.errorMessage = nil
+          return
+        }
+      }
+      guard let self, self.isStarting else { return }
+      NSLog("Perch spatial: no audio captured; reverting (permission likely denied)")
+      self.teardown()
+      self.errorMessage = L(
+        "音声を取得できませんでした。システムオーディオ録音の許可を確認してください。",
+        "No audio was captured. Check the system audio recording permission."
+      )
+    }
+  }
+
+  /// A running engine with new options: rebuild in place, staying on. Capture is already
+  /// confirmed, so no prompt and no waiting are involved.
+  private func reconfigureIfRunning() {
+    guard isEnabled, #available(macOS 14.4, *) else { return }
+    verifyTask?.cancel()
+    verifyTask = nil
+    (engine as? MultibandSpatializer)?.stop()
+    engine = nil
+    do {
+      engine = try makeAndStartEngine()
+      errorMessage = nil
+    } catch {
+      teardown()
+      errorMessage = L("空間オーディオを再設定できませんでした。", "Could not reconfigure Spatial Audio.")
+    }
+  }
+
+  private func teardown() {
     verifyTask?.cancel()
     verifyTask = nil
     if #available(macOS 14.4, *) {
@@ -98,25 +151,7 @@ final class SpatialAudioController: ObservableObject {
     }
     engine = nil
     isEnabled = false
-  }
-
-  /// A tap can start without error yet deliver nothing when the system-audio permission
-  /// is denied — and the original audio is muted meanwhile. If no capture has arrived
-  /// shortly after start, treat it as a denial: put the sound back and say so.
-  private func scheduleCaptureCheck() {
-    verifyTask = Task { @MainActor [weak self] in
-      try? await Task.sleep(for: .milliseconds(1500))
-      guard let self, !Task.isCancelled, self.isEnabled else { return }
-      guard #available(macOS 14.4, *), let engine = self.engine as? MultibandSpatializer else { return }
-      if !engine.hasReceivedAudio {
-        NSLog("Perch spatial: no audio captured within 1.5s; reverting (permission likely denied)")
-        self.stop()
-        self.errorMessage = L(
-          "音声を取得できませんでした。システムオーディオ録音の許可を確認してください。",
-          "No audio was captured. Check the system audio recording permission."
-        )
-      }
-    }
+    isStarting = false
   }
 
   private enum Keys {

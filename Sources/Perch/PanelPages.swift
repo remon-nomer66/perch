@@ -97,6 +97,16 @@ private struct SpatialAudioPage: View {
         SwitchRow(title: L("空間オーディオ", "Spatial Audio"), isOn: controller.isEnabled) {
           controller.setEnabled($0)
         }
+        // The switch does not commit to on until capture is confirmed, so while the
+        // permission prompt is up (or the first buffers are on their way) it says so.
+        .disabled(controller.isStarting)
+
+        if controller.isStarting {
+          Text(L("確認中…（許可を確認しています）", "Starting… (checking permission)"))
+            .font(.system(size: 9))
+            .foregroundStyle(.white.opacity(0.5))
+        }
+
         // The refinements only matter once it is on.
         if controller.isEnabled {
           SwitchRow(title: L("自動バランス", "Auto balance"), isOn: controller.autoBalance) {
