@@ -111,7 +111,11 @@ let package = Package(
     ),
     .executableTarget(
       name: "Perch",
-      dependencies: ["TandemCore", "TandemSession", "NotchKit", "PlayerBridge"],
+      dependencies: [
+        "TandemCore", "TandemSession", "NotchKit", "PlayerBridge",
+        // Bose (stage 6): the app now hosts a parallel Bose control path alongside Sony.
+        "BoseCore", "BoseSession", "BoseTransport", "BosePanel", "DeviceContract",
+      ],
       exclude: agentNotes("Sources/Perch"),
       resources: [.process("Resources")]
     ),

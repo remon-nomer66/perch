@@ -1,6 +1,7 @@
 import BoseCore
 import BoseSession
 import BoseTransport
+import CoreAudio
 import Foundation
 import IOBluetooth
 
@@ -48,6 +49,10 @@ if probeArguments.first?.lowercased() == "diagnose" {
   print("connected devices  \(paired.filter { $0.isConnected() }.count)")
   print("(addresses/names are never printed — devices are shown by index only)")
 
+  // The CoreAudio default output — what the app's AudioOutputObserver actually sees.
+  // Correlating its address to a BMAP device is the whole question for the app's gate.
+  printAudioOutputCorrelation(paired: paired)
+
   for (index, device) in paired.enumerated() {
     let connected = device.isConnected()
     // Refresh SDP for connected devices (the ones we could actually open); an empty
@@ -59,6 +64,14 @@ if probeArguments.first?.lowercased() == "diagnose" {
     // dump short across 16 paired devices.
     guard connected || marker.present || spp.present else { continue }
     print("--- device #\(index) (connected=\(connected)) ---")
+    // OUI = the address's first three octets (the manufacturer block; identifies the
+    // maker, not the user). Read from the address string only — never `device.name`,
+    // which blocks on a synchronous remote name request for an uncached device.
+    if let addr = device.addressString {
+      let oui = addr.split(separator: "-").prefix(3).joined(separator: "-")
+      print("  oui: \(oui)")
+    }
+    print("  classOfDevice: \(String(format: "0x%06X", device.classOfDevice))")
     print("  sdp refresh:  \(refresh)")
     let markerCh = marker.channel.map { "ch\($0)" } ?? "no-rfcomm"
     let sppCh = spp.channel.map { "ch\($0)" } ?? "no-rfcomm"
@@ -92,6 +105,79 @@ func fail(_ message: String) -> Never {
 struct UncheckedSendableBox<Value>: @unchecked Sendable {
   let value: Value
   init(_ value: Value) { self.value = value }
+}
+
+/// The first three address octets (the OUI / manufacturer block — identifies the maker,
+/// never the user) parsed from a string that contains a Bluetooth address somewhere.
+func ouiOf(_ string: String) -> String? {
+  let octets = string.split(whereSeparator: { $0 == "-" || $0 == ":" })
+    .map(String.init)
+    .filter { $0.count == 2 && $0.allSatisfy(\.isHexDigit) }
+  guard octets.count >= 3 else { return nil }
+  return octets.prefix(3).map { $0.lowercased() }.joined(separator: "-")
+}
+
+/// Prints how the CoreAudio default output correlates to the paired/BMAP devices, so the
+/// app's gate (audio output → which Bose control address) can be designed. Prints only
+/// the manufacturer OUI and booleans — never the full address.
+func printAudioOutputCorrelation(paired: [IOBluetoothDevice]) {
+  print("--- audio output ---")
+  var deviceAddress = AudioObjectPropertyAddress(
+    mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+    mScope: kAudioObjectPropertyScopeGlobal,
+    mElement: kAudioObjectPropertyElementMain
+  )
+  var device = AudioObjectID(0)
+  var size = UInt32(MemoryLayout<AudioObjectID>.size)
+  guard
+    AudioObjectGetPropertyData(
+      AudioObjectID(kAudioObjectSystemObject), &deviceAddress, 0, nil, &size, &device
+    ) == noErr, device != 0
+  else {
+    print("  (no default output device)")
+    return
+  }
+  var transportAddress = AudioObjectPropertyAddress(
+    mSelector: kAudioDevicePropertyTransportType,
+    mScope: kAudioObjectPropertyScopeGlobal,
+    mElement: kAudioObjectPropertyElementMain
+  )
+  var transport = UInt32(0)
+  var tsize = UInt32(MemoryLayout<UInt32>.size)
+  _ = AudioObjectGetPropertyData(device, &transportAddress, 0, nil, &tsize, &transport)
+  let isBluetooth = transport == kAudioDeviceTransportTypeBluetooth
+  print("  transport: \(isBluetooth ? "bluetooth" : String(format: "0x%08X", transport))")
+
+  var uidAddress = AudioObjectPropertyAddress(
+    mSelector: kAudioDevicePropertyDeviceUID,
+    mScope: kAudioObjectPropertyScopeGlobal,
+    mElement: kAudioObjectPropertyElementMain
+  )
+  var usize = UInt32(MemoryLayout<CFString?>.size)
+  var uidValue: Unmanaged<CFString>?
+  let uidStatus = withUnsafeMutablePointer(to: &uidValue) { pointer in
+    AudioObjectGetPropertyData(device, &uidAddress, 0, nil, &usize, pointer)
+  }
+  guard uidStatus == noErr, let uidValue else {
+    print("  (no device UID)")
+    return
+  }
+  let uid = uidValue.takeRetainedValue() as String
+  guard let oui = ouiOf(uid) else {
+    print("  audio OUI: (address not found in UID)")
+    return
+  }
+  print("  audio output OUI: \(oui)")
+  // Does any BMAP-advertising paired device share this OUI?
+  let bmapOUIs = paired
+    .filter { BmapServiceDiscovery.advertisesBmap($0) }
+    .compactMap { $0.addressString.flatMap(ouiOf) }
+  print("  BMAP device OUIs: \(Set(bmapOUIs).sorted().joined(separator: ", "))")
+  print("  audio OUI matches a BMAP device: \(bmapOUIs.contains(oui))")
+  // Is the audio output address itself one of the paired devices, and does it advertise BMAP?
+  if let match = paired.first(where: { $0.addressString.flatMap(ouiOf) == oui }) {
+    print("  audio device advertises BMAP: \(BmapServiceDiscovery.advertisesBmap(match))")
+  }
 }
 
 // Refreshes a device's cached SDP records synchronously. `getServiceRecord`/`services`

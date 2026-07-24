@@ -1,4 +1,5 @@
 import AppKit
+import BosePanel
 import NotchKit
 import ServiceManagement
 import SwiftUI
@@ -22,7 +23,7 @@ struct SettingsView: View {
 
   var body: some View {
     TabView(selection: $selectedTab) {
-      GeneralTab(model: model, service: service)
+      GeneralTab(model: model, bose: model.bose, service: service)
         .tabItem { Label(L("一般", "General"), systemImage: "slider.horizontal.3") }
         .tag(Tab.general)
       BehaviorTab(settings: settingsStore, loginItem: loginItem, model: model, service: service)
@@ -93,6 +94,7 @@ extension AppModel {
 /// themselves for the notch's black backdrop, so each card recreates it.
 private struct GeneralTab: View {
   @ObservedObject var model: AppModel
+  @ObservedObject var bose: BoseDeviceController
   let service: SessionService
 
   var body: some View {
@@ -104,7 +106,12 @@ private struct GeneralTab: View {
           retry: { await service.session.handle(.manualRetry) }
         )
 
-        if model.panel.summary.isControllable {
+        // A Bose device owns the controls: its own panel (noise/ambient, equalizer,
+        // immersive audio) reading and writing over the live BMAP session. Shown instead
+        // of the Sony pages, which are for the Tandem session that is idle here.
+        if let boseModel = bose.panelModel {
+          BoseControlsSection(model: boseModel)
+        } else if model.panel.summary.isControllable {
           if let caveat = model.panel.summary.caveat {
             Label(caveat, systemImage: "exclamationmark.triangle.fill")
               .font(.system(size: 11))
@@ -138,6 +145,31 @@ private struct GeneralTab: View {
       }
       .padding(16)
       .frame(maxWidth: .infinity, alignment: .leading)
+    }
+  }
+}
+
+/// The Bose device's live controls in the settings window: a page selector over the
+/// Bose panel (noise control + ambient level, equalizer, audio modes, immersive audio),
+/// driven by the same `BosePanelModel` the notch panel will use. Reads every feature
+/// back over the live session and writes gestures straight to the device.
+private struct BoseControlsSection: View {
+  @ObservedObject var model: BosePanelModel
+  @State private var page = 0
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 10) {
+      Picker("", selection: $page) {
+        Text(L("ノイズ", "Noise")).tag(0)
+        Text(L("イコライザー", "EQ")).tag(1)
+        Text(L("モード", "Modes")).tag(2)
+        Text(L("空間", "Spatial")).tag(3)
+      }
+      .pickerStyle(.segmented)
+      .labelsHidden()
+
+      BosePanelView(state: model.state, page: page, actions: model.actions)
+        .frame(height: 300)
     }
   }
 }

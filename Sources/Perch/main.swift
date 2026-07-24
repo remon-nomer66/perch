@@ -45,6 +45,11 @@ final class AppModel: ObservableObject {
 
   var pager = PanelPager(pageCount: PanelPages.count)
 
+  /// The parallel Bose control path. Runs its own loop; `refresh(from:)` reads its
+  /// `readout` and folds it into the panel when Sony has no device. Started/stopped by
+  /// the AppDelegate alongside the Sony session.
+  let bose = BoseDeviceController()
+
   /// Sends a change and refreshes from what the device actually reports back.
   ///
   /// The panel is not updated optimistically: on an unverified model the headset may
@@ -250,6 +255,21 @@ final class AppModel: ObservableObject {
     // it mid-gesture.
     next.noiseControl = levelAdjustment.isHolding ? panel.noiseControl : readings.noiseControl
     next.battery = Self.batteryLayout(for: fingerprint, readings: readings)
+
+    // Bose runs in parallel. When Sony has no controllable device, a Bose device that is
+    // the current audio output owns the summary and battery, so the shared closed bar and
+    // the General tab show it instead of "対応機器なし". Read-only for now — the expanded
+    // Bose controls are a later milestone.
+    if !next.summary.isControllable, let bose = bose.readout {
+      next.summary.status = bose.status
+      next.summary.modelName = bose.modelName
+      next.summary.firmwareVersion = bose.firmwareVersion
+      // Ultra 2 accepts the live noise-control and equalizer writes the Bose panel sends,
+      // so the header shows no read-only caveat — matching the writable Bose controls.
+      next.summary.acceptsWrites = true
+      next.battery = bose.battery
+    }
+
     next.nowPlaying = nowPlaying.map {
       PanelModel.NowPlaying(
         title: $0.title,
@@ -804,6 +824,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       .sink { [weak self] connected in self?.updateStatusIcon(connected: connected) }
       .store(in: &cancellables)
 
+    // The Bose controller watches the audio output on its own loop and connects to a
+    // Bose device when one becomes the output; the refresh below reads its result.
+    model.bose.start()
+
     Task {
       await service.start()
       while !Task.isCancelled {
@@ -915,9 +939,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // hostage. Detached, because this wait blocks the main thread the plain Task
     // would have needed.
     let service = self.service
+    // Hand off the Bose session synchronously (main-actor here) so the detached task can
+    // close its RFCOMM channel too — the earbuds need it released to serve the next host.
+    let boseSession = model.bose.detachForTermination()
     let stopped = DispatchSemaphore(value: 0)
     Task.detached(priority: .userInitiated) {
       await service.stop()
+      await boseSession?.close()
       stopped.signal()
     }
     _ = stopped.wait(timeout: .now() + .seconds(2))
