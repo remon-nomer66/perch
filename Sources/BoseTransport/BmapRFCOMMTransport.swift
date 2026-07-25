@@ -43,6 +43,7 @@ public enum BmapServiceDiscovery {
   /// USB-style vendor and product ids a model announces — the id `BoseCatalog` is keyed on.
   public static let deviceIdUUID = UUID(uuidString: "00001200-0000-1000-8000-00805F9B34FB")!
 
+  private static let vendorIdSourceAttribute: BluetoothSDPServiceAttributeID = 0x0205
   private static let vendorIdAttribute: BluetoothSDPServiceAttributeID = 0x0201
   private static let productIdAttribute: BluetoothSDPServiceAttributeID = 0x0202
 
@@ -81,9 +82,14 @@ public enum BmapServiceDiscovery {
   /// the connect-time init frame, the battery payload shape, whether block 31 exists. Read
   /// from another vendor's numbering it would pick a config for a model this is not, which
   /// is worse than the provisional profile an unknown id falls back to.
+  ///
+  /// Which numbering the vendor id is in comes from the record's own VendorIDSource, and
+  /// both are real: a QC Ultra Earbuds announces the Bluetooth SIG id (0x009E), so matching
+  /// only Bose's USB id refuses a genuine Bose device and leaves the catalog unwired.
   public static func productId(on device: IOBluetoothDevice) -> UInt16? {
     guard let record = serviceRecord(on: device, for: deviceIdUUID),
-      unsignedAttribute(record, vendorIdAttribute) == UInt16(BoseCatalog.vendorId)
+      let vendor = unsignedAttribute(record, vendorIdAttribute),
+      BoseCatalog.isBoseVendor(vendor, source: unsignedAttribute(record, vendorIdSourceAttribute))
     else { return nil }
     return unsignedAttribute(record, productIdAttribute)
   }
