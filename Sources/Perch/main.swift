@@ -550,11 +550,37 @@ final class AppModel: ObservableObject {
 
   func playingNow() async -> NowPlayingService.PlayingAnswer { await nowPlayingService.playing() }
 
+  /// Whether rules can act on the device that owns the panel right now.
+  ///
+  /// A rule's actions are the Sony session's own vocabulary — a noise state, an equaliser
+  /// *preset identifier* the device declared, a listening mode — and `applyRule` writes
+  /// them through that session alone. None of it reaches a Bose device, so while Bose owns
+  /// the panel a rule can be neither applied nor meaningfully written.
+  var supportsRules: Bool { panel.summary.isControllable && !panel.isBose }
+
+  /// Why the rule editor is withheld, for the notice shown in its place.
+  var ruleUnavailableReason: RuleEditorUnavailableNotice.Reason {
+    panel.isBose
+      ? .unsupportedDevice(modelName: panel.summary.modelName)
+      : .noDevice
+  }
+
   /// Applies the matched rule, first undoing whichever rule held before it.
   ///
   /// A hold is kept even when the rule changed nothing, so a source that is already
   /// set up right does not have later manual adjustments captured as its own.
   func applyRule(_ rule: SoundRule?, using service: SessionService) {
+    // A device without rule support is refused up front rather than falling through every
+    // branch below on nil readings: the outcome was the same silent no-op, but nothing in
+    // the code said so, and the editor happily wrote rules that could never fire. Any hold
+    // still standing is released first — the rule that set it applied to another device.
+    guard supportsRules else {
+      if let hold = ruleHold {
+        release(hold, using: service)
+        ruleHold = nil
+      }
+      return
+    }
     // The hold being replaced is kept around: its restore writes are still in
     // flight, so for a field both rules touch the panel still shows the old rule's
     // value — the true original lives only in the old hold.
