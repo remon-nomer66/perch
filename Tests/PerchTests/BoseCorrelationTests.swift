@@ -67,3 +67,25 @@ import Testing
 @Test func correlationRejectsIdentifiersWithoutAnAddress() {
   #expect(BoseDeviceController.correlate(output: "BuiltInSpeakerDevice", candidates: []) == nil)
 }
+
+/// The same device however IOBluetooth or Core Audio spelled it, so an address set aside
+/// after a failed open is recognised again on the next pass.
+@Test func addressesNormalizeToOneForm() {
+  #expect(BoseDeviceController.normalized("00-11-22-33-44-55") == "00:11:22:33:44:55")
+  #expect(BoseDeviceController.normalized("00:11:22:33:44:55") == "00:11:22:33:44:55")
+  #expect(BoseDeviceController.normalized("00-11-22-AB-CD-EF") == "00:11:22:ab:cd:ef")
+  #expect(BoseDeviceController.normalized("00-11-22-33-44-55:output") == "00:11:22:33:44:55")
+}
+
+/// A paired Bose product can publish two BMAP addresses where only one answers (seen on
+/// QC Ultra Earbuds: the first candidate timed out, the second connected). Excluding the
+/// one that failed must hand back the other rather than nothing.
+@Test func correlationPicksTheRemainingCandidateWhenOneIsExcluded() {
+  let candidates = ["00-11-22-33-44-56", "00-11-22-33-44-57"]
+  let failed = BoseDeviceController.normalized("00-11-22-33-44-56")
+  let chosen = BoseDeviceController.correlate(
+    output: "00-11-22-33-44-55",
+    candidates: candidates.filter { BoseDeviceController.normalized($0) != failed }
+  )
+  #expect(chosen == "00-11-22-33-44-57")
+}

@@ -50,6 +50,15 @@ final class BoseDeviceController: ObservableObject {
   /// OUI-keyed cache stays "valid" when the output moves from one to the other and pins the
   /// session to the device that is no longer playing.
   private var correlatedOutput: String?
+  /// BMAP addresses that would not open, and the audio output they were tried against.
+  ///
+  /// A paired Bose product can publish more than one BMAP address — a probe of QC Ultra
+  /// Earbuds found two, and only the second answered; the first timed out. Correlation
+  /// cannot tell those apart from the address alone, so the loop rotates: an address that
+  /// fails to open is set aside and the next candidate is tried, until one answers or the
+  /// list is exhausted and the whole set is reconsidered.
+  private var failedAddresses: Set<String> = []
+  private var failedAddressesOutput: String?
   private var firmwareVersion: String?
   /// The last full snapshot, so a periodic partial re-read keeps name and equalizer.
   private var snapshot = BoseDeviceSnapshot()
@@ -141,9 +150,31 @@ final class BoseDeviceController: ObservableObject {
     if session != nil, let active = activeAddress, correlatedOutput == output {
       return active
     }
-    let chosen = Self.correlate(output: output, candidates: bmapDeviceAddresses())
+    // Failures belong to the output they happened under; a different device starts clean.
+    if failedAddressesOutput != output {
+      failedAddresses.removeAll()
+      failedAddressesOutput = output
+    }
+
+    let candidates = bmapDeviceAddresses()
+    var chosen = Self.correlate(
+      output: output,
+      candidates: candidates.filter { !failedAddresses.contains(Self.normalized($0)) }
+    )
+    if chosen == nil, !failedAddresses.isEmpty {
+      // Every candidate has failed at least once. Forget that and start the rotation
+      // again rather than go silent for good: a bud that was in its case may be out now.
+      failedAddresses.removeAll()
+      chosen = Self.correlate(output: output, candidates: candidates)
+    }
     correlatedOutput = chosen == nil ? nil : output
     return chosen
+  }
+
+  /// An address in one canonical form, so the same device is recognised however the
+  /// separators and case came out of IOBluetooth or Core Audio.
+  nonisolated static func normalized(_ address: String) -> String {
+    addressOctets(of: address).joined(separator: ":")
   }
 
   /// The current default audio output's device identifier, or `nil` when it is not
@@ -230,6 +261,9 @@ final class BoseDeviceController: ObservableObject {
       Self.log.notice("bose connected: controllable")
     } catch {
       Self.log.notice("bose connect failed: \(String(describing: error), privacy: .public)")
+      // Set this address aside so the next tick tries a different BMAP candidate instead
+      // of retrying the one that just refused, over and over.
+      failedAddresses.insert(Self.normalized(address))
       await teardown(keepingAddress: true)
       readout = Readout(status: .unreachable, modelName: nil, firmwareVersion: nil, battery: .unknown)
     }
