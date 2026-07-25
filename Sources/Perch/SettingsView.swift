@@ -156,7 +156,12 @@ private struct GeneralTab: View {
         // A Bose device owns the controls: its own panel (noise/ambient, equalizer,
         // immersive audio) reading and writing over the live BMAP session. Shown instead
         // of the Sony pages, which are for the Tandem session that is idle here.
-        if let boseModel = bose.panelModel {
+        //
+        // Ownership is `model.panel.isBose` — the one decision the notch reads too. A live
+        // `bose.panelModel` alone is not it: a Bose session can be open while Sony still
+        // holds a controllable device, and judging by the session drew Bose controls here
+        // while the notch drew Sony's.
+        if model.panel.isBose, let boseModel = bose.panelModel {
           BoseControlsSection(model: boseModel)
         } else if model.panel.summary.isControllable {
           if let caveat = model.panel.summary.caveat {
@@ -189,7 +194,7 @@ private struct GeneralTab: View {
         ForEach(
           model.panelPages(using: service)
             .filter { page in
-              if bose.panelModel != nil { return page.isCommon }
+              if model.panel.isBose { return page.isCommon }
               return model.panel.summary.isControllable || page.isCommon
             }
         ) { page in

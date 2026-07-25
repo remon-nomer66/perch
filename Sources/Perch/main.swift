@@ -309,8 +309,13 @@ final class AppModel: ObservableObject {
 
     // Bose runs in parallel. When Sony has no controllable device, a Bose device that is
     // the current audio output owns the summary and battery, so the shared closed bar and
-    // the General tab show it instead of "対応機器なし". Read-only for now — the expanded
-    // Bose controls are a later milestone.
+    // the General tab show it instead of "対応機器なし".
+    //
+    // This is the *only* place device ownership is decided — "Sony while it is
+    // controllable, otherwise Bose" — and `panel.isBose` is the answer every screen reads.
+    // The notch and the settings window used to judge it separately (settings on
+    // `bose.panelModel != nil` alone), so with both sessions live one drew Sony and the
+    // other Bose at the same time.
     if !next.summary.isControllable, let bose = bose.readout {
       next.summary.status = bose.status
       next.summary.modelName = bose.modelName
