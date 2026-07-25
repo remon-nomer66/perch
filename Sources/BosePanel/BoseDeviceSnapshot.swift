@@ -74,9 +74,12 @@ extension BosePanelState {
       equalizer: equalizerState(from: snapshot, config: config),
       audioModes: config.supportsModeBlock ? snapshot.audioModes : nil,
       spatial: liveField(snapshot, config) { $0.spatial },
-      // No config axis names sidetone yet (frozen spec §9 does not list it), so it is
-      // gated on the snapshot alone until stage 6 adds one.
-      sidetone: snapshot.sidetone,
+      // Withheld outright. Sidetone has no reverse-engineered wire mapping, so nothing
+      // reads it and `BosePanelModel.setSidetone` writes nothing — a control drawn from it
+      // would move under the finger and change nothing on the device, which is worse than
+      // not offering it. The type and the gesture stay so the mapping has somewhere to
+      // land; the projection is the one line to change when it does.
+      sidetone: nil,
       isControllable: snapshot.isControllable,
       acceptsWrites: snapshot.acceptsWrites
     )

@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 #
-# Coordinates exclusive access to the single Sony control (RFCOMM) session.
+# Coordinates exclusive access to the single control (RFCOMM) session.
 #
-# The headset exposes exactly one control channel. The notch app and the probe
-# CLI both open it, so only one may run at a time; a second one hangs waiting for
-# the channel. Every agent MUST take the lock before launching either, and release
+# A headset exposes exactly one control channel. The notch app and the probe CLIs
+# all open it, so only one may run at a time; a second one hangs waiting for the
+# channel. Every agent MUST take the lock before launching any of them, and release
 # it after stopping. The lock records which agent (owner) holds it and when, and an
 # append-only log keeps the history of who changed it.
+#
+# Both probes are covered — perch-probe (Sony/Tandem) and bose-probe (Bose/BMAP).
+# The app drives both brands from one process, so it can collide with either.
 #
 # NEVER write a Bluetooth address or other personal data into the lock or the log.
 #
@@ -14,9 +17,11 @@
 #   control-lock.sh status
 #   control-lock.sh acquire <owner> <app|probe> [note]
 #   control-lock.sh release <owner>
-#   control-lock.sh app-start <owner> [note]          # acquire + open the notch app
-#   control-lock.sh app-stop  <owner>                 # quit the notch app + release
-#   control-lock.sh probe     <owner> <address> <outfile> [note]   # acquire + run probe + release
+#   control-lock.sh app-start  <owner> [note]         # acquire + open the notch app
+#   control-lock.sh app-stop   <owner>                # quit the notch app + release
+#   control-lock.sh probe      <owner> <address> <outfile> [note]  # Sony probe, acquire + run + release
+#   control-lock.sh bose-probe <owner> <outfile> [probe args...]   # Bose probe, acquire + run + release
+#     (bose-probe's own arguments are optional: [ultra2|qc35] [address])
 #
 # <owner> should identify the agent/session (e.g. its Claude Code session id).
 
@@ -27,15 +32,21 @@ LOCK="$ROOT/.control-session.lock"
 LOG="$ROOT/.control-session.log"
 APP="$ROOT/.build/Perch.app"
 PROBE="$ROOT/.build/debug/perch-probe"
+BOSE_PROBE="$ROOT/.build/debug/bose-probe"
 APP_PATTERN='.build/Perch.app/Contents/MacOS/Perch'
 PROBE_PATTERN='perch-probe'
+BOSE_PROBE_PATTERN='bose-probe'
 
 now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 field() { [ -f "$LOCK" ] && sed -n "s/^$1=//p" "$LOCK" || true; }
 
-# Any process actually holding the channel right now, lock file aside.
+# Any process actually holding a control channel right now, lock file aside.
 holders() {
-  { pgrep -f "$APP_PATTERN" 2>/dev/null || true; pgrep -f "$PROBE_PATTERN" 2>/dev/null || true; } | tr '\n' ' '
+  {
+    pgrep -f "$APP_PATTERN" 2>/dev/null || true
+    pgrep -f "$PROBE_PATTERN" 2>/dev/null || true
+    pgrep -f "$BOSE_PROBE_PATTERN" 2>/dev/null || true
+  } | tr '\n' ' '
 }
 
 write_lock() { # owner role pid note
@@ -49,6 +60,43 @@ write_lock() { # owner role pid note
 }
 
 log() { echo "$(now) $*" >> "$LOG"; }
+
+# Takes the lock, runs one probe to completion, releases. Shared by every probe so a
+# new one can never quietly bypass the lock — which is how bose-probe came to open a
+# control channel outside it. Arguments: binary label owner outfile [probe args...]
+run_probe() {
+  local binary="$1" label="$2" owner="$3" out="$4"
+  shift 4
+
+  if [ ! -x "$binary" ]; then
+    echo "MISSING: $binary is not built (swift build --product $label)" >&2
+    return 1
+  fi
+
+  acquire "$owner" "probe" "$label"
+  # Release on any exit, including SIGINT/SIGTERM. Bash delivers the trap only after
+  # the foreground probe finishes, so the lock is never released while the probe still
+  # holds the channel. Ctrl-C also reaches the probe itself (same process group), which
+  # is what ends it. The owner is baked into the trap now rather than read from a
+  # variable, which is out of scope by the time an EXIT trap runs.
+  local on_exit
+  printf -v on_exit \
+    'log "AUTORELEASE %s interrupted owner=%s"; release "%s" >/dev/null 2>&1 || true' \
+    "$label" "$owner" "$owner"
+  trap "$on_exit" EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  set +e
+  "$binary" "$@" > "$out" 2>&1
+  local rc=$?
+  set -e
+
+  trap - EXIT INT TERM
+  release "$owner"
+  echo "$label exit=$rc -> $out"
+  return $rc
+}
 
 acquire() { # owner role note
   local owner="$1" role="$2" note="${3:-}"
@@ -157,28 +205,25 @@ case "$cmd" in
     ;;
 
   probe)
-    owner="${2:?owner}"; address="${3:?bluetooth address}"; out="${4:?output file}"; note="${5:-probe}"
-    acquire "$owner" "probe" "$note"
-    # Release on any exit, including SIGINT/SIGTERM. Bash delivers the trap only
-    # after the foreground probe finishes, so the lock is never released while the
-    # probe still holds the channel. Ctrl-C also reaches the probe itself (same
-    # process group), which is what ends it.
-    trap 'log "AUTORELEASE probe interrupted owner=$owner"; release "$owner" >/dev/null 2>&1 || true' EXIT
-    trap 'exit 130' INT
-    trap 'exit 143' TERM
     set +e
-    "$PROBE" "$address" > "$out" 2>&1
+    run_probe "$PROBE" "perch-probe" "${2:?owner}" "${4:?output file}" "${3:?bluetooth address}"
     rc=$?
     set -e
-    trap - EXIT INT TERM
-    release "$owner"
-    echo "probe exit=$rc -> $out"
+    exit $rc
+    ;;
+
+  bose-probe)
+    # Everything past the outfile is bose-probe's own (all optional: [ultra2|qc35] [address]).
+    set +e
+    run_probe "$BOSE_PROBE" "bose-probe" "${2:?owner}" "${3:?output file}" "${@:4}"
+    rc=$?
+    set -e
     exit $rc
     ;;
 
   *)
     echo "unknown command: $cmd" >&2
-    sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit 2
     ;;
 esac

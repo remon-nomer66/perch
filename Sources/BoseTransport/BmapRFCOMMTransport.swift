@@ -302,6 +302,14 @@ final class BmapRFCOMMChannelHost: NSObject, @unchecked Sendable {
             return
           }
           if status != kIOReturnSuccess {
+            // A synchronous rejection means no delegate callback is coming, so the channel
+            // just adopted would sit half-open until something else tore the host down.
+            // Drop it here instead: the failure path owns what the failure created.
+            let orphan = lock.withLock { () -> IOBluetoothRFCOMMChannel? in
+              defer { channel = nil }
+              return channel
+            }
+            _ = orphan?.close()
             finishOpen(.failure(BmapChannelOpenFailure.openRejected(Int32(status))))
           }
         }
