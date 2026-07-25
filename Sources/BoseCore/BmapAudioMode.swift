@@ -8,11 +8,14 @@ import Foundation
 /// hardware) — the app reads the active mode's config instead.
 public struct BmapModeConfig: Equatable, Sendable {
   public let index: Int
-  /// The device's own UTF-8 name (STATUS bytes 6...37), never coined here. An empty or
-  /// `"None"` name marks an unconfigured slot.
+  /// The device's own UTF-8 name (STATUS bytes 6...37), never coined here.
   public let name: String
   /// STATUS[3] bit 0: the user may edit this slot (the preset slots are not editable).
   public let isUserEditable: Bool
+  /// STATUS[4]: whether the slot holds a real, selectable mode. The device's own answer,
+  /// so it is read rather than inferred from the name — a placeholder name is localised
+  /// on non-English firmware, and a user may legitimately name a slot "None".
+  public let isConfigured: Bool
   /// The noise-control preset this mode carries. STATUS[42]=cnc, [44]=spatial, [45]=wind,
   /// [47]=anc (frozen spec / bose-bmap-reference §3).
   public let cnc: Int
@@ -24,6 +27,7 @@ public struct BmapModeConfig: Equatable, Sendable {
     index: Int,
     name: String,
     isUserEditable: Bool,
+    isConfigured: Bool,
     cnc: Int,
     spatial: BmapNoiseControlSetting.Spatial,
     windBlock: Bool,
@@ -32,16 +36,11 @@ public struct BmapModeConfig: Equatable, Sendable {
     self.index = index
     self.name = name
     self.isUserEditable = isUserEditable
+    self.isConfigured = isConfigured
     self.cnc = cnc
     self.spatial = spatial
     self.windBlock = windBlock
     self.ancEnabled = ancEnabled
-  }
-
-  /// Whether the slot holds a real, selectable mode (a named, non-empty slot). Empty
-  /// slots report the placeholder name `"None"`.
-  public var isConfigured: Bool {
-    !name.isEmpty && name.caseInsensitiveCompare("None") != .orderedSame
   }
 
   /// The noise-control state this mode represents, used to seed the live controls since
@@ -63,6 +62,7 @@ public enum BmapAudioMode {
   public static let configAddress = BmapFunctionAddress.modeConfig
 
   private static let statusLength = 48
+  private static let configuredOffset = 4
   private static let nameRange = 6..<38
   private static let cncOffset = 42
   private static let spatialOffset = 44
@@ -132,6 +132,7 @@ public enum BmapAudioMode {
       index: Int(bytes[0]),
       name: name,
       isUserEditable: bytes[3] & 0x01 != 0,
+      isConfigured: bytes[configuredOffset] != 0,
       cnc: Int(bytes[cncOffset]),
       spatial: spatial,
       windBlock: bytes[windOffset] != 0,

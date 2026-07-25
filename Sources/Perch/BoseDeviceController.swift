@@ -317,12 +317,13 @@ final class BoseDeviceController: ObservableObject {
     return try BmapNoiseCancellationReader.parse(frame)
   }
 
-  /// Reads every mode slot's [31.6] config and keeps the configured (named) ones. Slots
-  /// 0...10 cover the presets (Quiet/Aware/Immersion/Cinema) and the user slots; empty
-  /// slots report the name "None" and are dropped.
+  /// Reads every mode slot's [31.6] config and keeps the ones the device marks configured.
+  /// The slots walked come from the model's declared preset + editable ranges, never a
+  /// baked-in span, and an empty slot is recognised by its STATUS[4] flag rather than by
+  /// its (localisable) placeholder name.
   private func readModeList(_ session: BoseSession) async throws -> [BoseAudioMode] {
     var modes: [BoseAudioMode] = []
-    for index in 0...10 {
+    for index in config.modeSlots {
       guard
         let frame = try? await session.request(try BmapAudioMode.configRequest(index: index)),
         let cfg = try? BmapAudioMode.parseConfig(frame), cfg.isConfigured
