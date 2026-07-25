@@ -42,6 +42,11 @@ final class BoseDeviceController: ObservableObject {
 
   private var session: BoseSession?
   private var activeAddress: String?
+  /// The audio output identity `activeAddress` was correlated from. The fast path is keyed
+  /// on this rather than on the output's OUI: two paired Bose devices share an OUI, so an
+  /// OUI-keyed cache stays "valid" when the output moves from one to the other and pins the
+  /// session to the device that is no longer playing.
+  private var correlatedOutput: String?
   private var firmwareVersion: String?
   /// The last full snapshot, so a periodic partial re-read keeps name and equalizer.
   private var snapshot = BoseDeviceSnapshot()
@@ -88,6 +93,7 @@ final class BoseDeviceController: ObservableObject {
     let live = session
     session = nil
     activeAddress = nil
+    correlatedOutput = nil
     panelModel = nil
     readout = nil
     return live
@@ -114,33 +120,67 @@ final class BoseDeviceController: ObservableObject {
   }
 
   /// The BMAP control address for the current audio output, or `nil` when the output is
-  /// not a Bose device. Correlation is by OUI (the address's manufacturer block): the
-  /// earbuds' audio address and their BMAP control address share it, while a Sony output
-  /// or the speakers share it with no BMAP device — so idle earbuds are never woken and
-  /// Sony is never disturbed.
+  /// not a Bose device. See `correlate(output:candidates:)` for how the two are matched.
   ///
   /// The IOBluetooth SDP scan runs here on the main actor deliberately: IOBluetooth
   /// delivers cached SDP off the calling thread's run loop, and a background thread has
   /// none, so `getServiceRecord` returns empty there. It reads cached records (no live
   /// query), so it does not block; only opening a channel is slow, and that is async.
   private func currentBoseControlAddress() -> String? {
-    guard let outputOUI = currentOutputOUI() else { return nil }
-    // Fast path: still connected to a device of this OUI. The SDP scan below does
-    // synchronous CoreBluetooth XPC, so it is skipped while the session holds — only a
-    // change of audio output re-runs it, keeping the steady state off that XPC path.
-    if session != nil, let active = activeAddress, Self.oui(of: active) == outputOUI {
+    guard let output = currentOutputIdentifier() else {
+      correlatedOutput = nil
+      return nil
+    }
+    // Fast path: the output is the very one the live session was correlated from. The SDP
+    // scan below does synchronous CoreBluetooth XPC, so it is skipped while the session
+    // holds — only a change of audio *device* re-runs it, keeping the steady state off
+    // that XPC path while still noticing a move between two Bose devices.
+    if session != nil, let active = activeAddress, correlatedOutput == output {
       return active
     }
-    return bmapDeviceAddresses().first { Self.oui(of: $0) == outputOUI }
+    let chosen = Self.correlate(output: output, candidates: bmapDeviceAddresses())
+    correlatedOutput = chosen == nil ? nil : output
+    return chosen
   }
 
-  /// The OUI of the current default audio output, or `nil` when it is not Bluetooth.
-  private func currentOutputOUI() -> String? {
+  /// The current default audio output's device identifier, or `nil` when it is not
+  /// Bluetooth. The raw string, so two Bose devices are told apart — never logged.
+  private func currentOutputIdentifier() -> String? {
     switch audio.current() {
-    case .identified(let device): return Self.oui(of: device.rawValue)
-    case .unidentifiedBluetooth(let uid): return Self.oui(of: uid)
+    case .identified(let device): return device.rawValue
+    case .unidentifiedBluetooth(let uid): return uid
     case .other: return nil
     }
+  }
+
+  /// Picks the BMAP control address belonging to the device currently playing audio.
+  ///
+  /// A headset's audio address *is* its control address, so an exact match settles it. TWS
+  /// earbuds are the case that cannot be settled that way — their audio rides one address
+  /// and BMAP another — which is why correlation falls back to the OUI (the manufacturer
+  /// block both share). With a single Bose device paired the OUI is enough; with several,
+  /// it names them all, so the fallback then prefers the candidate sharing the longest
+  /// address prefix with the output. A pair's two addresses are allocated together and
+  /// agree well past the OUI, while a different Bose product diverges at it — so the
+  /// earbuds in the ears win over the headphones in the bag.
+  ///
+  /// `nonisolated` and pure: the whole rule is exercised without Bluetooth.
+  nonisolated static func correlate(output: String, candidates: [String]) -> String? {
+    let outputOctets = addressOctets(of: output)
+    guard outputOctets.count >= 3 else { return nil }
+    let outputOUI = Array(outputOctets.prefix(3))
+
+    var best: (address: String, shared: Int)?
+    for candidate in candidates {
+      let octets = addressOctets(of: candidate)
+      guard Array(octets.prefix(3)) == outputOUI else { continue }
+      let shared = zip(octets, outputOctets).prefix { $0 == $1 }.count
+      // A full match is the device itself; nothing can beat it.
+      if shared == outputOctets.count, shared == octets.count { return candidate }
+      // Ties keep the earlier candidate: `bmapDeviceAddresses` orders connected first.
+      if best == nil || shared > best!.shared { best = (candidate, shared) }
+    }
+    return best?.address
   }
 
   // MARK: - Session lifecycle
@@ -211,7 +251,10 @@ final class BoseDeviceController: ObservableObject {
     firmwareVersion = nil
     snapshot = BoseDeviceSnapshot()
     modeList = []
-    if !keepingAddress { activeAddress = nil }
+    if !keepingAddress {
+      activeAddress = nil
+      correlatedOutput = nil
+    }
   }
 
   private func publishReadout(status: DeviceSummary.Status) {
@@ -365,14 +408,23 @@ final class BoseDeviceController: ObservableObject {
     }
   }
 
-  /// The first three address octets (the OUI / manufacturer block), lowercased, from a
-  /// string containing a Bluetooth address in any common separator/case. Never the whole
-  /// address. `nonisolated` so the off-main SDP scan can call it.
-  nonisolated static func oui(of string: String) -> String? {
+  /// The address octets, lowercased, from a string containing a Bluetooth address in any
+  /// common separator/case. Capped at the six a BD_ADDR has, so trailing hex-looking
+  /// fragments of a Core Audio device UID cannot extend it. `nonisolated` so the off-main
+  /// SDP scan can call it.
+  nonisolated static func addressOctets(of string: String) -> [String] {
     let octets = string.split(whereSeparator: { $0 == "-" || $0 == ":" })
       .map(String.init)
       .filter { $0.count == 2 && $0.allSatisfy(\.isHexDigit) }
+      .map { $0.lowercased() }
+    return Array(octets.prefix(6))
+  }
+
+  /// The first three address octets (the OUI / manufacturer block). Never the whole
+  /// address, so it identifies the maker and not a device.
+  nonisolated static func oui(of string: String) -> String? {
+    let octets = addressOctets(of: string)
     guard octets.count >= 3 else { return nil }
-    return octets.prefix(3).map { $0.lowercased() }.joined(separator: ":")
+    return octets.prefix(3).joined(separator: ":")
   }
 }
