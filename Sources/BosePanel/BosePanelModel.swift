@@ -3,6 +3,7 @@ import BoseSession
 import Combine
 import Foundation
 import SwiftUI
+import os
 
 /// Guards one panel field against a periodic refresh while a write is in flight, so the
 /// device's not-yet-updated value cannot snap a control back mid-gesture. Each `begin`
@@ -54,6 +55,11 @@ public final class BosePanelModel: ObservableObject {
   private var cncAdjustment = BoseAdjustmentGuard()
   private var cncDrag: Task<Void, Never>?
   private var bandDrags: [UInt8: Task<Void, Never>] = [:]
+
+  /// A refused write used to be swallowed whole: `try?` dropped the error and the panel
+  /// kept the optimistic value. It is at least recorded now, at the same level the Sony
+  /// side records its write failures. Nothing device-identifying is logged.
+  private static let log = Logger(subsystem: "dev.perch.mac", category: "bose-panel")
 
   public init(
     snapshot: BoseDeviceSnapshot = BoseDeviceSnapshot(),
@@ -159,12 +165,20 @@ public final class BosePanelModel: ObservableObject {
   private func sendLiveNoiseControl(final: Bool, token: Int) async {
     defer { if final { cncAdjustment.end(token) } }
     guard let session, let live = snapshot.liveNoiseControl else { return }
-    guard let frame = try? BmapNoiseControlLiveWrite.writeRequest(live) else { return }
+    guard let frame = try? BmapNoiseControlLiveWrite.writeRequest(live) else {
+      Self.log.notice("bose noise-control write could not be built")
+      return
+    }
     // The SETGET echoes the applied state (STATUS/RESULT at [31.10]); that echo is the
     // confirmation the set→poll discipline reconciles against.
     guard let response = try? await session.request(frame),
       let confirmed = try? BmapNoiseControlLiveWrite.parse(response)
-    else { return }
+    else {
+      // The optimistic value stands: the controller re-reads noise control on every
+      // refresh, so a live link corrects it within one tick, and a dead one is torn down.
+      Self.log.notice("bose noise-control write was not confirmed")
+      return
+    }
     if final {
       snapshot = snapshot.settingLive { _ in confirmed }
       reproject()
@@ -195,7 +209,10 @@ public final class BosePanelModel: ObservableObject {
     guard
       let write = try? BmapEqualizer.setRequest(bandId: bandId, value: value, range: range),
       let readBack = try? BmapEqualizer.readRequest()
-    else { return }
+    else {
+      Self.log.notice("bose equalizer write could not be built")
+      return
+    }
     // Write then read the value back until the device reports it — the write's own echo
     // can lie on an unverified device, so a separate GET confirms what stuck.
     let confirmed = try? await session.writeThenPoll(
@@ -206,10 +223,32 @@ public final class BosePanelModel: ObservableObject {
         return bands.contains { $0.bandId == bandId && $0.current == value }
       }
     )
-    if final, let confirmed, let bands = try? BmapEqualizer.parseBands(confirmed) {
+    guard final else { return }
+    if let confirmed, let bands = try? BmapEqualizer.parseBands(confirmed) {
       snapshot.equalizerBands = bands
       reproject()
+      return
     }
+    // The equalizer is the one field the periodic refresh never re-reads, so a refused
+    // write left the slider showing a value the device does not hold — until the next
+    // reconnect. Ask what it actually holds and show that instead; if even the read
+    // fails the link is gone and the controller's own teardown takes it from here.
+    Self.log.notice("bose equalizer write was not applied; re-reading the bands")
+    await reloadEqualizerBands(session)
+  }
+
+  /// Re-reads [1.7] and replaces the panel's bands with the device's own answer.
+  private func reloadEqualizerBands(_ session: BoseSession) async {
+    guard
+      let request = try? BmapEqualizer.readRequest(),
+      let frame = try? await session.request(request),
+      let bands = try? BmapEqualizer.parseBands(frame)
+    else {
+      Self.log.notice("bose equalizer re-read failed; the panel keeps the unconfirmed value")
+      return
+    }
+    snapshot.equalizerBands = bands
+    reproject()
   }
 
   // MARK: - Modes ([31.6]) and sidetone — optimistic only for now

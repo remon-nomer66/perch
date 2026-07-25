@@ -51,6 +51,14 @@ public struct BoseDeviceConfig: Equatable, Sendable {
   /// Whether the model exposes the audio-modes block (block 31).
   public var supportsModeBlock: Bool { editableSlots != nil }
 
+  /// Every mode slot the model declares — the presets plus the user-editable ones, in
+  /// slot order. The range to walk when enumerating [31.6] configs, so the scan follows
+  /// the declared capability instead of a baked-in `0...10`. Empty without block 31.
+  public var modeSlots: [Int] {
+    let all = Set(presetSlots ?? 0..<0).union(editableSlots ?? 0..<0)
+    return all.sorted()
+  }
+
   public func supports(_ address: BmapFunctionAddress) -> Bool {
     features.contains(address)
   }

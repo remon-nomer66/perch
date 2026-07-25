@@ -1,6 +1,56 @@
 import SwiftUI
 import TandemSession
 
+/// Why no rule editor is offered right now, said in the user's terms rather than left as
+/// a blank space. Shared by the site/app editor and the music editor so both screens give
+/// the same reason.
+struct RuleEditorUnavailableNotice: View {
+  enum Reason {
+    /// Nothing controllable is connected.
+    case noDevice
+    /// The connected device's brand has no rule support. A rule's actions are the Sony
+    /// session's own vocabulary — noise state, equaliser preset identifier, listening
+    /// mode — and none of them reach a Bose device, so a rule written here would be
+    /// registered, shown, matched, and then do nothing at all.
+    case unsupportedDevice(modelName: String?)
+  }
+
+  let reason: Reason
+
+  var body: some View {
+    Text(text)
+      .font(.system(size: 11))
+      .foregroundStyle(isWarning ? .orange : .secondary)
+  }
+
+  private var isWarning: Bool {
+    if case .unsupportedDevice = reason { return true }
+    return false
+  }
+
+  private var text: String {
+    switch reason {
+    case .noDevice:
+      return L(
+        "ルールの追加は機器の接続中に行えます。接続中は選んだ設定がその場で機器に反映され、"
+          + "聴きながら選べます。",
+        "Rules can be added while a device is connected. While connected, each choice "
+          + "is applied to the device right away, so it can be judged by ear."
+      )
+    case .unsupportedDevice(let modelName):
+      let name = modelName ?? L("この機器", "This device")
+      return L(
+        "\(name)ではルールに対応していません。"
+          + "ルールが変更するノイキャン・イコライザー・リスニングモードは Sony 機の設定項目のため、"
+          + "この機器には送信されません。ノイキャンやイコライザーはパネルから直接操作してください。",
+        "\(name) does not support rules. What a rule changes — noise control, equalizer "
+          + "preset, listening mode — are the Sony session's settings and are not sent to "
+          + "this device. Use the panel to adjust it directly."
+      )
+    }
+  }
+}
+
 /// The three things a rule can change — noise control, equaliser preset, listening mode —
 /// as pickers that apply each choice to the connected device at once, so a rule can be
 /// judged by ear while it is written. Shared by the site/app editor and the music editor.

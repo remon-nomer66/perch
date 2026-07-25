@@ -156,7 +156,12 @@ private struct GeneralTab: View {
         // A Bose device owns the controls: its own panel (noise/ambient, equalizer,
         // immersive audio) reading and writing over the live BMAP session. Shown instead
         // of the Sony pages, which are for the Tandem session that is idle here.
-        if let boseModel = bose.panelModel {
+        //
+        // Ownership is `model.panel.isBose` — the one decision the notch reads too. A live
+        // `bose.panelModel` alone is not it: a Bose session can be open while Sony still
+        // holds a controllable device, and judging by the session drew Bose controls here
+        // while the notch drew Sony's.
+        if model.panel.isBose, let boseModel = bose.panelModel {
           BoseControlsSection(model: boseModel)
         } else if model.panel.summary.isControllable {
           if let caveat = model.panel.summary.caveat {
@@ -189,7 +194,7 @@ private struct GeneralTab: View {
         ForEach(
           model.panelPages(using: service)
             .filter { page in
-              if bose.panelModel != nil { return page.isCommon }
+              if model.panel.isBose { return page.isCommon }
               return model.panel.summary.isControllable || page.isCommon
             }
         ) { page in
@@ -291,6 +296,10 @@ private struct DeviceStatusHeader: View {
       ]
       .compactMap(\.self)
       .joined(separator: "  ")
+    case .numbered(let cells):
+      cells
+        .compactMap { cell in cell.percent.map { "\(cell.slot) \($0)%" } }
+        .joined(separator: "  ")
     case .unknown:
       ""
     }
@@ -392,19 +401,10 @@ private struct BehaviorTab: View {
         // The choices a rule offers are the connected device's declarations, so a rule
         // is written against a real device — and while writing one, each choice lands
         // on the device at once so it can be judged by ear.
-        if model.panel.summary.isControllable {
+        if model.supportsRules {
           newRuleEditor
         } else {
-          Text(
-            L(
-              "ルールの追加は機器の接続中に行えます。接続中は選んだ設定がその場で機器に反映され、"
-                + "聴きながら選べます。",
-              "Rules can be added while a device is connected. While connected, each choice "
-                + "is applied to the device right away, so it can be judged by ear."
-            )
-          )
-          .font(.system(size: 11))
-          .foregroundStyle(.secondary)
+          RuleEditorUnavailableNotice(reason: model.ruleUnavailableReason)
         }
       }
 

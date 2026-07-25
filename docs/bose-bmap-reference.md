@@ -148,6 +148,22 @@ Modalias `bluetooth:v05A7pXXXXd0000` の `p` 直後4桁が Product ID。`config=
 
 **ModeConfig STATUS(48B)**: `[0]=idx [1-2]=prompt [3]=isUserEditable(0x01=可) [4]=isConfigured [6-37]=name [42]=cnc [43]=autoCNC [44]=spatial [45]=wind [47]=anc`。[38-41][46]は **(未確認)**。
 
+> **[4]=isConfigured は実機と一致しない(反証済)**。QC Ultra Earbuds (fw 4.9.32) の実測では
+> 設定済みの Quiet / Aware / Immersion を含む**全スロットで [4]=0x00**。代わりに
+> voice prompt id [2] が設定済み(0x01/0x02/0x22)と空スロット(0x00)を分離する。
+> 実装は `[4] != 0 || [2] != 0` を「設定済み」とみなす(BmapAudioMode.parseConfig)。
+>
+> | idx | name | [2] | [3] | [4] |
+> |---|---|---|---|---|
+> | 0 | Quiet | 01 | 00 | 00 |
+> | 1 | Aware | 02 | 00 | 00 |
+> | 2 | Immersion | 22 | 00 | 00 |
+> | 3-6 | None(空) | 00 | 01 | 00 |
+>
+> **未確認**: ユーザー作成モードで prompt=0 の場合。実測時に該当スロットが無かった。
+> また同機の編集可スロットは idx=3 から始まっており(presets 0-2)、
+> Ultra ヘッドホンの「preset 0-3 / 編集可 4-10」とは異なる。
+
 **ライブ [31.10](5B)**: `[cnc, autoCNC, spatial, wind, anc]`。cnc 反転(0=最大ANC)。autoCNC=1 は Runtime error8。
 
 ---

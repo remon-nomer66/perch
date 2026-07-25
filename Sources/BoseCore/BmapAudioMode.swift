@@ -8,11 +8,15 @@ import Foundation
 /// hardware) — the app reads the active mode's config instead.
 public struct BmapModeConfig: Equatable, Sendable {
   public let index: Int
-  /// The device's own UTF-8 name (STATUS bytes 6...37), never coined here. An empty or
-  /// `"None"` name marks an unconfigured slot.
+  /// The device's own UTF-8 name (STATUS bytes 6...37), never coined here.
   public let name: String
   /// STATUS[3] bit 0: the user may edit this slot (the preset slots are not editable).
   public let isUserEditable: Bool
+  /// Whether the slot holds a real, selectable mode. Read from the payload rather than
+  /// inferred from the name: a placeholder name is localised on non-English firmware, and
+  /// a user may legitimately name a slot "None". See `parseConfig` for which bytes decide
+  /// it and why the reference's nominal flag alone does not.
+  public let isConfigured: Bool
   /// The noise-control preset this mode carries. STATUS[42]=cnc, [44]=spatial, [45]=wind,
   /// [47]=anc (frozen spec / bose-bmap-reference §3).
   public let cnc: Int
@@ -24,6 +28,7 @@ public struct BmapModeConfig: Equatable, Sendable {
     index: Int,
     name: String,
     isUserEditable: Bool,
+    isConfigured: Bool,
     cnc: Int,
     spatial: BmapNoiseControlSetting.Spatial,
     windBlock: Bool,
@@ -32,16 +37,11 @@ public struct BmapModeConfig: Equatable, Sendable {
     self.index = index
     self.name = name
     self.isUserEditable = isUserEditable
+    self.isConfigured = isConfigured
     self.cnc = cnc
     self.spatial = spatial
     self.windBlock = windBlock
     self.ancEnabled = ancEnabled
-  }
-
-  /// Whether the slot holds a real, selectable mode (a named, non-empty slot). Empty
-  /// slots report the placeholder name `"None"`.
-  public var isConfigured: Bool {
-    !name.isEmpty && name.caseInsensitiveCompare("None") != .orderedSame
   }
 
   /// The noise-control state this mode represents, used to seed the live controls since
@@ -63,6 +63,11 @@ public enum BmapAudioMode {
   public static let configAddress = BmapFunctionAddress.modeConfig
 
   private static let statusLength = 48
+  /// STATUS[1-2]: the mode's voice-prompt id. Non-zero exactly on the configured slots in
+  /// the hardware capture below, which is what makes it usable as a configured marker.
+  private static let promptOffset = 2
+  /// STATUS[4]: the reference's nominal isConfigured flag.
+  private static let configuredOffset = 4
   private static let nameRange = 6..<38
   private static let cncOffset = 42
   private static let spatialOffset = 44
@@ -117,6 +122,27 @@ public enum BmapAudioMode {
   }
 
   /// Parses a 48-byte [31.6] ModeConfig STATUS.
+  ///
+  /// A slot counts as configured when either the nominal flag at STATUS[4] or the voice
+  /// prompt id at STATUS[2] is non-zero. The prompt is load-bearing, not a belt-and-braces
+  /// extra: a QC Ultra Earbuds capture (firmware 4.9.32) reports **0 at [4] for every
+  /// slot** — the configured Quiet / Aware / Immersion presets included — so reading the
+  /// documented flag alone empties the mode list on real hardware. The prompt separates
+  /// them cleanly on that same capture:
+  ///
+  ///     idx name        [2]  [3]  [4]
+  ///     0   Quiet       01   00   00    configured preset
+  ///     1   Aware       02   00   00    configured preset
+  ///     2   Immersion   22   00   00    configured preset
+  ///     3…6 None        00   01   00    empty, user-editable
+  ///
+  /// Judging by the name instead — empty, or the English literal "None" — is what this
+  /// replaces: the placeholder is localised on non-English firmware, where every empty
+  /// slot would then become a mode, and a slot a user names "None" disappears.
+  ///
+  /// Unverified: a *user-created* mode whose voice prompt is 0. The captured device had no
+  /// custom mode to check, and such a slot would be missed here. Worth re-capturing once
+  /// one exists.
   public static func parseConfig(_ frame: BmapFrame) throws -> BmapModeConfig {
     guard frame.address == configAddress else {
       throw BmapAudioModeError.unexpectedAddress(fblock: frame.fblock, function: frame.function)
@@ -132,6 +158,7 @@ public enum BmapAudioMode {
       index: Int(bytes[0]),
       name: name,
       isUserEditable: bytes[3] & 0x01 != 0,
+      isConfigured: bytes[configuredOffset] != 0 || bytes[promptOffset] != 0,
       cnc: Int(bytes[cncOffset]),
       spatial: spatial,
       windBlock: bytes[windOffset] != 0,

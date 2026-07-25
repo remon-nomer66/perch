@@ -58,4 +58,32 @@ import Testing
 
 @Test func vendorIdIsBose() {
   #expect(BoseCatalog.vendorId == 0x05A7)
+  #expect(BoseCatalog.bluetoothSIGVendorId == 0x009E)
+}
+
+/// A Device ID record says which numbering its vendor id is in. Both are real Bose ids in
+/// their own namespace, and a QC Ultra Earbuds announces the Bluetooth SIG one — matching
+/// only the USB id refused a genuine Bose device and left the catalog unwired.
+@Test func boseVendorIsRecognisedInEitherNumbering() {
+  // source 1 = Bluetooth SIG, 2 = USB Implementer's Forum.
+  #expect(BoseCatalog.isBoseVendor(0x009E, source: 1))
+  #expect(BoseCatalog.isBoseVendor(0x05A7, source: 2))
+  // Right id, wrong namespace: 0x05A7 is not Bose in the SIG list.
+  #expect(!BoseCatalog.isBoseVendor(0x05A7, source: 1))
+  #expect(!BoseCatalog.isBoseVendor(0x009E, source: 2))
+  // No source declared: either number is still Bose, anything else is not.
+  #expect(BoseCatalog.isBoseVendor(0x009E, source: nil))
+  #expect(BoseCatalog.isBoseVendor(0x05A7, source: nil))
+  #expect(!BoseCatalog.isBoseVendor(0x004C, source: nil))  // Apple
+  #expect(!BoseCatalog.isBoseVendor(0x004C, source: 1))
+}
+
+/// Read off the hardware this was developed against, not the reference list: the unit
+/// announcing 0x4072 completed a full BMAP session in the Ultra 2 dialect.
+@Test func catalogResolvesTheHardwareVerifiedEarbuds() throws {
+  let model = try #require(BoseCatalog.model(forProductId: 0x4072))
+  #expect(model.config == .qcUltra2Earbuds)
+  // The point of identifying it: earbuds must not be offered wind reduction.
+  #expect(model.config.supportsWindReduction == false)
+  #expect(BoseCatalog.isSupported(productId: 0x4072))
 }
