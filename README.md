@@ -50,6 +50,7 @@ open .build/Perch.app
 - **ノッチにバーが出ない** — ヘッドホンが Mac の音声出力先になっているか確認してください。メニューバーの魚のアイコンからも設定を開けます
 - **「別の端末が操作しています」** — スマホの公式アプリなどが接続を握っています。相手を閉じてから「再接続」を押してください
 - **ビルドし直すたびに権限を聞かれる** — 署名が毎回変わるためです。下の開発者向けの `PERCH_SIGN_IDENTITY` を設定してください
+- **「"Perch" は開いていません」「マルウェアが含まれていないことを検証できませんでした」** — 公証を受けていないビルドをダウンロードしたときに出ます。**macOS 15 以降、右クリック →「開く」での解除はできません**。ダイアログの「完了」を押してから、**システム設定 → プライバシーとセキュリティ** を開き、下の方に出る Perch の行の**「このまま開く」**を押してください。自分でビルドした `.app` はダウンロード扱いにならないため、この警告は出ません
 
 ## プライバシー
 
@@ -89,6 +90,16 @@ tools/package_app.sh release    # releaseビルド(アプリアイコン必須)
 | `PERCH_SIGN_IDENTITY` | codesignのidentity。未指定はad-hoc署名となり、ビルドのたびに権限の再許可が必要になる。常用するならKeychain Accessで一度だけ自己署名証明書を作って指定する |
 | `PERCH_VERSION` / `PERCH_BUILD` | `CFBundleShortVersionString` / `CFBundleVersion` の上書き。未指定のreleaseビルドは `git describe` とコミット数から補う |
 | `PERCH_NOTARY_PROFILE` | `notarytool store-credentials` のプロファイル名。Developer ID署名のreleaseビルドで指定すると公証とstapleまで行う。未指定なら自己署名のまま |
+
+いずれも**秘密情報ではない**。前者は証明書の「名前」、後者はKeychainプロファイルの「名札」であって、秘密鍵とApp Store Connectの資格情報はKeychainから出ない。`.p12` や `.p8` をリポジトリに置く必要は無い(`.gitignore` で予防している)。
+
+### 配布用 .dmg の生成
+
+```sh
+tools/make_dmg.sh                        # .build/Perch.app から .build/Perch.dmg
+```
+
+`package_app.sh` と同じ環境変数を読む。`PERCH_SIGN_IDENTITY` があればディスクイメージ自体に署名し、`PERCH_NOTARY_PROFILE` もあれば公証とstapleまで行う。**Gatekeeperが判定するのはダウンロードされた `.dmg`** なので、中の `.app` だけを公証しても初回起動の警告は消えない。両方を通して初めて警告が出なくなる。
 
 ## 権限
 
