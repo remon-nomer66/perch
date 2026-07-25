@@ -39,6 +39,12 @@ public enum BmapServiceDiscovery {
   public static let markerUUID = UUID(uuidString: "00000000-DECA-FADE-DECA-DEAFDECACAFF")!
   /// The standard Serial Port Profile service class the control channel lives on.
   public static let serialPortUUID = UUID(uuidString: "00001101-0000-1000-8000-00805F9B34FB")!
+  /// The Device Identification Profile record (PnPInformation, 0x1200). It carries the
+  /// USB-style vendor and product ids a model announces — the id `BoseCatalog` is keyed on.
+  public static let deviceIdUUID = UUID(uuidString: "00001200-0000-1000-8000-00805F9B34FB")!
+
+  private static let vendorIdAttribute: BluetoothSDPServiceAttributeID = 0x0201
+  private static let productIdAttribute: BluetoothSDPServiceAttributeID = 0x0202
 
   /// The RFCOMM channel of the BMAP control service on `device`, or `nil` when the
   /// device does not advertise BMAP or no channel can be read.
@@ -66,6 +72,30 @@ public enum BmapServiceDiscovery {
   /// connected Bose device without opening a channel.
   public static func advertisesBmap(_ device: IOBluetoothDevice) -> Bool {
     serviceRecord(on: device, for: markerUUID) != nil
+  }
+
+  /// The product id `device` announces in its Device ID record, or `nil` when it publishes
+  /// none — or names a vendor other than Bose.
+  ///
+  /// The vendor check is not a formality. The id chooses the whole `BoseDeviceConfig`:
+  /// the connect-time init frame, the battery payload shape, whether block 31 exists. Read
+  /// from another vendor's numbering it would pick a config for a model this is not, which
+  /// is worse than the provisional profile an unknown id falls back to.
+  public static func productId(on device: IOBluetoothDevice) -> UInt16? {
+    guard let record = serviceRecord(on: device, for: deviceIdUUID),
+      unsignedAttribute(record, vendorIdAttribute) == UInt16(BoseCatalog.vendorId)
+    else { return nil }
+    return unsignedAttribute(record, productIdAttribute)
+  }
+
+  private static func unsignedAttribute(
+    _ record: IOBluetoothSDPServiceRecord,
+    _ attribute: BluetoothSDPServiceAttributeID
+  ) -> UInt16? {
+    guard let number = record.getAttributeDataElement(attribute)?.getNumberValue() else {
+      return nil
+    }
+    return UInt16(exactly: number.uintValue)
   }
 
   private static func serviceRecord(
@@ -144,6 +174,24 @@ public func bmapDeviceAddresses() -> [String] {
 /// or the first BMAP device otherwise. Kept for callers that want a single best guess.
 public func connectedBmapAddress() -> String? {
   bmapDeviceAddresses().first
+}
+
+/// The `BoseDeviceConfig` for the paired device at `address`, from the product id it
+/// announces over SDP. Falls back to the provisional Ultra 2 profile when the device
+/// publishes no usable Device ID record, exactly as `BoseCatalog` prescribes.
+///
+/// Reads cached SDP like `bmapDeviceAddresses`, so it must be called from a thread with a
+/// run loop (the main actor in this app) — a background thread gets empty records back.
+public func bmapDeviceConfig(forAddress address: String) -> (config: BoseDeviceConfig, productId: UInt16?) {
+  let paired = IOBluetoothDevice.pairedDevices() as? [IOBluetoothDevice] ?? []
+  let device = paired.first { device in
+    guard let reported = device.addressString else { return false }
+    return reported.caseInsensitiveCompare(address) == .orderedSame
+  }
+  guard let device, let productId = BmapServiceDiscovery.productId(on: device) else {
+    return (BoseCatalog.fallbackConfig, nil)
+  }
+  return (BoseCatalog.config(forProductId: productId), productId)
 }
 
 // MARK: - Host

@@ -38,7 +38,10 @@ final class BoseDeviceController: ObservableObject {
   private let audio: any AudioOutputObserving
   private let openTimeout: Duration
   private let refreshInterval: Duration
-  private let config: BoseDeviceConfig = .qcUltra2
+  /// The connected model's config, resolved from the product id it announces over SDP at
+  /// every connect. `BoseCatalog`'s provisional Ultra 2 profile until a device names
+  /// itself — and again for any id the catalog does not know.
+  private var config: BoseDeviceConfig = BoseCatalog.fallbackConfig
 
   private var session: BoseSession?
   private var activeAddress: String?
@@ -188,14 +191,25 @@ final class BoseDeviceController: ObservableObject {
   private func connect(to address: String) async {
     readout = Readout(status: .connecting, modelName: nil, firmwareVersion: nil, battery: .unknown)
     do {
+      // The model decides the dialect — QC35 answers nothing until it receives the [0.1]
+      // init, reports a one-byte battery, and has no block 31 — so the config is resolved
+      // from the announced product id *before* the session starts. An id the catalog does
+      // not know keeps the provisional Ultra 2 profile, which is what it is there for.
+      let (resolved, productId) = bmapDeviceConfig(forAddress: address)
+      config = resolved
+      Self.log.notice(
+        """
+        bose config resolved: \
+        productId=\(productId.map { String(format: "0x%04X", $0) } ?? "unknown", privacy: .public) \
+        supported=\(productId.map(BoseCatalog.isSupported(productId:)) ?? false, privacy: .public)
+        """
+      )
       let opened = try await BmapRFCOMMChannelOpener(openTimeout: openTimeout).open(address: address)
-      // Only the Ultra 2 family is byte-verified today; its config also drives the
-      // provisional profile for unknown ids, so it is the safe default for a first read.
       let session = await BoseSession.start(opened: opened, config: config)
       try await session.connect()
       self.session = session
 
-      firmwareVersion = try? await readFirmware(session)
+      firmwareVersion = config.supports(.firmwareVersion) ? try? await readFirmware(session) : nil
       snapshot = await readSnapshot(session, includingStable: true)
       // An opened channel that answers nothing is not a connection. Publishing `.ready`
       // here would show an empty panel over a link the next refresh has to tear down
@@ -206,15 +220,12 @@ final class BoseDeviceController: ObservableObject {
         readout = Readout(status: .unreachable, modelName: nil, firmwareVersion: nil, battery: .unknown)
         return
       }
-      // The session talks the Ultra 2 dialect for every model in the family, but the panel
-      // display config is chosen once the device has named itself: the earbuds withhold
-      // wind reduction while the headphones keep it. Product ids are not yet plumbed from
-      // SDP, so the device-reported product name is the only signal that tells them apart.
-      panelModel = BosePanelModel(
-        snapshot: snapshot,
-        config: Self.displayConfig(forModelName: snapshot.modelName),
-        session: session
-      )
+      // One config drives both the wire and the panel. The display axes it carries — wind
+      // reduction above all, which the earbuds lack though their [31.10] payload still
+      // has the byte — now come from the catalog entry for the announced product id,
+      // rather than from looking for "earbud" in a name that is localisable and, on a
+      // renamed device, not the model's at all.
+      panelModel = BosePanelModel(snapshot: snapshot, config: config, session: session)
       publishReadout(status: .ready)
       Self.log.notice("bose connected: controllable")
     } catch {
@@ -283,11 +294,17 @@ final class BoseDeviceController: ObservableObject {
     /// Whether any GET in this call came back parsed. The only evidence the link is alive.
     var readSomething = false
 
+    // Every GET is gated on the config declaring the address, so a model is never asked
+    // for a block it would refuse — the whole point of the config carrying a feature set.
     if includingStable {
-      snap.modelName = try? await readModelName(session)
-      readSomething = readSomething || snap.modelName != nil
-      snap.equalizerBands = try? await readEqualizer(session)
-      readSomething = readSomething || snap.equalizerBands != nil
+      if config.supports(.deviceName) {
+        snap.modelName = try? await readModelName(session)
+        readSomething = readSomething || snap.modelName != nil
+      }
+      if config.supports(.equalizer) {
+        snap.equalizerBands = try? await readEqualizer(session)
+        readSomething = readSomething || snap.equalizerBands != nil
+      }
       modeList = (try? await readModeList(session)) ?? []
       readSomething = readSomething || !modeList.isEmpty
     } else {
@@ -297,13 +314,15 @@ final class BoseDeviceController: ObservableObject {
 
     // Battery [2.2]. A device that is busy can answer with no components at all, so an
     // empty list is still an answer: the read succeeded, which is what the flag tracks.
-    if let battery = try? await readBatteryComponents(session) {
+    if config.supports(.battery), let battery = try? await readBatteryComponents(session) {
       snap.battery = battery
       readSomething = true
     }
     // Noise cancellation level [1.5] — the CNC range and current ambient/ANC balance.
-    snap.noiseCancellation = try? await readNoiseCancellation(session)
-    readSomething = readSomething || snap.noiseCancellation != nil
+    if config.supports(.noiseCancellationRead) {
+      snap.noiseCancellation = try? await readNoiseCancellation(session)
+      readSomething = readSomething || snap.noiseCancellation != nil
+    }
 
     // Audio modes (block 31). Ultra 2's live [31.10] answers a GET with
     // functionNotSupported, so the current ANC / spatial / wind state is read from the
@@ -323,16 +342,6 @@ final class BoseDeviceController: ObservableObject {
 
     snap.isControllable = readSomething
     return snap
-  }
-
-  /// The panel display config for a device that has named itself. Every Ultra 2 device
-  /// shares the protocol config, so this differs from `config` only in the display axes
-  /// that hardware, not the wire, decides — today just wind reduction, which the earbuds
-  /// lack. An unread or unrecognised name keeps the headphones' full-feature default.
-  private static func displayConfig(forModelName modelName: String?) -> BoseDeviceConfig {
-    guard let name = modelName?.lowercased() else { return .qcUltra2 }
-    let isEarbuds = name.contains("earbud") || name.contains("buds")
-    return isEarbuds ? .qcUltra2Earbuds : .qcUltra2
   }
 
   private func readModelName(_ session: BoseSession) async throws -> String {
