@@ -11,7 +11,22 @@ import TandemSession
 enum BatteryLayout: Equatable {
   case single(Int?)
   case leftRight(left: Int?, right: Int?, charging: Int?)
+  /// Several cells the device numbers but does not name. Used when the payload carries
+  /// more than one reading with no declaration of which enclosure each belongs to —
+  /// numbering them is honest, whereas calling the first two "L" and "R" is a guess that
+  /// swaps the sides on any device that orders them differently.
+  case numbered([Cell])
   case unknown
+
+  /// One numbered charge cell, in the order the device reported it.
+  struct Cell: Equatable, Identifiable {
+    /// The 1-based position in the device's own list. Never a component id: those are
+    /// device-defined and mean nothing to the reader.
+    let slot: Int
+    let percent: Int?
+
+    var id: Int { slot }
+  }
 }
 
 /// What the panel needs to draw.
@@ -786,6 +801,11 @@ private struct BatteryReadout: View {
         if isExpanded, let charging {
           BatteryPip(label: nil, value: charging, symbol: "case", isExpanded: isExpanded)
             .transition(.opacity)
+        }
+      case .numbered(let cells):
+        // Closed, the bar has room for two pips beside the cutout; the rest join on open.
+        ForEach(isExpanded ? cells : Array(cells.prefix(2))) { cell in
+          BatteryPip(label: "\(cell.slot)", value: cell.percent, isExpanded: isExpanded)
         }
       case .unknown:
         EmptyView()

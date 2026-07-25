@@ -393,17 +393,26 @@ final class BoseDeviceController: ObservableObject {
 
   // MARK: - Helpers
 
-  private static func batteryLayout(from components: [BmapBatteryComponent]) -> BatteryLayout {
+  /// Maps the parsed [2.2] components onto the shared layout.
+  ///
+  /// A single component is the whole headset. Several become numbered cells, never L / R /
+  /// case: `BmapBatteryComponent.componentId` is device-defined, so which enclosure each
+  /// reading belongs to is not something the payload declares — the parse layer says so
+  /// and deliberately keeps the id raw. Reading the order as left, right, case put the two
+  /// earbud charges the wrong way round on any model that reports them differently. The
+  /// Bose panel already numbers them (`BosePanelState.batteryReading`); this matches it, so
+  /// the notch and the panel agree.
+  nonisolated static func batteryLayout(from components: [BmapBatteryComponent]) -> BatteryLayout {
     switch components.count {
     case 0:
       return .unknown
     case 1:
       return .single(components[0].percent)
     default:
-      return .leftRight(
-        left: components[0].percent,
-        right: components[1].percent,
-        charging: components.count >= 3 ? components[2].percent : nil
+      return .numbered(
+        components.enumerated().map { index, component in
+          BatteryLayout.Cell(slot: index + 1, percent: component.percent)
+        }
       )
     }
   }

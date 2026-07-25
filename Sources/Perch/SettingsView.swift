@@ -296,6 +296,10 @@ private struct DeviceStatusHeader: View {
       ]
       .compactMap(\.self)
       .joined(separator: "  ")
+    case .numbered(let cells):
+      cells
+        .compactMap { cell in cell.percent.map { "\(cell.slot) \($0)%" } }
+        .joined(separator: "  ")
     case .unknown:
       ""
     }
