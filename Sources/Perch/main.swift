@@ -1165,7 +1165,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // The bundle should always carry the artwork; a bare symbol beats an empty slot
     // in the bar if it somehow does not. The symbol is always drawn as a template —
     // a non-template stand-in would be invisible against a matching menu bar.
-    let bundled = Bundle.module.image(forResource: name)
+    //
+    // Read from the app bundle, never `Bundle.module`. SwiftPM's accessor for an
+    // *executable* target looks in exactly two places — `Bundle.main.bundleURL`
+    // (the .app's own directory, not its Resources) and the absolute build path
+    // baked in at compile time — and calls `fatalError` when both miss. Packaged
+    // into an .app the first always misses, so the app ran only on a machine that
+    // still had the build tree at that exact path: on every other Mac it crashed
+    // here at launch. `Bundle.main` finds what package_app.sh installs, and a miss
+    // falls through to the symbol below instead of killing the process.
+    let bundled = Bundle.main.image(forResource: name)
     guard
       let image = bundled
         ?? NSImage(systemSymbolName: "headphones", accessibilityDescription: "Perch")
