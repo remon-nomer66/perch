@@ -6,14 +6,16 @@ import Testing
 // オンにするまでと、オンの間の判断を、観測の列（信号の有無・他プロセスの再生の有無・
 // タップの許可判定）と、そのとき下る判断の表で確かめる。時間は既定の配分のまま:
 // オンにするまでは 400ms ごとに見て6秒で見切る（15回目の観測が期限）。オンの間は
-// 1秒ごとに見て、他が再生中なのに5秒無音なら手を打つ（5回目の観測）。
+// 1秒ごとに見て、他が再生中なのに5秒無音なら手を打つ（5回目の観測）。他の再生が
+// 3秒（3回）止まって初めて、それまでの無音と手当てを忘れる。
 // 守りたい約束:
 //  - 許可ありと分かれば、無音でもすぐオン（何も再生していなくてもオンにしておける）
 //  - 許可なしなら期限で取り消し、理由は「許可なし」
 //  - 判定できなければ実際の音で確かめ、届かなければ「音声を検出できない」で取り消す
 //    （許可が無いとは決めつけない）
 //  - 原音はミュートされているので、許可ありと確認できない限り無音のまま居座らない
-//  - オンの間、何も再生していない無音は正常。他が再生中なのに黙ったタップは1回作り直し、
+//  - オンの間、何も再生していない無音は正常（他プロセスの状態が読めないときは、再生中
+//    かもしれない側に倒す）。他が再生中なのに黙ったタップは1回作り直し、
 //    それでも黙っていれば取り消して理由を出す。ただし、オンにしてから実際の音を一度でも
 //    聞いていて、作り直したタップが許可ありと答えるなら、その無音は相手の音（黙ったまま
 //    出力を開いているアプリ）なのでオンのまま
@@ -111,9 +113,14 @@ private let scenarios: [Scenario] = [
     decisions: [.hold, .rebuild] + holdsUntilDeadline(then: .revoke(.permissionDenied))
   ),
   Scenario(
-    name: "判定できない → 許可あり: 拒否を見ていないので作り直さずにオン",
-    looks: [.silentUnknown, .silentGranted],
-    decisions: [.hold, .commit]
+    name: "判定できない → 許可あり: 許可あり以外を見た後なので、タップを1回作り直す",
+    looks: [.silentUnknown, .silentGranted, .silentGranted],
+    decisions: [.hold, .rebuild, .commit]
+  ),
+  Scenario(
+    name: "期限ちょうど（15回目）に、判定できないから許可ありへ変わっても作り直してからオン",
+    looks: Array(repeating: .silentUnknown, count: 14) + [.silentGranted, .silentGranted],
+    decisions: holds(14) + [.rebuild, .commit]
   ),
   Scenario(
     name: "期限ちょうど（15回目）に許可ありが来れば、期限より許可ありが勝つ（作り直してから）",
@@ -205,9 +212,9 @@ private let watchScenarios: [WatchScenario] = [
     decisions: holds(30)
   ),
   WatchScenario(
-    name: "他プロセスの再生が読めないときの無音も、正常として扱う",
-    looks: Array(repeating: .quietUnreadable, count: 30),
-    decisions: holds(30)
+    name: "他プロセスの再生が読めないときは再生中かもしれない側に倒す: 黙ったタップを作り直し、取り消す",
+    looks: Array(repeating: .quietUnreadable, count: 10),
+    decisions: holds(4) + [.rebuild] + holds(4) + [.revoke(.captureLost)]
   ),
   WatchScenario(
     name: "他が再生中なのに無音が続けば、タップを1回作り直す",
@@ -263,9 +270,20 @@ private let watchScenarios: [WatchScenario] = [
     decisions: [.hold] + holds(4) + [.rebuild] + holds(5) + holds(4) + [.revoke(.captureLost)]
   ),
   WatchScenario(
-    name: "相手が鳴らし止めれば、次に黙ったときは改めて1回作り直せる",
-    looks: [.flowing] + stall() + stall() + [.quiet] + stall(),
-    decisions: [.hold] + holds(4) + [.rebuild] + holds(5) + [.hold] + holds(4) + [.rebuild]
+    name: "相手が3秒鳴らし止めれば、次に黙ったときは改めて1回作り直せる",
+    looks: [.flowing] + stall() + stall() + stall(3, .quiet) + stall(),
+    decisions: [.hold] + holds(4) + [.rebuild] + holds(5) + holds(3) + holds(4) + [.rebuild]
+  ),
+  WatchScenario(
+    name: "許可ありと確かめた後、相手の出力が一瞬止まっても忘れない（作り直しを連発しない）",
+    looks: [.flowing] + stall() + stall() + [.quiet] + stall(5),
+    decisions: [.hold] + holds(4) + [.rebuild] + holds(5) + [.hold] + holds(5)
+  ),
+  WatchScenario(
+    name: "許可ありと確かめた後、相手の出力が止まったり戻ったりを繰り返しても作り直さない",
+    looks: [.flowing] + stall() + stall()
+      + Array(repeating: [WatchLook.quiet, .stalled], count: 10).flatMap { $0 },
+    decisions: [.hold] + holds(4) + [.rebuild] + holds(5) + holds(20)
   ),
   WatchScenario(
     name: "作り直した後に許可なしと分かれば、期限を待たずに許可なしで取り消す",
@@ -273,9 +291,14 @@ private let watchScenarios: [WatchScenario] = [
     decisions: holds(4) + [.rebuild, .revoke(.permissionDenied)]
   ),
   WatchScenario(
-    name: "無音の途中で再生が止まれば、数え直す",
-    looks: stall(4) + [.quiet] + stall(),
-    decisions: holds(4) + [.hold] + holds(4) + [.rebuild]
+    name: "無音の途中で再生が一瞬止まっただけなら、数え直さない",
+    looks: stall(4) + [.quiet] + stall(1),
+    decisions: holds(4) + [.hold] + [.rebuild]
+  ),
+  WatchScenario(
+    name: "無音の途中で再生が3秒止まれば、数え直す",
+    looks: stall(4) + stall(3, .quiet) + stall(),
+    decisions: holds(4) + holds(3) + holds(4) + [.rebuild]
   ),
   WatchScenario(
     name: "音が戻った後なら、次に黙ったときにも改めて1回作り直せる",

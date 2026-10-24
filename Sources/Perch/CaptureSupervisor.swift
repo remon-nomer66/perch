@@ -13,16 +13,17 @@ import SpatialAudioKit
 /// tap: at the deadline it reverts, and says why.
 ///
 /// Running: silence while nothing else plays is simply what there is to hear. Silence
-/// while another process is playing may mean capture was lost — the grant revoked, a
-/// tap gone deaf — and with the original muted the whole Mac would be silent. The tap is
-/// rebuilt once. If the fresh tap still hears nothing, it is asked for the grant: a
-/// refusal, or no answer, gives up and says why. A fresh tap that is allowed to record
-/// and still hears silence means the silence is the other app's own — browsers keep
-/// WebAudio output running while quiet, calls sit silent between speakers — so spatial
-/// audio stays on, asking the tap again once per timeout in case the grant goes. But
-/// only once real audio has been heard since turning on: the tap's "allowed" is itself
-/// an unproven answer, so on its own it never keeps a silent Mac — wrong answers, or a
-/// tap that is allowed but cannot capture, still give the sound back.
+/// while another process is playing (or may be: unreadable counts as playing) may mean
+/// capture was lost — the grant revoked, a tap gone deaf — and with the original muted
+/// the whole Mac would be silent. The tap is rebuilt once. If the fresh tap still hears
+/// nothing, it is asked for the grant: a refusal, or no answer, gives up and says why.
+/// A fresh tap that is allowed to record and still hears silence means the silence is
+/// the other app's own — browsers keep WebAudio output running while quiet, calls sit
+/// silent between speakers — so spatial audio stays on, asking the tap again once per
+/// timeout in case the grant goes. But only once real audio has been heard since
+/// turning on: the tap's "allowed" is itself an unproven answer, so on its own it never
+/// keeps a silent Mac — wrong answers, or a tap that is allowed but cannot capture,
+/// still give the sound back.
 struct CaptureSupervisor: Equatable {
   struct Timing: Equatable {
     /// How often the capture is looked at while turning on.
@@ -35,6 +36,9 @@ struct CaptureSupervisor: Equatable {
     /// How long the tap may stay silent while another process plays before something is
     /// done about it. Long enough to ride out the gap between tracks.
     var stallTimeout: Duration = .seconds(5)
+    /// How long nothing else must play before a stretch of silence, and what was done
+    /// about it, is forgotten.
+    var quietReset: Duration = .seconds(3)
   }
 
   enum Decision: Equatable, Sendable {
@@ -60,13 +64,32 @@ struct CaptureSupervisor: Equatable {
   }
 
   private enum Phase: Equatable {
-    /// `sawDenial`: the tap refused at some look of this attempt. `rebuilt`: the one
-    /// rebuild this attempt allows has been used.
-    case confirming(elapsed: Duration, sawDenial: Bool, rebuilt: Bool)
-    /// `silent`: how long the tap has been silent while another process plays.
-    /// `heardSignal`: real audio has arrived at least once since turning on — the only
-    /// proof that capture works, which an answer from the tap is not.
-    case running(silent: Duration, recovery: Recovery, heardSignal: Bool)
+    case confirming(Confirmation)
+    case running(Watch)
+  }
+
+  /// Turning on, so far.
+  private struct Confirmation: Equatable {
+    var elapsed: Duration = .zero
+    /// The tap refused at some look of this attempt — what the deadline reports.
+    var sawDenial = false
+    /// The tap gave anything but "allowed" at some look: a later "allowed" means the
+    /// grant landed while this tap was live.
+    var sawNonGrant = false
+    /// The one rebuild this attempt allows has been used.
+    var rebuilt = false
+  }
+
+  /// Watching a running capture, so far.
+  private struct Watch: Equatable {
+    /// Real audio has arrived at least once since turning on — the only proof that
+    /// capture works, which an answer from the tap is not.
+    var heardSignal: Bool
+    /// How long the tap has been silent while another process may be playing.
+    var silent: Duration = .zero
+    /// How long nothing else has been playing, without audio either.
+    var quiet: Duration = .zero
+    var recovery = Recovery.none
   }
 
   /// How far one stretch of silence-while-others-play has been handled.
@@ -80,7 +103,7 @@ struct CaptureSupervisor: Equatable {
   }
 
   let timing: Timing
-  private var phase = Phase.confirming(elapsed: .zero, sawDenial: false, rebuilt: false)
+  private var phase = Phase.confirming(Confirmation())
 
   init(timing: Timing = Timing()) {
     self.timing = timing
@@ -110,20 +133,14 @@ struct CaptureSupervisor: Equatable {
     permission: () -> SystemAudioPermission
   ) -> Decision {
     switch phase {
-    case let .confirming(previous, sawDenial, rebuilt):
-      return confirm(
+    case .confirming(var confirmation):
+      confirmation.elapsed += elapsed
+      return confirm(hasSignal: hasSignal, confirmation, permission: permission)
+    case .running(let watch):
+      return self.watch(
         hasSignal: hasSignal,
-        elapsed: previous + elapsed,
-        sawDenial: sawDenial,
-        rebuilt: rebuilt,
-        permission: permission
-      )
-    case let .running(silent, recovery, heardSignal):
-      return watch(
-        hasSignal: hasSignal,
-        silentFor: silent + elapsed,
-        recovery: recovery,
-        heardSignal: heardSignal,
+        elapsed: elapsed,
+        watch,
         othersPlaying: othersPlaying,
         permission: permission
       )
@@ -132,82 +149,99 @@ struct CaptureSupervisor: Equatable {
 
   private mutating func confirm(
     hasSignal: Bool,
-    elapsed: Duration,
-    sawDenial: Bool,
-    rebuilt: Bool,
+    _ confirmation: Confirmation,
     permission: () -> SystemAudioPermission
   ) -> Decision {
     // Real audio is proof whatever the tap says about the grant.
     if hasSignal {
-      phase = .running(silent: .zero, recovery: .none, heardSignal: true)
+      phase = .running(Watch(heardSignal: true))
       return .commit
     }
+    var next = confirmation
     let answer = permission()
     switch answer {
-    case .granted where sawDenial && !rebuilt:
-      // The grant landed while this tap was live, and a tap built before the grant can
-      // stay silent. A fresh one, with a full window of its own.
-      phase = .confirming(elapsed: .zero, sawDenial: false, rebuilt: true)
+    case .granted where confirmation.sawNonGrant && !confirmation.rebuilt:
+      // The grant landed while this tap was live (it said no, or could not tell, before),
+      // and a tap built before the grant can stay silent. A fresh one, with a full window
+      // of its own.
+      phase = .confirming(Confirmation(rebuilt: true))
       return .rebuild
     case .granted:
-      phase = .running(silent: .zero, recovery: .none, heardSignal: false)
+      phase = .running(Watch(heardSignal: false))
       return .commit
     case .denied, .unknown:
-      let refused = sawDenial || answer == .denied
-      guard elapsed >= timing.confirmDeadline else {
-        phase = .confirming(elapsed: elapsed, sawDenial: refused, rebuilt: rebuilt)
+      next.sawDenial = next.sawDenial || answer == .denied
+      next.sawNonGrant = true
+      guard next.elapsed >= timing.confirmDeadline else {
+        phase = .confirming(next)
         return .hold
       }
-      return .revoke(refused ? .permissionDenied : .noAudioDetected)
+      return .revoke(next.sawDenial ? .permissionDenied : .noAudioDetected)
     }
   }
 
   private mutating func watch(
     hasSignal: Bool,
-    silentFor: Duration,
-    recovery: Recovery,
-    heardSignal: Bool,
+    elapsed: Duration,
+    _ watch: Watch,
     othersPlaying: () -> Bool?,
     permission: () -> SystemAudioPermission
   ) -> Decision {
-    let heard = heardSignal || hasSignal
-    guard !hasSignal, othersPlaying() == true else {
-      // Audio flows, or nothing else is playing (or that cannot be read) — silence is
-      // then what there is to hear. Either way the capture is fine, and a later silence
-      // is a new stretch with a rebuild of its own.
-      phase = .running(silent: .zero, recovery: .none, heardSignal: heard)
+    var next = watch
+    if hasSignal {
+      // Audio flows: the capture is fine, and a later silence is a new stretch with a
+      // rebuild of its own.
+      phase = .running(Watch(heardSignal: true))
       return .hold
     }
-    let timedOut = silentFor >= timing.stallTimeout
-    switch recovery {
+    // Unreadable counts as "may be playing": that is the side where a muted Mac gets
+    // its sound back.
+    guard othersPlaying() != false else {
+      // Nothing else is playing: silence is what there is to hear. Only once that has
+      // lasted is the stretch forgotten — one quiet look between two silent ones must
+      // not throw away a vouched tap and cost another rebuild.
+      next.quiet += elapsed
+      if next.quiet >= timing.quietReset {
+        next = Watch(heardSignal: watch.heardSignal)
+      }
+      return keepWatching(next)
+    }
+    next.quiet = .zero
+    next.silent += elapsed
+    let timedOut = next.silent >= timing.stallTimeout
+    switch watch.recovery {
     case .none:
-      guard timedOut else { return keepWatching(silentFor, .none, heard) }
-      phase = .running(silent: .zero, recovery: .rebuilt, heardSignal: heard)
+      guard timedOut else { return keepWatching(next) }
+      next.silent = .zero
+      next.recovery = .rebuilt
+      phase = .running(next)
       return .rebuild
     case .rebuilt:
       // The whole Mac is muted meanwhile: a refusal from the fresh tap ends it at once.
       let answer = permission()
       if answer == .denied { return .revoke(.permissionDenied) }
-      guard timedOut else { return keepWatching(silentFor, .rebuilt, heard) }
+      guard timedOut else { return keepWatching(next) }
       // "Allowed" is only believed once real audio has borne capture out. Without that,
       // a wrong answer — or a tap that may record but cannot — would keep the original
       // muted for good.
-      guard answer == .granted, heard else { return .revoke(.captureLost) }
-      return keepWatching(.zero, .vouched, heard)
+      guard answer == .granted, watch.heardSignal else { return .revoke(.captureLost) }
+      next.silent = .zero
+      next.recovery = .vouched
+      return keepWatching(next)
     case .vouched:
-      guard timedOut else { return keepWatching(silentFor, .vouched, heard) }
+      guard timedOut else { return keepWatching(next) }
       switch permission() {
-      case .granted: return keepWatching(.zero, .vouched, heard)
+      case .granted:
+        next.silent = .zero
+        return keepWatching(next)
       case .denied: return .revoke(.permissionDenied)
       case .unknown: return .revoke(.captureLost)
       }
     }
   }
 
-  private mutating func keepWatching(
-    _ silent: Duration, _ recovery: Recovery, _ heardSignal: Bool
-  ) -> Decision {
-    phase = .running(silent: silent, recovery: recovery, heardSignal: heardSignal)
+  private mutating func keepWatching(_ watch: Watch) -> Decision {
+    phase = .running(watch)
     return .hold
   }
 }
