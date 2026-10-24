@@ -29,12 +29,76 @@ private let policy = SessionPolicy(maximumFailureCount: 3)
   // An unverified device that connects successfully is a successful connection: a
   // headset that drops the channel on every wearing change would otherwise spend
   // the whole failure budget across hours of normal use and stick at exhausted.
-  let (next, _) = policy.reduce(
+  // The reset waits for the session to prove itself, so a session that fails before
+  // then still counts — see `aSessionThatFaultsBeforeProvingStableExhaustsItsBudget`.
+  let (unverified, _) = policy.reduce(
     state(.verifying, failureCount: 2),
     .verificationRejected
   )
+  #expect(unverified.phase == .unverified)
+
+  let (next, effects) = policy.reduce(unverified, .sessionProvedStable)
   #expect(next.phase == .unverified)
   #expect(next.failureCount == 0)
+  #expect(effects.isEmpty)
+}
+
+@Test func verificationAloneDoesNotRestoreTheBudget() {
+  // Reaching ready only says the handshake answered. Resetting the budget there let
+  // a session that faults on its first poll reconnect forever without ever reaching
+  // exhaustion: every reconnect verified again and wiped the count it had just spent.
+  for (event, phase) in [
+    (SessionEvent.verificationSucceeded, SessionState.Phase.ready),
+    (.verificationRejected, .unverified),
+  ] {
+    let (next, _) = policy.reduce(state(.verifying, failureCount: 2), event)
+    #expect(next.phase == phase)
+    #expect(next.failureCount == 2, "\(event) restored the budget before the session proved itself")
+  }
+}
+
+@Test func aSessionThatFaultsBeforeProvingStableExhaustsItsBudget() {
+  // Drive the real cycle: every reconnect verifies, reaches ready, and faults on the
+  // first poll — a declared read the device never answers. The loop must end.
+  var current = state(.connecting)
+  for _ in 0..<20 {
+    (current, _) = policy.reduce(current, .channelOpened(current.attempt))
+    #expect(current.phase == .verifying)
+    (current, _) = policy.reduce(current, .verificationSucceeded)
+    #expect(current.phase == .ready)
+    (current, _) = policy.reduce(current, .sessionFault(.responseTimedOut))
+    if current.phase == .retryExhausted { break }
+    #expect(current.phase == .retryWaiting)
+    (current, _) = policy.reduce(current, .backoffExpired)
+  }
+  #expect(current.phase == .retryExhausted, "a session that never settled reconnected forever")
+  #expect(current.failureCount == policy.maximumFailureCount)
+}
+
+@Test func aSessionThatProvedStableStartsItsBudgetOverOnEveryDrop() {
+  // The intent the reset exists for: a headset that drops its channel on every
+  // wearing change, after working normally in between, never sticks at exhausted.
+  var current = state(.connecting)
+  for _ in 0..<20 {
+    (current, _) = policy.reduce(current, .channelOpened(current.attempt))
+    (current, _) = policy.reduce(current, .verificationSucceeded)
+    (current, _) = policy.reduce(current, .sessionProvedStable)
+    #expect(current.failureCount == 0)
+    (current, _) = policy.reduce(current, .channelClosedUnexpectedly(current.attempt))
+    #expect(current.phase == .retryWaiting, "normal wearing changes spent the budget")
+    (current, _) = policy.reduce(current, .backoffExpired)
+  }
+}
+
+@Test func provingStableOutsideALiveSessionChangesNothing() {
+  // Only a live session can prove itself; a late signal must not restore the budget
+  // of a reconnect that is still paying for a failure.
+  for phase: SessionState.Phase in [.connecting, .verifying, .retryWaiting, .retryExhausted] {
+    let start = state(phase, failureCount: 2)
+    let (next, effects) = policy.reduce(start, .sessionProvedStable)
+    #expect(next == start, "\(phase) took a stability signal")
+    #expect(effects.isEmpty)
+  }
 }
 
 @Test func exhaustedRetriesRearmOnASlowCadence() {
@@ -134,6 +198,20 @@ private let policy = SessionPolicy(maximumFailureCount: 3)
   let (next, effects) = policy.reduce(suspended, .defaultOutputChanged(deviceA))
   #expect(next.phase == .ready)
   #expect(effects == [.cancelGrace])
+}
+
+@Test func aFaultWhileSuspendedReleasesRatherThanResumingOnABrokenStream() {
+  // The grace holds the channel, and acknowledgements still go out on it. A fault
+  // there — a stalled write above all — used to be ignored, so returning to the
+  // device resumed onto a channel that could no longer carry anything, and the first
+  // request after it waited out its whole timeout before anything was rebuilt.
+  for fault: SessionFault in [.writeStalled, .responseTimedOut, .bufferOverflowed] {
+    let (next, effects) = policy.reduce(state(.suspended(resume: .ready)), .sessionFault(fault))
+    #expect(next.phase == .released, "\(fault) was ignored while suspended")
+    #expect(effects.contains(.cancelGrace))
+    #expect(effects.contains(.closeChannel))
+    #expect(effects.contains(.failPendingRequests))
+  }
 }
 
 @Test func disconnectingWhileSuspendedReleasesRatherThanResuming() {
@@ -247,7 +325,10 @@ private let policy = SessionPolicy(maximumFailureCount: 3)
 }
 
 @Test func successResetsTheFailureCount() {
-  let (next, _) = policy.reduce(state(.verifying, failureCount: 2), .verificationSucceeded)
+  // Success is a session that proved itself, not one that merely verified.
+  let (ready, _) = policy.reduce(state(.verifying, failureCount: 2), .verificationSucceeded)
+  #expect(ready.phase == .ready)
+  let (next, _) = policy.reduce(ready, .sessionProvedStable)
   #expect(next.phase == .ready)
   #expect(next.failureCount == 0)
 }
@@ -263,6 +344,73 @@ private let policy = SessionPolicy(maximumFailureCount: 3)
   let (next, effects) = policy.reduce(state(.retryWaiting, failureCount: 1), .defaultOutputChanged(nil))
   #expect(next.phase == .released)
   #expect(effects == [.cancelBackoff])
+}
+
+// MARK: - Failures retrying cannot fix
+
+@Test func aVerificationTheDeviceAnswersUnreadablyStopsRetrying() {
+  // The device answered the handshake with something that does not parse. Asking
+  // again gets the same answer, so it was a reconnect loop on the retry budget, then
+  // the slow cadence forever — each pass holding the single control channel.
+  let (incompatible, effects) = policy.reduce(
+    state(.verifying, failureCount: 1),
+    .verificationFailedPermanently
+  )
+  #expect(incompatible.phase == .incompatible)
+  #expect(incompatible.target == deviceA, "the refusal must remember which device it is about")
+  #expect(effects == [.closeChannel, .invalidateSession, .failPendingRequests])
+  #expect(!incompatible.acceptsWrites)
+
+  for event: SessionEvent in [.backoffExpired, .defaultOutputChanged(deviceA), .graceExpired] {
+    let (still, stillEffects) = policy.reduce(incompatible, event)
+    #expect(still.phase == .incompatible, "\(event) retried a failure that cannot change")
+    #expect(stillEffects.isEmpty)
+  }
+}
+
+@Test func aFirstUnreadableAnswerIsCheckedOnceMoreBeforeItIsBelieved() {
+  // One malformed answer right after connecting — a device still settling — would
+  // otherwise park the device until someone pressed retry. A second one, on a fresh
+  // connection, is the device's actual answer.
+  let (checking, effects) = policy.reduce(state(.verifying), .verificationFailedPermanently)
+  #expect(checking.phase == .retryWaiting)
+  #expect(effects.contains(.scheduleBackoff(attempt: 1)))
+
+  let (reconnecting, _) = policy.reduce(checking, .backoffExpired)
+  let (verifying, _) = policy.reduce(reconnecting, .channelOpened(reconnecting.attempt))
+  let (parked, _) = policy.reduce(verifying, .verificationFailedPermanently)
+  #expect(parked.phase == .incompatible)
+}
+
+@Test func anIncompatibleDeviceIsRetriedOnlyByHandOrByAnotherDevice() {
+  let (retrying, effects) = policy.reduce(state(.incompatible), .manualRetry)
+  #expect(retrying.phase == .connecting)
+  #expect(effects == [.openChannel(deviceA, retrying.attempt)])
+
+  let (refused, refusedEffects) = policy.reduce(
+    state(.incompatible, isDefaultOutput: false), .manualRetry
+  )
+  #expect(refused.phase == .incompatible, "a retry connected to a device that is not the output")
+  #expect(refusedEffects.isEmpty)
+
+  let (other, otherEffects) = policy.reduce(state(.incompatible), .defaultOutputChanged(deviceB))
+  #expect(other.phase == .connecting)
+  #expect(other.target == deviceB)
+  #expect(otherEffects == [.openChannel(deviceB, other.attempt)])
+
+  let (released, releaseEffects) = policy.reduce(state(.incompatible), .defaultOutputChanged(nil))
+  #expect(released.phase == .released)
+  #expect(releaseEffects.isEmpty)
+}
+
+@Test func sleepDoesNotLaunderIncompatibility() {
+  let (asleep, sleepEffects) = policy.reduce(state(.incompatible), .willSleep)
+  #expect(asleep.phase == .sleeping(resume: .blocked(.incompatible)))
+  #expect(sleepEffects.isEmpty, "the channel was already closed")
+
+  let (awake, effects) = policy.reduce(asleep, .didWake(deviceA))
+  #expect(awake.phase == .incompatible)
+  #expect(effects.isEmpty)
 }
 
 // MARK: - Close completions
@@ -312,15 +460,99 @@ private let policy = SessionPolicy(maximumFailureCount: 3)
 
 // MARK: - Contention
 
-@Test func contentionDoesNotReconnectOnItsOwn() {
-  let (contended, _) = policy.reduce(
+@Test func anOutputNotificationDoesNotReconnectAContendedSession() {
+  // Only the slow-cadence timer and the user move contention along; the same device
+  // being announced as the output again is not news.
+  let (contended, effects) = policy.reduce(
     state(.ready), .controlContended(ConnectionAttempt(0))
   )
   #expect(contended.phase == .contended)
+  #expect(effects.contains(.scheduleContentionRetry))
 
-  let (unchanged, effects) = policy.reduce(contended, .defaultOutputChanged(deviceA))
+  let (unchanged, outputEffects) = policy.reduce(contended, .defaultOutputChanged(deviceA))
   #expect(unchanged.phase == .contended)
-  #expect(effects.isEmpty)
+  #expect(outputEffects.isEmpty)
+}
+
+@Test func contentionRetriesOnASlowCadence() {
+  // An open timeout is read as contention, but nothing proves it: the async open has
+  // been seen never calling back at all. Waiting for the user alone left a session
+  // that was merely unlucky stuck until someone pressed retry, so contention tries
+  // again on its own, slowly — each try can hang for the full open timeout.
+  //
+  // The try stays `contended` while it is out: passing through `connecting` swapped
+  // the panel's "another device is in control" for "connecting" for up to the whole
+  // open timeout, every tick, and hid the retry button meanwhile.
+  let contended = state(.contended, failureCount: 2, attempt: ConnectionAttempt(4))
+  let (trying, effects) = policy.reduce(contended, .backoffExpired)
+  #expect(trying.phase == .contended)
+  #expect(trying.attempt != contended.attempt)
+  #expect(trying.failureCount == 0, "contention is not a failure")
+  #expect(effects == [.openChannel(deviceA, trying.attempt)])
+
+  // Timing out again only arms the next tick.
+  let (again, againEffects) = policy.reduce(trying, .controlContended(trying.attempt))
+  #expect(again.phase == .contended)
+  #expect(againEffects == [.cancelOpen, .scheduleContentionRetry])
+
+  // The channel being free at last is an ordinary connection.
+  let (verifying, openEffects) = policy.reduce(trying, .channelOpened(trying.attempt))
+  #expect(verifying.phase == .verifying)
+  #expect(openEffects == [.startVerification])
+
+  // Failing some other way is not contention, and goes on the retry budget.
+  let (failed, _) = policy.reduce(trying, .channelFailed(trying.attempt))
+  #expect(failed.phase == .retryWaiting)
+}
+
+@Test func aTryLeftOverFromContentionIsCancelledAndItsChannelClosed() {
+  let (trying, _) = policy.reduce(state(.contended), .backoffExpired)
+
+  // The user's retry replaces the try; the try's late completion is then stale.
+  let (retrying, retryEffects) = policy.reduce(trying, .manualRetry)
+  #expect(retrying.phase == .connecting)
+  #expect(retryEffects == [.openChannel(deviceA, retrying.attempt)])
+  let (_, staleEffects) = policy.reduce(retrying, .channelOpened(trying.attempt))
+  #expect(staleEffects == [.closeChannel])
+
+  // Leaving the device cancels the try along with the timer.
+  let (released, releaseEffects) = policy.reduce(trying, .defaultOutputChanged(nil))
+  #expect(released.phase == .released)
+  #expect(releaseEffects.contains(.cancelOpen))
+  #expect(releaseEffects.contains(.cancelBackoff))
+  let (_, lateEffects) = policy.reduce(released, .channelOpened(trying.attempt))
+  #expect(lateEffects == [.closeChannel])
+}
+
+@Test func anOpenThatTimedOutIntoContentionCannotLandLater() {
+  // Only a try contention starts may be adopted while contended; the open that
+  // timed out into it was cancelled, and must be closed if it lands after all.
+  let connecting = state(.connecting, attempt: ConnectionAttempt(4))
+  let (contended, _) = policy.reduce(connecting, .controlContended(ConnectionAttempt(4)))
+  let (still, effects) = policy.reduce(contended, .channelOpened(ConnectionAttempt(4)))
+  #expect(still.phase == .contended)
+  #expect(effects == [.closeChannel])
+}
+
+@Test func aContentionTickWhileTheDeviceIsNotTheOutputRearms() {
+  // Seizing the session for a device nobody is listening to would take control
+  // away from the host that is; the tick waits for the next one instead.
+  let (still, effects) = policy.reduce(
+    state(.contended, isDefaultOutput: false),
+    .backoffExpired
+  )
+  #expect(still.phase == .contended)
+  #expect(effects == [.scheduleContentionRetry])
+}
+
+@Test func leavingContentionCancelsItsTimer() {
+  let (released, releaseEffects) = policy.reduce(state(.contended), .defaultOutputChanged(nil))
+  #expect(released.phase == .released)
+  #expect(releaseEffects.contains(.cancelBackoff), "the released phase inherited a live retry timer")
+
+  let (switched, switchEffects) = policy.reduce(state(.contended), .defaultOutputChanged(deviceB))
+  #expect(switched.target == deviceB)
+  #expect(switchEffects.contains(.cancelBackoff))
 }
 
 @Test func anOpenTimeoutAgainstAReachableOutputDeviceIsReadAsContention() {
@@ -334,7 +566,7 @@ private let policy = SessionPolicy(maximumFailureCount: 3)
     connecting, .controlContended(ConnectionAttempt(4))
   )
   #expect(contended.phase == .contended)
-  #expect(effects == [.cancelOpen])
+  #expect(effects == [.cancelOpen, .scheduleContentionRetry])
 
   // The reconnect button lives: a manual retry from here opens a fresh channel.
   let (retrying, retryEffects) = policy.reduce(contended, .manualRetry)
@@ -412,14 +644,14 @@ private let policy = SessionPolicy(maximumFailureCount: 3)
       !effects.contains { if case .openChannel = $0 { return true } else { return false } },
       "sleep let \(label) reconnect"
     )
+    // Both refusals re-arm their slow-cadence timers on waking: sleep cancelled them
+    // with the rest of the teardown, and nothing else ever advances either.
     if phase == .retryExhausted {
-      // Exhaustion re-arms its slow-cadence timer on waking; nothing else ever
-      // advances it. The other refusals wait for the user or for contention to end.
       #expect(
         effects.contains { if case .scheduleBackoff = $0 { return true } else { return false } }
       )
     } else {
-      #expect(effects.isEmpty)
+      #expect(effects == [.scheduleContentionRetry])
     }
   }
 }
@@ -549,6 +781,48 @@ private let policy = SessionPolicy(maximumFailureCount: 3)
   #expect(verifying.phase == .verifying)
 }
 
+@Test func releasingKeepsTheAttemptCounter() {
+  // `released` used to be a fresh state, attempt and all, so the next connection
+  // reused the number of an attempt abandoned moments earlier — and that attempt's
+  // late completion (the cancelled open failing, or landing after all) passed for
+  // the live one.
+  let releases: [[SessionEvent]] = [
+    [.defaultOutputChanged(nil)],
+    [.manualRelease],
+    [.bluetoothDisconnected],
+    [.willSleep, .didWake(nil)],
+  ]
+  for release in releases {
+    let (connecting, _) = policy.reduce(.released, .defaultOutputChanged(deviceA))
+    let abandoned = connecting.attempt
+    var released = connecting
+    for event in release {
+      (released, _) = policy.reduce(released, event)
+    }
+    #expect(released.phase == .released)
+
+    let (reconnecting, _) = policy.reduce(released, .defaultOutputChanged(deviceB))
+    #expect(reconnecting.attempt != abandoned, "\(release) reused an abandoned attempt")
+
+    let (afterFailure, failureEffects) = policy.reduce(reconnecting, .channelFailed(abandoned))
+    #expect(afterFailure == reconnecting, "a cancelled open failing late failed the live one")
+    #expect(failureEffects.isEmpty)
+    let (afterOpen, openEffects) = policy.reduce(reconnecting, .channelOpened(abandoned))
+    #expect(afterOpen == reconnecting, "the other device's late channel was adopted")
+    #expect(openEffects == [.closeChannel])
+  }
+}
+
+@Test func aStaleOpenWhileTheLiveOneVerifiesOnlyClosesIt() {
+  // The phase does not move for a stale completion, and here it is already
+  // `verifying`: the coordinator adopts a channel only when told to verify it, so
+  // the effects alone must say whose channel this is.
+  let verifying = state(.verifying, attempt: ConnectionAttempt(5))
+  let (next, effects) = policy.reduce(verifying, .channelOpened(ConnectionAttempt(4)))
+  #expect(next == verifying)
+  #expect(effects == [.closeChannel])
+}
+
 // MARK: - Construction
 
 @Test func aNonReleasedPhaseWithoutATargetIsNotRepresentable() {
@@ -580,6 +854,10 @@ private let policy = SessionPolicy(maximumFailureCount: 3)
     (state(.verifying), .verificationSucceeded, .ready),
     (state(.verifying), .verificationRejected, .unverified),
     (state(.verifying), .verificationFailedTransient, .retryWaiting),
+    (state(.verifying), .verificationFailedPermanently, .retryWaiting),
+    (state(.verifying, failureCount: 1), .verificationFailedPermanently, .incompatible),
+    (state(.incompatible), .manualRetry, .connecting),
+    (state(.incompatible), .defaultOutputChanged(nil), .released),
     (state(.verifying), .defaultOutputChanged(nil), .released),
     (state(.verifying), .controlContended(ConnectionAttempt(0)), .contended),
     (state(.ready), .defaultOutputChanged(nil), .suspended(resume: .ready)),
@@ -597,6 +875,7 @@ private let policy = SessionPolicy(maximumFailureCount: 3)
     (state(.retryExhausted), .manualRetry, .connecting),
     (state(.retryExhausted), .defaultOutputChanged(nil), .released),
     (state(.contended), .manualRetry, .connecting),
+    (state(.contended), .backoffExpired, .contended),
     (state(.contended), .defaultOutputChanged(deviceA), .contended),
     (state(.contended), .defaultOutputChanged(nil), .released),
     (state(.unverified), .defaultOutputChanged(deviceA), .unverified),
@@ -620,15 +899,17 @@ private let policy = SessionPolicy(maximumFailureCount: 3)
     .released, .connecting, .verifying, .ready, .contended,
     .suspended(resume: .ready), .retryWaiting, .retryExhausted,
     .unverified, .sleeping(resume: .reconnect), .sleeping(resume: .blocked(.unverified)),
-    .recovering,
+    .recovering, .incompatible, .sleeping(resume: .blocked(.incompatible)),
   ]
   let events: [SessionEvent] = [
     .defaultOutputChanged(deviceA), .defaultOutputChanged(deviceB), .defaultOutputChanged(nil),
     .channelOpened(attempt), .channelFailed(attempt), .channelClosedUnexpectedly(attempt),
     .channelClosedByUs, .verificationSucceeded, .verificationRejected,
-    .verificationFailedTransient, .controlContended(attempt), .sessionFault(.bufferOverflowed),
+    .verificationFailedTransient, .verificationFailedPermanently,
+    .controlContended(attempt), .sessionFault(.bufferOverflowed),
     .graceExpired, .backoffExpired, .bluetoothDisconnected,
     .willSleep, .didWake(deviceA), .didWake(nil), .manualRetry, .manualRelease,
+    .sessionProvedStable,
   ]
 
   for phase in phases {
@@ -650,6 +931,20 @@ private let policy = SessionPolicy(maximumFailureCount: 3)
         #expect(next.target != nil, "\(phase) + \(event) lost its target")
       }
       #expect(next.failureCount >= 0)
+      // A request left in flight on an invalidated session holds the wire until its
+      // timeout, and that timeout then faults whatever session exists by then.
+      let (_, effects) = policy.reduce(state(phase, attempt: attempt), event)
+      if effects.contains(.invalidateSession) {
+        #expect(
+          effects.contains(.failPendingRequests),
+          "\(phase) + \(event) invalidated the session but left its requests pending"
+        )
+      }
+      // Attempt numbers only ever move forward. Releasing must not rewind them, or
+      // an abandoned attempt's completion matches the next one.
+      if next.phase == .released {
+        #expect(next.attempt == attempt, "\(phase) + \(event) rewound the attempt")
+      }
       // Writes may only reopen from a phase that had a verified session.
       if next.acceptsWrites {
         // Waking restores whatever the session was before sleeping, so a usable

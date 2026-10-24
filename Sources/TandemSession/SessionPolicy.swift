@@ -19,6 +19,9 @@ public enum SessionFault: Equatable, Sendable {
   case responseTimedOut
   case bufferOverflowed
   case responseUnattributable
+  /// A write did not reach the channel within its bound: the remote stopped granting
+  /// flow control, and every later write would queue behind the stalled one.
+  case writeStalled
 }
 
 public enum SessionEvent: Equatable, Sendable {
@@ -33,6 +36,13 @@ public enum SessionEvent: Equatable, Sendable {
   case verificationSucceeded
   case verificationRejected
   case verificationFailedTransient
+  /// The device answered the verification, and the answer cannot be interpreted.
+  /// Unlike a transient failure, asking again only gets the same answer.
+  case verificationFailedPermanently
+  /// The live session completed its first full read of the device. Verifying only
+  /// shows the handshake answers; this shows the device answers what the session
+  /// keeps asking it, which is what restores the failure budget.
+  case sessionProvedStable
   /// Another host most likely holds the device's single control channel. Fired when
   /// an open times out against a device that is provably reachable — the transport
   /// verified the baseband connection before opening, and this hardware answers a
@@ -62,6 +72,9 @@ public enum SessionEffect: Equatable, Sendable {
   case startGrace
   case cancelGrace
   case scheduleBackoff(attempt: Int)
+  /// Arms the slow timer contention retries on. It shares the backoff's slot, so
+  /// `cancelBackoff` cancels it and it fires as `backoffExpired`.
+  case scheduleContentionRetry
   case cancelBackoff
 }
 
@@ -79,6 +92,7 @@ public struct SessionState: Equatable, Sendable {
       case unverified
       case retryExhausted
       case contended
+      case incompatible
     }
   }
 
@@ -87,6 +101,9 @@ public struct SessionState: Equatable, Sendable {
     case connecting
     case verifying
     case ready
+    /// Another host most likely holds the control channel. Nothing proves it — an
+    /// open that never calls back looks the same — so besides waiting for the user,
+    /// the channel is tried again on a slow timer while the device is the output.
     case contended
     /// The device stopped being the default output. The channel is held for a grace
     /// period so a brief switch away does not cost a reconnect, but nothing may talk
@@ -96,6 +113,12 @@ public struct SessionState: Equatable, Sendable {
     case retryWaiting
     /// Transient failures reached the limit. Recoverable by hand.
     case retryExhausted
+    /// The device answered verification, twice, with something this application
+    /// cannot interpret. Retrying would only repeat the answer, so nothing reconnects
+    /// until the user asks or the output moves to another device, and the control
+    /// channel is closed so that another host can have it. The target is kept, so
+    /// that a different device still connects.
+    case incompatible
     /// Connected and usable, but this model has never been verified against the
     /// encodings this application sends.
     ///
@@ -160,6 +183,8 @@ public struct SessionState: Equatable, Sendable {
     self.isTargetDefaultOutput = self.target == nil ? false : isTargetDefaultOutput
   }
 
+  /// The state before anything has connected. A session that releases later goes
+  /// through `releasing()` instead, which keeps its attempt counter.
   public static let released = SessionState()
 
   /// `suspended` is deliberately excluded even though the channel is still open:
@@ -195,7 +220,7 @@ public struct SessionPolicy: Sendable {
       )
     case .manualRelease:
       guard state.phase != .released else { return (state, []) }
-      return (.released, teardown(from: state))
+      return (state.releasing(), teardown(from: state))
     default:
       break
     }
@@ -207,7 +232,7 @@ public struct SessionPolicy: Sendable {
 
     if case .bluetoothDisconnected = event {
       guard state.target != nil else { return (state, []) }
-      return (.released, teardown(from: state))
+      return (state.releasing(), teardown(from: state))
     }
 
     if let outcome = reduceTargetChange(state, event) { return outcome }
@@ -234,8 +259,11 @@ public struct SessionPolicy: Sendable {
     case .channelOpened(let attempt):
       // Matching the attempt is not enough. Cancelling moves the phase on while
       // keeping the attempt, so an open that lands afterwards must still be closed
-      // rather than left to leak.
-      if attempt == state.attempt, state.phase == .connecting { return nil }
+      // rather than left to leak. `contended` adopts only the try it started itself:
+      // entering it moves the attempt past the open that timed out into it.
+      if attempt == state.attempt, state.phase == .connecting || state.phase == .contended {
+        return nil
+      }
       return (state, [.closeChannel])
 
     case .channelFailed(let attempt), .channelClosedUnexpectedly(let attempt),
@@ -254,6 +282,7 @@ public struct SessionPolicy: Sendable {
     case .unverified: .blocked(.unverified)
     case .retryExhausted: .blocked(.retryExhausted)
     case .contended: .blocked(.contended)
+    case .incompatible: .blocked(.incompatible)
     default: .reconnect
     }
   }
@@ -281,7 +310,7 @@ public struct SessionPolicy: Sendable {
       // what is being listened to, so release and let the output notification
       // reconnect — the same path a verified device takes.
       if blocked == .unverified {
-        guard let device else { return (.released, []) }
+        guard let device else { return (state.releasing(), []) }
         return start(connectingTo: device, from: state)
       }
       let restored: SessionState.Phase =
@@ -289,18 +318,25 @@ public struct SessionPolicy: Sendable {
         case .unverified: .unverified
         case .retryExhausted: .retryExhausted
         case .contended: .contended
+        case .incompatible: .incompatible
         }
+      // A try that sleep cancelled must not land in the contention that wakes up.
+      let resumed = blocked == .contended ? state.contending() : state
       // The output is unknown until the audio system reports one, so the refusal
-      // comes back without permission to reconnect. Exhaustion alone re-arms its
-      // slow-cadence timer, because nothing else ever advances it.
+      // comes back without permission to reconnect. Exhaustion and contention re-arm
+      // their slow-cadence timers, because nothing else ever advances them, and a
+      // tick that finds the device still not the output simply re-arms.
+      // Incompatibility owns no timer: it waits for the user.
       let effects: [SessionEffect] =
-        blocked == .retryExhausted
-        ? [.scheduleBackoff(attempt: max(state.failureCount, 1))]
-        : []
-      return (state.moved(to: restored, isTargetDefaultOutput: device != nil), effects)
+        switch blocked {
+        case .retryExhausted: [.scheduleBackoff(attempt: max(state.failureCount, 1))]
+        case .contended: [.scheduleContentionRetry]
+        case .unverified, .incompatible: []
+        }
+      return (resumed.moved(to: restored, isTargetDefaultOutput: device != nil), effects)
     }
 
-    guard let device else { return (.released, []) }
+    guard let device else { return (state.releasing(), []) }
     return start(connectingTo: device, from: state)
   }
 
@@ -332,32 +368,54 @@ public struct SessionPolicy: Sendable {
       guard let device else { return (state, []) }
       return start(connectingTo: device, from: state)
 
-    case (.connecting, .channelOpened):
+    // A try contention started that finds the channel free is an ordinary connection.
+    case (.connecting, .channelOpened), (.contended, .channelOpened):
       return (state.moved(to: .verifying), [.startVerification])
 
-    case (.connecting, .channelFailed):
+    // A try that fails some other way than hanging is not contention.
+    case (.connecting, .channelFailed), (.contended, .channelFailed):
       return failed(state)
 
     case (.connecting, .defaultOutputChanged(nil)):
-      return (.released, [.cancelOpen, .closeChannel])
+      return (state.releasing(), [.cancelOpen, .closeChannel])
 
+    // Neither verdict restores the failure budget: a session that verifies and then
+    // faults on its first poll would otherwise reconnect forever, wiping on every
+    // pass the count it had just spent. `sessionProvedStable` restores it instead.
     case (.verifying, .verificationSucceeded):
-      return (state.moved(to: .ready, failureCount: 0), [])
+      return (state.moved(to: .ready), [])
 
-    // The channel stays open. Only writing is refused. Connecting to an unverified
-    // device is still a successful connection, so the failure budget starts over: a
-    // headset that drops the channel on every wearing change would otherwise spend
-    // the whole budget across hours of normal use and stick at exhausted.
+    // The channel stays open. Only writing is refused.
     case (.verifying, .verificationRejected):
-      return (state.moved(to: .unverified, failureCount: 0), [])
+      return (state.moved(to: .unverified), [])
+
+    // A session that completed a read is a successful connection, verified or not, so
+    // the failure budget starts over: a headset that drops the channel on every
+    // wearing change would otherwise spend the whole budget across hours of normal
+    // use and stick at exhausted.
+    case (.ready, .sessionProvedStable), (.unverified, .sessionProvedStable),
+      (.suspended, .sessionProvedStable):
+      return (state.moved(to: state.phase, failureCount: 0), [])
 
     case (.verifying, .verificationFailedTransient):
       return failed(state)
 
+    // Not on the retry budget: every retry would get the same unreadable answer
+    // while holding the channel away from the hosts that can use it. A first one is
+    // checked once more on a fresh connection, though — a device still settling
+    // right after connecting must not be parked until someone presses retry — and is
+    // believed when the reconnect, already carrying a failure, gets it again.
+    case (.verifying, .verificationFailedPermanently):
+      guard state.failureCount > 0 else { return failed(state) }
+      return (
+        state.moved(to: .incompatible),
+        [.closeChannel, .invalidateSession, .failPendingRequests]
+      )
+
     // An unfinished session must not survive into `suspended`: resuming from there
     // would reach `ready` without completing verification or recovery.
     case (.verifying, .defaultOutputChanged(nil)), (.recovering, .defaultOutputChanged(nil)):
-      return (.released, [.closeChannel, .invalidateSession, .failPendingRequests])
+      return (state.releasing(), [.closeChannel, .invalidateSession, .failPendingRequests])
 
     case (.ready, .defaultOutputChanged(nil)):
       return (
@@ -380,11 +438,24 @@ public struct SessionPolicy: Sendable {
         return (state.moved(to: .unverified, isTargetDefaultOutput: true), [.cancelGrace])
       }
 
+    // Every invalidation also fails what is pending on the session: a request left in
+    // flight holds the wire until its own timeout, which then faults whichever
+    // session is live by then. A suspension can hold one admitted before it began.
     case (.suspended, .graceExpired):
-      return (.released, [.cancelGrace, .closeChannel, .invalidateSession])
+      return (
+        state.releasing(),
+        [.cancelGrace, .closeChannel, .invalidateSession, .failPendingRequests]
+      )
 
     case (.suspended, .channelClosedUnexpectedly):
-      return (.released, [.cancelGrace, .invalidateSession, .failPendingRequests])
+      return (state.releasing(), [.cancelGrace, .invalidateSession, .failPendingRequests])
+
+    // The grace exists to resume onto a working channel. One that faulted — a write
+    // that stalled, an answer that never came — would be resumed broken, so it is
+    // let go like a channel that closed; the device reconnects when it is the output
+    // again, the same way it does after the grace runs out.
+    case (.suspended, .sessionFault):
+      return (state.releasing(), teardown(from: state))
 
     case (.connecting, .controlContended):
       // The open hung until its timeout against a device the transport had already
@@ -393,15 +464,46 @@ public struct SessionPolicy: Sendable {
       // control channel (docs/rfcomm-transport-notes.md §7), so that combination is
       // read as contention rather than burned as retry budget: the retry path would
       // hang for the full timeout on every attempt, while `contended` says what is
-      // actually happening and waits for the user or for the output to move.
+      // actually happening. A hang is not proof, though — the async open has been
+      // seen never calling back at all — so contention retries on its own slow
+      // timer as well as waiting for the user or for the output to move.
       // A connecting state whose device stopped being the output has released
       // already, so the guard is only for states constructed by hand.
       guard state.isTargetDefaultOutput else { return failed(state) }
-      return (state.moved(to: .contended), [.cancelOpen])
+      return (state.contending(), [.cancelOpen, .scheduleContentionRetry])
 
     case (.ready, .controlContended), (.verifying, .controlContended),
       (.recovering, .controlContended), (.unverified, .controlContended):
-      return (state.moved(to: .contended), [.closeChannel, .invalidateSession])
+      return (
+        state.contending(),
+        [.closeChannel, .invalidateSession, .failPendingRequests, .scheduleContentionRetry]
+      )
+
+    case (.contended, .backoffExpired):
+      // The try stays `contended` while it is out. Passing through `connecting` swapped
+      // the panel's "another device is in control" for "connecting" for up to the
+      // whole open timeout on every tick, and hid the retry button meanwhile. The
+      // budget starts fresh, like a manual retry: contention is not a failure.
+      // Seizing the session for a device nobody is listening to would take control
+      // away from the host that is, so a tick without the output only re-arms.
+      guard let target = state.target, state.isTargetDefaultOutput else {
+        return (state, [.scheduleContentionRetry])
+      }
+      let attempt = state.attempt.next
+      return (
+        SessionState(
+          phase: .contended,
+          target: target,
+          failureCount: 0,
+          attempt: attempt,
+          isTargetDefaultOutput: true
+        ),
+        [.openChannel(target, attempt)]
+      )
+
+    // The try hung again: still contended, and the next tick is armed.
+    case (.contended, .controlContended):
+      return (state, [.cancelOpen, .scheduleContentionRetry])
 
     case (.ready, .channelClosedUnexpectedly), (.verifying, .channelClosedUnexpectedly),
       (.recovering, .channelClosedUnexpectedly), (.unverified, .channelClosedUnexpectedly):
@@ -419,7 +521,7 @@ public struct SessionPolicy: Sendable {
       return failed(state)
 
     case (.retryWaiting, .backoffExpired):
-      guard let target = state.target else { return (.released, [.cancelBackoff]) }
+      guard let target = state.target else { return (state.releasing(), [.cancelBackoff]) }
       let (next, open) = start(
         connectingTo: target,
         from: state,
@@ -428,12 +530,15 @@ public struct SessionPolicy: Sendable {
       return (next, [.cancelBackoff] + open)
 
     case (.retryWaiting, .defaultOutputChanged(nil)):
-      return (.released, [.cancelBackoff])
+      return (state.releasing(), [.cancelBackoff])
 
-    case (.contended, .defaultOutputChanged(nil)), (.retryExhausted, .defaultOutputChanged(nil)):
-      return (.released, teardown(from: state))
+    case (.contended, .defaultOutputChanged(nil)), (.retryExhausted, .defaultOutputChanged(nil)),
+      (.incompatible, .defaultOutputChanged(nil)):
+      return (state.releasing(), teardown(from: state))
 
-    case (.contended, .manualRetry), (.retryExhausted, .manualRetry):
+    // Incompatibility takes a manual retry too: the button is on screen, and a
+    // firmware update is the one thing that changes the answer.
+    case (.contended, .manualRetry), (.retryExhausted, .manualRetry), (.incompatible, .manualRetry):
       // Seizing the session for a device the user is not listening to would take
       // control away from whichever host actually is.
       guard let target = state.target, state.isTargetDefaultOutput else { return (state, []) }
@@ -505,11 +610,15 @@ public struct SessionPolicy: Sendable {
   /// Releases whatever the phase currently owns, and nothing else.
   private func teardown(from state: SessionState) -> [SessionEffect] {
     switch state.phase {
-    case .released, .sleeping, .contended:
+    case .released, .sleeping, .incompatible:
+      // Incompatibility closed its channel on the way in and owns no timer.
       return []
     case .retryExhausted:
       // Exhaustion owns its slow-cadence retry timer.
       return [.cancelBackoff]
+    case .contended:
+      // Contention owns its timer and, while a try is out, that try's open.
+      return [.cancelBackoff, .cancelOpen]
     case .connecting:
       return [.cancelOpen, .closeChannel]
     case .verifying, .ready, .recovering, .unverified:
@@ -523,6 +632,25 @@ public struct SessionPolicy: Sendable {
 }
 
 extension SessionState {
+  /// `released`, carrying the attempt counter forward. Starting it over would let
+  /// the next connection reuse the number of an attempt abandoned moments earlier,
+  /// and that attempt's late completion would then pass for the live one.
+  fileprivate func releasing() -> SessionState {
+    SessionState(phase: .released, attempt: attempt)
+  }
+
+  /// `contended`, under an attempt number no open owns. The open that timed out into
+  /// it is abandoned, so only a try that contention itself starts can land here.
+  fileprivate func contending() -> SessionState {
+    SessionState(
+      phase: .contended,
+      target: target,
+      failureCount: failureCount,
+      attempt: attempt.next,
+      isTargetDefaultOutput: isTargetDefaultOutput
+    )
+  }
+
   fileprivate func withDefaultOutput(_ isDefaultOutput: Bool) -> SessionState {
     SessionState(
       phase: phase,

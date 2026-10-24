@@ -69,32 +69,6 @@ public enum SessionRequestFailure: Error, Equatable, Sendable {
 /// actors, an invalidation could land after a request had already been admitted
 /// against the state it invalidated.
 public actor SessionCoordinator {
-  public struct Timeouts: Sendable {
-    public var response: Duration
-    public var grace: Duration
-    public var backoffUnit: Duration
-    /// Overrides the dialect-derived readings poll interval. Internal and test-only:
-    /// production always derives the cadence from the dialect, so nothing here can
-    /// bake in a model-specific value.
-    var readingIntervalOverride: Duration?
-
-    // An acknowledgement timeout used to live here, but nothing ever armed it: the
-    // response timeout is the one deadline a request needs, and a reply arriving
-    // without its acknowledgement is recorded on the request rather than timed.
-    public init(
-      response: Duration = .seconds(5),
-      grace: Duration = .seconds(60),
-      // Half a second before the first retry: a headset that drops its channel on a
-      // wearing change is back about a second later, which should feel immediate.
-      // Doubling still spaces persistent failures out to sixteen seconds.
-      backoffUnit: Duration = .milliseconds(500)
-    ) {
-      self.response = response
-      self.grace = grace
-      self.backoffUnit = backoffUnit
-    }
-  }
-
   private let policy: SessionPolicy
   private let opener: any TandemChannelOpening
   private let verifier: any DeviceVerifying
@@ -111,6 +85,7 @@ public actor SessionCoordinator {
   private var fingerprint: TandemDeviceFingerprint?
   private var rejection: TandemDeviceVerificationFailure?
   private var latestReadings = DeviceReadings()
+  private var settingRevisions = SettingRevisions()
   private var readingTask: Task<Void, Never>?
   private let reader = FeatureReader()
 
@@ -130,6 +105,8 @@ public actor SessionCoordinator {
   private var unverifiedWritesPermitted = false
   /// Alternates 0 and 1 across everything we send on a channel.
   private var outgoingSequence: UInt8 = 0
+  /// Every write on the channel, in the order the session made them.
+  private var writeChain = ChannelWriteChain()
   private var notifications: AsyncStream<TandemFrame>.Continuation?
   private var closeWasRequested = false
   /// Touch-panel gesture names heard over the session, added to the support report.
@@ -166,19 +143,7 @@ public actor SessionCoordinator {
   public var unsupportedReason: TandemDeviceVerificationFailure? { rejection }
   public var readings: DeviceReadings { latestReadings }
 
-  /// Everything a panel refresh needs, read in one actor hop so the fields are always
-  /// of the same instant. Taken one accessor at a time, an `invalidate()` could land
-  /// between them and hand the panel a `.ready` phase with a nil fingerprint for a
-  /// frame; with device-scoped rules that momentary nil model name unmatched a rule and
-  /// set noise/EQ flapping. A single hop cannot be interrupted.
-  public struct Snapshot: Sendable {
-    public let phase: SessionState.Phase
-    public let fingerprint: TandemDeviceFingerprint?
-    public let unsupportedReason: TandemDeviceVerificationFailure?
-    public let acceptsWrites: Bool
-    public let readings: DeviceReadings
-  }
-
+  /// Everything a panel refresh needs, in one actor hop (see `Snapshot`).
   public var snapshot: Snapshot {
     Snapshot(
       phase: state.phase,
@@ -200,13 +165,14 @@ public actor SessionCoordinator {
   // MARK: - Events
 
   public func handle(_ event: SessionEvent) async {
-    let previous = state.phase
+    let previous = state
     let (next, effects) = policy.reduce(state, event)
+    SessionLog.transition(from: previous, to: next, on: event)
     state = next
     for effect in effects {
       await run(effect)
     }
-    reconcilePolling(from: previous)
+    reconcilePolling(from: previous.phase)
   }
 
   /// The suspended grace holds the channel but must not keep talking on it: the
@@ -263,17 +229,23 @@ public actor SessionCoordinator {
       graceTask = nil
 
     case .scheduleBackoff(let attempt):
-      backoffTask?.cancel()
-      let delay = timeouts.backoffUnit * Double(1 << min(attempt - 1, 5))
-      backoffTask = Task {
-        try? await Task.sleep(for: delay)
-        guard !Task.isCancelled else { return }
-        await self.handle(.backoffExpired)
-      }
+      armBackoff(after: timeouts.backoffUnit * Double(1 << min(attempt - 1, 5)))
+
+    case .scheduleContentionRetry:
+      armBackoff(after: timeouts.contentionRetry)
 
     case .cancelBackoff:
       backoffTask?.cancel()
       backoffTask = nil
+    }
+  }
+
+  private func armBackoff(after delay: Duration) {
+    backoffTask?.cancel()
+    backoffTask = Task {
+      try? await Task.sleep(for: delay)
+      guard !Task.isCancelled else { return }
+      await self.handle(.backoffExpired)
     }
   }
 
@@ -293,6 +265,7 @@ public actor SessionCoordinator {
     rejection = nil
     unverifiedWritesPermitted = false
     outgoingSequence = 0
+    writeChain = ChannelWriteChain()
     // The gestures heard belong to the device that announced them. Carrying the log
     // across an invalidation would mix the previous device's touch vocabulary into
     // the next device's support report.
@@ -318,8 +291,10 @@ public actor SessionCoordinator {
         // hardware behaves while another host holds its single control channel.
         // An unreachable or unpaired device fails fast with a different error and
         // stays on the ordinary retry path.
+        SessionLog.openFailed(ChannelFailure.openTimedOut)
         await self.handle(.controlContended(attempt))
       } catch {
+        SessionLog.openFailed(error)
         await self.handle(.channelFailed(attempt))
       }
     }
@@ -327,9 +302,12 @@ public actor SessionCoordinator {
 
   private func channelOpened(_ opened: OpenedChannel, attempt: ConnectionAttempt) async {
     // Ask the policy first. It may have moved on, in which case it tells us to close
-    // rather than adopt the channel.
+    // rather than adopt the channel. It adopts a channel exactly when it starts
+    // verifying it; the phase alone cannot say so, because a stale completion leaves
+    // the phase where it was — `verifying`, when the live attempt already landed.
     let (next, effects) = policy.reduce(state, .channelOpened(attempt))
-    guard next.phase == .verifying else {
+    SessionLog.transition(from: state, to: next, on: .channelOpened(attempt))
+    guard effects.contains(.startVerification) else {
       state = next
       await opened.channel.close()
       for effect in effects where !effect.isChannelClose { await run(effect) }
@@ -373,8 +351,11 @@ public actor SessionCoordinator {
     }
 
     let routed = router.route(parsed.frames)
+    // Queued, not awaited: a stalled write here would stop inbound processing, and
+    // with it the answer every waiting request depends on. Queueing still puts each
+    // acknowledgement ahead of any request the answers below go on to unblock.
     for ack in routed.acknowledgements {
-      try? await channel?.write(ack.encoded())
+      if let channel { _ = enqueueWrite(ack.encoded(), on: channel) }
     }
     for event in routed.events {
       deliver(event)
@@ -404,50 +385,27 @@ public actor SessionCoordinator {
     }
   }
 
-  /// A setting changed on the device itself — a touch on the headset, or a change made
-  /// from the phone app — is announced over the channel as an unsolicited frame, not as
-  /// a reply to a request. The periodic read folds such a change in eventually, but only
-  /// on its slow keepalive cadence (up to a reading interval later), which is why a
-  /// noise-control change made by touch took many seconds to reach the panel. Parsing
-  /// the notification here updates the reading at once, so the panel reflects a physical
-  /// change within a refresh tick.
-  ///
-  /// Only a noise-control parameter — what a headphone touch actually changes — is
-  /// handled; every other unsolicited frame is left untouched for the notification
-  /// stream and the gesture log. The reading's shape (modes, field count, wind kind) is
-  /// carried over from what was read, since the notification alone does not restate it.
+  /// A noise-control change made on the device itself is announced unsolicited;
+  /// folding it in at once is what lets a touch on the headset reach the panel within
+  /// a refresh tick (see `NoiseControlReading.applying(unsolicited:)`).
   private func applyUnsolicited(_ frame: TandemFrame) {
-    guard let reading = latestReadings.noiseControl else { return }
-    let bytes = [UInt8](frame.payload)
-    guard bytes.count >= 2, bytes[1] == reading.inquiry else { return }
-    // The device announces a noise-control change with either the return (0x67) or the
-    // notify (0x69) command — the same two the write's read-back listens for.
-    let state: TandemNoiseControlState
-    switch bytes[0] {
-    case 0x67:
-      guard
-        let parsed = try? TandemNoiseControlProtocol.parseParameterResponse(
-          frame, inquiry: reading.inquiry)
-      else { return }
-      state = parsed
-    case 0x69:
-      guard
-        let parsed = try? TandemNoiseControlProtocol.parseParameterNotification(
-          frame, inquiry: reading.inquiry)
-      else { return }
-      state = parsed
-    default:
-      return
-    }
-    guard state != reading.state else { return }
-    latestReadings.noiseControl = NoiseControlReading(
-      inquiry: reading.inquiry,
-      modes: reading.modes,
-      state: state,
-      valueFieldCount: max(bytes.count - 2, reading.valueFieldCount),
-      legacyWindKind: reading.inquiry == TandemNoiseControlProtocol.legacyInquiry && bytes.count > 3
-        ? bytes[3] : reading.legacyWindKind
-    )
+    guard let updated = latestReadings.noiseControl?.applying(unsolicited: frame) else { return }
+    settle(.noiseControl, from: epoch) { $0.noiseControl = updated }
+  }
+
+  /// Stores a setting that changed outside the poll — a write's read-back or the
+  /// device's own announcement — and marks it, so that a poll cycle already under way
+  /// does not put back the value it read before the change. A write can outlive its
+  /// session between the read-back's answer and this store; what it read then
+  /// belongs to a device that is gone, so it is dropped like a stale poll cycle.
+  private func settle(
+    _ setting: DeviceReadings.Setting,
+    from admittedEpoch: SessionEpoch,
+    _ update: (inout DeviceReadings) -> Void
+  ) {
+    guard admittedEpoch == epoch else { return }
+    update(&latestReadings)
+    settingRevisions = settingRevisions.bumping(setting)
   }
 
   private func failPending(with failure: RequestFailure) {
@@ -475,11 +433,16 @@ public actor SessionCoordinator {
         let outcome = try await self.verifier.verify(over: Requester(coordinator: self))
         await self.verificationFinished(outcome, from: admittedEpoch)
       } catch {
-        // Reaching the device failed, which is not the same as the device being
-        // unsupported: one is worth retrying, the other never is. The task inherits
+        // Failing to reach the device is worth retrying; an answer that does not
+        // parse is not, because asking again gets the same answer. The task inherits
         // the coordinator's isolation, so the epoch read is a plain same-actor call.
         guard self.epoch == admittedEpoch else { return }
-        await self.handle(.verificationFailedTransient)
+        let kind = VerificationFailureKind(error)
+        SessionLog.verificationFailed(error, kind: kind)
+        switch kind {
+        case .transient: await self.handle(.verificationFailedTransient)
+        case .deterministic: await self.handle(.verificationFailedPermanently)
+        }
       }
     }
   }
@@ -526,6 +489,7 @@ public actor SessionCoordinator {
     let admittedEpoch = epoch
     readingTask = Task { [reader] in
       while !Task.isCancelled {
+        let started = self.settingRevisions
         let readings = await reader.read(
           declaring: functions,
           dialect: dialect,
@@ -535,22 +499,33 @@ public actor SessionCoordinator {
         // task without moving the epoch, and the partial result of the interrupted
         // cycle would erase fields the session still holds.
         guard !Task.isCancelled else { return }
-        // The task inherits the coordinator's isolation, so the store is a plain
-        // same-actor call; the reads above are where the suspensions happen.
-        self.store(readings, from: admittedEpoch)
+        // The task inherits the coordinator's isolation, so the store is a same-actor
+        // call; the reads above are where the suspensions happen.
+        await self.store(readings, from: admittedEpoch, startedAt: started)
         try? await Task.sleep(for: interval)
       }
     }
   }
 
-  private func store(_ readings: DeviceReadings, from readEpoch: SessionEpoch) {
+  private func store(
+    _ readings: DeviceReadings,
+    from readEpoch: SessionEpoch,
+    startedAt started: SettingRevisions
+  ) async {
     // A read can outlive the session it was started for: `FeatureReader` swallows
     // per-request failures, so a read interrupted by an invalidation still returns a
     // partial result afterwards. Storing that would resurrect the previous device's
     // values — and let a write against the next device pass `apply`'s guards with
     // the previous device's inquiry and field count.
     guard readEpoch == epoch else { return }
-    latestReadings = readings
+    // A setting written or announced while the cycle ran is newer than what it read.
+    latestReadings = readings.keeping(
+      settingRevisions.settingsChanged(since: started),
+      from: latestReadings
+    )
+    // A cycle that reached here survived every request it made, which is the proof of
+    // a working session the policy waits for before restoring a spent budget.
+    if state.failureCount > 0 { await handle(.sessionProvedStable) }
   }
 
   /// The raw read-only capability exchanges for a support report, gathered over the
@@ -574,24 +549,6 @@ public actor SessionCoordinator {
 
   // MARK: - Writing
 
-  public enum WriteFailure: Error, Equatable, Sendable {
-    case notPermitted
-    case unsupported
-    /// The device answered, but with something other than what was asked for. The
-    /// value in hand is what it actually holds.
-    case notApplied(TandemNoiseControlState)
-    case notAppliedListening(TandemListeningSelection)
-    /// The equaliser read-back did not hold the requested preset or bands. The values
-    /// carried are what the device actually holds.
-    case notAppliedEqualizer(selectedPreset: UInt8?, bandSteps: [Int])
-    /// The speak-to-chat read-back did not hold the requested values.
-    case notAppliedSpeakToChat(SpeakToChatReading)
-    /// The sidetone read-back did not hold the requested value. What is carried is
-    /// what the device actually holds.
-    case notAppliedSidetone(SidetoneReading)
-    case failed(SessionRequestFailure)
-  }
-
   /// Sends a noise-control change and reads it back.
   ///
   /// The read-back is the only check there is on an unverified model: the encoding
@@ -603,6 +560,7 @@ public actor SessionCoordinator {
   /// happens once, on the value the drag settles on.
   public func apply(noiseControl target: TandemNoiseControlState, isFinal: Bool = true) async throws {
     guard acceptsWrites else { throw WriteFailure.notPermitted }
+    let admittedEpoch = epoch
     guard let reading = latestReadings.noiseControl else {
       throw WriteFailure.unsupported
     }
@@ -649,7 +607,7 @@ public actor SessionCoordinator {
     }
 
     let confirmed = try await readNoiseControlNow(inquiry)
-    latestReadings.noiseControl = confirmed
+    settle(.noiseControl, from: admittedEpoch) { $0.noiseControl = confirmed }
     guard confirmed.state == target else {
       throw WriteFailure.notApplied(confirmed.state)
     }
@@ -663,6 +621,7 @@ public actor SessionCoordinator {
   /// device declared, so a device without listening modes is never written to here.
   public func apply(listeningSelection target: TandemListeningSelection) async throws {
     guard acceptsWrites else { throw WriteFailure.notPermitted }
+    let admittedEpoch = epoch
     guard let reading = latestReadings.listeningMode, !reading.features.isEmpty else {
       throw WriteFailure.unsupported
     }
@@ -684,7 +643,7 @@ public actor SessionCoordinator {
     }
 
     let confirmed = try await readListeningNow(features: reading.features)
-    latestReadings.listeningMode = confirmed
+    settle(.listeningMode, from: admittedEpoch) { $0.listeningMode = confirmed }
     guard confirmed.selection == target else {
       throw WriteFailure.notAppliedListening(confirmed.selection)
     }
@@ -728,6 +687,7 @@ public actor SessionCoordinator {
     isFinal: Bool = true
   ) async throws {
     guard acceptsWrites else { throw WriteFailure.notPermitted }
+    let admittedEpoch = epoch
     guard let reading = latestReadings.equalizer else { throw WriteFailure.unsupported }
     let inquiry = TandemReadOnlyEqualizer.inquiry(for: fingerprint?.dialect ?? .current)
     // The older generation writes band levels against "the current preset" (0xFF)
@@ -750,7 +710,7 @@ public actor SessionCoordinator {
     guard isFinal else { return }
 
     let confirmed = try await readEqualizerParameterNow(reading)
-    latestReadings.equalizer = confirmed
+    settle(.equalizer, from: admittedEpoch) { $0.equalizer = confirmed }
     // A preset selection is judged on the preset; a band write on the bands. The
     // preset byte of a legacy band write is an addressing detail ("the current
     // preset"), so the bands are the requested value there.
@@ -772,6 +732,7 @@ public actor SessionCoordinator {
   /// reason as the listening writes; the read-back is the check.
   public func apply(speakToChatEnabled isEnabled: Bool) async throws {
     guard acceptsWrites else { throw WriteFailure.notPermitted }
+    let admittedEpoch = epoch
     guard let reading = latestReadings.speakToChat else { throw WriteFailure.unsupported }
     try? await writeWithoutReply {
       try TandemSpeakToChatProtocol.setEnabledRequest(
@@ -782,7 +743,7 @@ public actor SessionCoordinator {
       )
     }
     let confirmed = try await readSpeakToChatNow(reading)
-    latestReadings.speakToChat = confirmed
+    settle(.speakToChat, from: admittedEpoch) { $0.speakToChat = confirmed }
     guard confirmed.isEnabled == isEnabled else {
       throw WriteFailure.notAppliedSpeakToChat(confirmed)
     }
@@ -793,6 +754,7 @@ public actor SessionCoordinator {
     timeout: TandemSpeakToChatTimeout
   ) async throws {
     guard acceptsWrites else { throw WriteFailure.notPermitted }
+    let admittedEpoch = epoch
     guard let reading = latestReadings.speakToChat else { throw WriteFailure.unsupported }
     try? await writeWithoutReply {
       try TandemSpeakToChatProtocol.setDetailRequest(
@@ -803,7 +765,7 @@ public actor SessionCoordinator {
       )
     }
     let confirmed = try await readSpeakToChatNow(reading)
-    latestReadings.speakToChat = confirmed
+    settle(.speakToChat, from: admittedEpoch) { $0.speakToChat = confirmed }
     guard confirmed.sensitivity == sensitivity, confirmed.timeout == timeout else {
       throw WriteFailure.notAppliedSpeakToChat(confirmed)
     }
@@ -816,6 +778,7 @@ public actor SessionCoordinator {
   /// as the listening writes; the read-back is the check.
   public func apply(sidetoneEnabled isEnabled: Bool) async throws {
     guard acceptsWrites else { throw WriteFailure.notPermitted }
+    let admittedEpoch = epoch
     guard let reading = latestReadings.sidetone, reading.isEnabled != nil else {
       throw WriteFailure.unsupported
     }
@@ -827,7 +790,7 @@ public actor SessionCoordinator {
       )
     }
     let confirmed = try await readSidetoneNow(reading)
-    latestReadings.sidetone = confirmed
+    settle(.sidetone, from: admittedEpoch) { $0.sidetone = confirmed }
     guard confirmed.isEnabled == isEnabled else {
       throw WriteFailure.notAppliedSidetone(confirmed)
     }
@@ -964,11 +927,34 @@ public actor SessionCoordinator {
     }
     outgoingSequence ^= 1
 
-    do {
-      try await channel.write(frame.encoded())
-    } catch let failure as ChannelFailure {
+    // Bounded by the chain: with nothing to answer it, this write had no deadline at
+    // all, and a stalled one stopped the drag and every write behind it for good.
+    if case .failure(let failure) = await enqueueWrite(frame.encoded(), on: channel).value {
       throw SessionRequestFailure.channel(failure)
     }
+  }
+
+  /// Queues a write on the session's chain. A write that overruns its bound means the
+  /// remote stopped granting flow control, which does not clear by itself — and every
+  /// later write would queue behind it — so the session it belonged to is rebuilt.
+  private func enqueueWrite(
+    _ data: Data,
+    on channel: any TandemChannel
+  ) -> ChannelWriteChain.Outcome {
+    let (chain, outcome) = writeChain.appending(data, to: channel, within: timeouts.write)
+    writeChain = chain
+    let admittedEpoch = epoch
+    Task {
+      guard case .failure(.writeTimedOut) = await outcome.value else { return }
+      await self.writeStalled(in: admittedEpoch)
+    }
+    return outcome
+  }
+
+  private func writeStalled(in admittedEpoch: SessionEpoch) async {
+    guard admittedEpoch == epoch else { return }
+    SessionLog.writeStalled()
+    await handle(.sessionFault(.writeStalled))
   }
 
   /// Internal rather than fileprivate so the serialization and attribution can be
@@ -1065,19 +1051,17 @@ public actor SessionCoordinator {
         epoch: admittedEpoch,
         matches: matching,
         continuation: continuation,
-        faultsOnTimeout: faultsOnTimeout
+        faultsOnTimeout: faultsOnTimeout,
+        label: SessionLog.label(ofRequest: frame.payload)
       )
+      // Armed before the write, not after it: a write held by flow control never
+      // returns, and a deadline that waits for it left the request — and every one
+      // queued behind it — in flight for good.
+      scheduleResponseTimeout(id)
+      let written = enqueueWrite(frame.encoded(), on: channel)
       Task {
-        do {
-          try await channel.write(frame.encoded())
-        } catch let failure as ChannelFailure {
-          await self.finish(id, with: .channel(failure))
-          return
-        } catch {
-          await self.finish(id, with: .channel(.closed))
-          return
-        }
-        await self.scheduleResponseTimeout(id)
+        guard case .failure(let failure) = await written.value else { return }
+        await self.finish(id, with: .channel(failure))
       }
     }
   }
@@ -1085,8 +1069,11 @@ public actor SessionCoordinator {
   /// Whether the request currently on the wire has been acknowledged. Exposed for
   /// tests: acknowledgement handling has no other observable surface.
   var inFlightAcknowledged: Bool? { inFlight?.lifecycle.isAcknowledged }
+  /// The failure budget spent so far. Exposed for tests: until it runs out, the
+  /// budget has no other observable surface.
+  var failureCount: Int { state.failureCount }
 
-  private func scheduleResponseTimeout(_ id: OperationID) async {
+  private func scheduleResponseTimeout(_ id: OperationID) {
     Task { [timeouts] in
       try? await Task.sleep(for: timeouts.response)
       await self.responseTimedOut(id)
@@ -1100,11 +1087,14 @@ public actor SessionCoordinator {
     request.lifecycle.handle(.responseTimedOut)
     guard case .failed(let failure) = request.lifecycle.outcome else { return }
     request.continuation.resume(throwing: SessionRequestFailure.failed(failure))
-    guard request.faultsOnTimeout else { return }
     // An unanswered request leaves us unable to attribute anything that arrives
     // later, so the session is rebuilt rather than continued. A probe opts out: it
     // expects some functions to go unanswered and must not tear down a working
-    // session to discover that.
+    // session to discover that. Only the session the request was sent on is at
+    // fault; a request that outlived its session must not fault the next one.
+    let faultsSession = request.faultsOnTimeout && request.epoch == epoch
+    SessionLog.unanswered(request.label, faultsSession: faultsSession)
+    guard faultsSession else { return }
     await handle(.sessionFault(.responseTimedOut))
   }
 
@@ -1123,6 +1113,8 @@ public actor SessionCoordinator {
     /// False for a probe, whose timeout fails only itself; true for a request, whose
     /// timeout rebuilds the session.
     let faultsOnTimeout: Bool
+    /// Command and inquiry, for the log when the request goes unanswered.
+    let label: String
 
     func matches(_ frame: TandemFrame) -> Bool { matches(frame) }
   }
