@@ -6,8 +6,12 @@ import os
 /// カメラのヘッドトラッキングを共通シートから駆動する。
 ///
 /// パイプラインは カメラ(Vision) → 較正(PoseCenter) → スムージング(RotationOneEuroFilter)
-/// → ロスト受け皿(TrackingBlend) → 空間オーディオのリスナー向き。数学はすべて
-/// SpatialAudioKit の純粋型で、ここはその結線と UI 状態だけを持つ。
+/// → 後ろ向きの切り替え(FacingAwayGate) → ロスト・後ろ向きの受け皿(TrackingBlend)
+/// → 空間オーディオのリスナー向き。数学はすべて SpatialAudioKit の純粋型で、ここは
+/// その結線と UI 状態だけを持つ。
+///
+/// 顔が見えないとき、誰も写っていなければ音場は正面へ戻し、背を向けた人が写っていれば
+/// 真後ろへ回す（後ろを向いた聴き手にとって、Mac は背後にあるため）。
 ///
 /// カメラは完全オプトイン: トグル操作の後にだけ許可を求め、オフ・アプリ終了で必ず止める。
 /// フレームはプロバイダの外に出ず、ここへ届くのは角度と信頼状態だけ。
@@ -32,6 +36,9 @@ final class HeadTrackingController: ObservableObject {
     case tracking
     /// 顔を見失っている（暗所・横向き・離席）。音場はゆっくり正面へ戻る。
     case faceLost
+    /// 人は写っているが顔が見えない — 後ろを向いている。音場を真後ろへ回す。
+    /// 映像は届き続けているので、途絶（watchdog）とは別物。
+    case facingAway
     case denied
     case failed(String)
   }
@@ -72,11 +79,11 @@ final class HeadTrackingController: ObservableObject {
     }
   }
 
-  /// トグルの見た目。許可待ち・較正中・見失い中もオンとして扱う。
+  /// トグルの見た目。許可待ち・較正中・見失い中・後ろ向きの間もオンとして扱う。
   var isEnabled: Bool {
     switch status {
     case .off, .denied, .failed: false
-    case .requestingPermission, .calibrating, .tracking, .faceLost: true
+    case .requestingPermission, .calibrating, .tracking, .faceLost, .facingAway: true
     }
   }
 
@@ -96,6 +103,7 @@ final class HeadTrackingController: ObservableObject {
   private var center: PoseCenter
   private var filter = RotationOneEuroFilter()
   private var blend = TrackingBlend()
+  private var facing = FacingAwayGate()
   private var distance: RelativeDistanceEstimator?
   private var lastTime: Double?
   private var receivedAnySample = false
@@ -165,10 +173,13 @@ final class HeadTrackingController: ObservableObject {
   /// いまの顔向きを新しい「正面」にする。較正をやり直すだけ。
   /// 追跡が確立した後にだけ意味がある — 許可待ちや較正中に呼ばれても何もしない
   /// （許可待ち中に状態を書き換えると、許可の返事が宙に浮く）。
+  /// 後ろ向きの間も何もしない: 正面にする顔の向きが無く、較正中は音場を動かさないので、
+  /// 顔が戻るまで音場が真後ろに置き去りになる。
   func recenter() {
     guard status == .tracking || status == .faceLost else { return }
     center = PoseCenter(sampleTarget: calibrationSamples)
     filter = RotationOneEuroFilter()
+    facing = FacingAwayGate()
     distance = nil
     calibrationMisses = 0
     status = .calibrating
@@ -339,6 +350,7 @@ final class HeadTrackingController: ObservableObject {
     center = PoseCenter(sampleTarget: calibrationSamples)
     filter = RotationOneEuroFilter()
     blend = TrackingBlend()
+    facing = FacingAwayGate()
     distance = nil
     lastTime = nil
     receivedAnySample = false
@@ -434,7 +446,8 @@ final class HeadTrackingController: ObservableObject {
           status = .tracking
         }
       } else {
-        // 較正中のロストは待つ — ただし永久には待たない。
+        // 較正中のロストは待つ — ただし永久には待たない。後ろ向きのフレームも同じく
+        // 見逃しとして数えるだけ: 正面の基準が無いうちは「後ろ」も定まらない。
         calibrationMisses += 1
         if calibrationMisses >= calibrationMissLimit {
           fail(
@@ -463,16 +476,36 @@ final class HeadTrackingController: ObservableObject {
     }
     let ratioForBlend = distanceEnabled ? measuredRatio : 1.0
 
-    let (output, blendedRatio) = blend.advance(
-      tracked: tracked,
-      distanceRatio: tracked == nil ? nil : ratioForBlend,
-      dt: dt
-    )
-    let nextStatus: Status = tracked == nil ? .faceLost : .tracking
+    let mode = facing.update(with: sample, dt: dt)
+    let target: TrackingBlend.Target
+    if let tracked {
+      target = .tracked(tracked, distanceRatio: ratioForBlend)
+    } else {
+      target = mode == .facingAway ? .facingAway : .lost
+    }
+    let (output, blendedRatio) = blend.advance(target, dt: dt)
+
+    let nextStatus: Status =
+      switch mode {
+      case .tracking: .tracking
+      case .lost: .faceLost
+      case .facingAway: .facingAway
+      }
     if status != nextStatus {
+      logFacingAwayChange(from: status, to: nextStatus)
       status = nextStatus
     }
     applyPose?(output.listenerOrientation, blendedRatio)
+  }
+
+  /// 後ろ向きへの出入りを残す。状態の名前だけで、画像や姿勢の数値は書かない。
+  private func logFacingAwayChange(from previous: Status, to next: Status) {
+    if next == .facingAway {
+      Self.log.info("Facing away: turning the sound field behind the listener")
+    } else if previous == .facingAway {
+      let reason = next == .tracking ? "the face is back" : "no one facing away is in view"
+      Self.log.info("No longer facing away (\(reason, privacy: .public))")
+    }
   }
 
   /// 中断して理由を告げる。カメラは必ず止める（「使用中」の表示とランプを残さない）。

@@ -4,8 +4,8 @@ import SwiftUI
 /// The right three fifths of the spatial-audio sheet: camera head tracking. The toggle
 /// is gated on the spatialiser being on — orientation goes nowhere without a running
 /// engine — and every state the camera can be in (permission, calibration, tracking,
-/// lost) is said out loud, because an active camera must never be a mystery. For the
-/// same reason the heading names the camera that will light up.
+/// lost, facing away) is said out loud, because an active camera must never be a
+/// mystery. For the same reason the heading names the camera that will light up.
 struct HeadTrackingColumn: View {
   @ObservedObject var spatial: SpatialAudioController
   @ObservedObject var headTracking: HeadTrackingController
@@ -93,6 +93,12 @@ struct HeadTrackingColumn: View {
     case .faceLost:
       caption(
         L("顔を見失っています — 音場をゆっくり正面へ戻します。", "Face lost — easing the sound field back to front.")
+      )
+    case .facingAway:
+      // No recenter here: with the face out of view there is no direction to take as
+      // the new front.
+      caption(
+        L("後ろ向き — 音場を背後へ回します。", "Facing away — turning the sound field behind you.")
       )
     case .denied:
       warning(
