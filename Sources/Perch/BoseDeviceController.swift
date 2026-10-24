@@ -392,8 +392,11 @@ final class BoseDeviceController: ObservableObject {
     /// Whether any GET in this call came back parsed. The only evidence the link is alive.
     var readSomething = false
 
-    // Every GET is gated on the config declaring the address, so a model is never asked
-    // for a block it would refuse — the whole point of the config carrying a feature set.
+    // Every GET is gated on the config, so a model is never asked for a block it would
+    // refuse — the whole point of the config carrying its capabilities. The single
+    // addresses go by its feature set; the block-31 mode reads go by its declared mode
+    // slots instead (`supportsModeBlock`, and `modeSlots`, empty without block 31), not by
+    // `.modeConfig` in the feature set.
     if includingStable {
       if config.supports(.deviceName) {
         snap.modelName = try? await readModelName(session)
