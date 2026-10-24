@@ -17,11 +17,12 @@ import os
 /// it merely stops holding up the writes behind it.
 @MainActor
 struct DeviceWriteChain {
-  /// Twice the session's own response deadline. A write that is merely slow — queued
-  /// behind the readings poll, or riding out one unanswered read-back until the session
-  /// faults it — finishes inside this, so only a write the session failed to bound at
-  /// all is given up on.
-  nonisolated static let defaultLimit: Duration = SessionCoordinator.Timeouts().response * 2
+  /// Three of the session's own response deadlines. A write that is merely slow can
+  /// take about two — queued behind the readings poll, one read-back answered just
+  /// inside its deadline and another that runs out until the session faults it — so
+  /// the limit keeps a whole deadline of margin over that, and only a write the session
+  /// failed to bound at all is given up on.
+  nonisolated static let defaultLimit: Duration = SessionCoordinator.Timeouts().response * 3
 
   private static let log = Logger(subsystem: "dev.perch.mac", category: "DeviceWrite")
 

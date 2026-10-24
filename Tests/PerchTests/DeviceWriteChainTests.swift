@@ -79,9 +79,10 @@ func promptWriteFreesTheChainAtOnce() async {
   await timer.drain()
 }
 
-@Test("The limit sits well past the session's own response deadline")
+@Test("The limit leaves a full response deadline of margin over a merely slow write")
 func limitOutlastsTheSessionDeadline() {
-  // A merely slow write — queued behind the readings poll, or riding out one
-  // unanswered read-back until the session faults it — must never be given up on.
-  #expect(DeviceWriteChain.defaultLimit > SessionCoordinator.Timeouts().response)
+  // A merely slow write can take about two response deadlines — one read-back answered
+  // just inside its deadline, then another that runs out and faults the session. It
+  // must never be given up on, so the limit sits a whole deadline beyond that.
+  #expect(DeviceWriteChain.defaultLimit >= SessionCoordinator.Timeouts().response * 3)
 }
