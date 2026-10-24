@@ -23,12 +23,31 @@ public final class NotchWindow: NSPanel {
     ignoresMouseEvents = true
   }
 
-  public override var canBecomeKey: Bool { true }
+  /// Only while open. The panel takes the keyboard when a control in it is clicked —
+  /// a non-activating panel can, without bringing the app forward — and a strip that
+  /// could still become key while closed would hold the keyboard from an invisible window.
+  public override var canBecomeKey: Bool { !ignoresMouseEvents }
   public override var canBecomeMain: Bool { false }
 
-  /// Interactive only while something is on screen to interact with.
+  /// Interactive only while something is on screen to interact with. Leaving that state
+  /// also hands the keyboard back: nothing else would, and typing would keep landing
+  /// in a transparent strip until the user clicked their own window again.
   public func setInteractive(_ interactive: Bool) {
-    ignoresMouseEvents = !interactive
+    if ignoresMouseEvents == interactive { ignoresMouseEvents = !interactive }
+    guard !interactive, isKeyWindow else { return }
+    // On the next pass of the run loop, not inside the event that closed the panel —
+    // that may be a press on a control in this very window, still being dispatched.
+    DispatchQueue.main.async { [weak self] in self?.relinquishKey() }
+  }
+
+  /// Ordering out passes key status to the window behind — for a non-activating panel,
+  /// back to the app the user was typing in — and ordering straight back in keeps the
+  /// closed bar on screen. Not interactive by now, the strip refuses key on the way
+  /// back. Checked again here: the panel may have been reopened in the meantime.
+  private func relinquishKey() {
+    guard ignoresMouseEvents, isKeyWindow else { return }
+    orderOut(nil)
+    orderFrontRegardless()
   }
 }
 
