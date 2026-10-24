@@ -11,9 +11,11 @@ import os
 /// succeeds even without the system-audio recording grant — such a tap just delivers
 /// silence — so turning on asks the tap itself whether recording is allowed, and turns
 /// on at once when it is, even with nothing playing. When the tap cannot tell, real
-/// audio has to arrive first. A refusal (or no audio) reverts and says why; the policy
-/// lives in `CaptureSupervisor`. The on/off state is not persisted; a launch never starts
-/// capturing on its own. The sub-options are remembered.
+/// audio has to arrive first. A refusal (or no audio) reverts and says why. While on,
+/// the capture stays watched: a tap that falls silent while other apps play is rebuilt
+/// once, then given up on. The policy lives in `CaptureSupervisor`. The on/off state is
+/// not persisted; a launch never starts capturing on its own. The sub-options are
+/// remembered.
 @MainActor
 final class SpatialAudioController: ObservableObject {
   @Published private(set) var isEnabled = false
@@ -49,7 +51,10 @@ final class SpatialAudioController: ObservableObject {
   private static let log = Logger(subsystem: "dev.perch.mac", category: "spatial")
 
   private var engine: (any SpatialCaptureEngine)?
+  /// The engine's audible-block count at the previous look; a new engine starts at zero.
+  private var lastAudibleBlocks = 0
   private let makeEngine: SpatialEngineFactory
+  private let othersPlaying: () -> Bool?
   private let timing: CaptureSupervisor.Timing
   private var supervisor: CaptureSupervisor?
   /// The last grant the tap reported, so the log records changes rather than every look.
@@ -68,14 +73,18 @@ final class SpatialAudioController: ObservableObject {
   /// - Parameters:
   ///   - makeEngine: builds and starts the capture engine. The default is the real
   ///     spatialiser over a process tap; tests pass a fake so no tap is ever created.
+  ///   - othersPlaying: whether a process other than Perch is outputting audio (nil when
+  ///     unreadable) — what tells a tap that lost capture from one that hears silence.
   ///   - timing: how often the capture is looked at, and how long each wait may last.
   init(
     defaults: UserDefaults = .standard,
     makeEngine: @escaping SpatialEngineFactory = SpatialEngines.makeSpatializer,
+    othersPlaying: @escaping () -> Bool? = { AudibleProcesses.isAnotherProcessOutputting() },
     timing: CaptureSupervisor.Timing = CaptureSupervisor.Timing()
   ) {
     self.defaults = defaults
     self.makeEngine = makeEngine
+    self.othersPlaying = othersPlaying
     self.timing = timing
     autoBalance = defaults.object(forKey: Keys.auto) as? Bool ?? true
     wander = defaults.object(forKey: Keys.wander) as? Bool ?? true
@@ -101,6 +110,7 @@ final class SpatialAudioController: ObservableObject {
   private func buildEngine() throws {
     engine?.stop()
     engine = nil
+    lastAudibleBlocks = 0
     engine = try makeEngine(options) { [weak self] in
       Task { @MainActor [weak self] in
         self?.handleEngineConfigurationChange()
@@ -130,8 +140,8 @@ final class SpatialAudioController: ObservableObject {
     superviseCapture()
   }
 
-  /// Looks at the capture every tick and carries out what the supervisor decides, until
-  /// the attempt is settled.
+  /// Looks at the capture every tick and carries out what the supervisor decides — while
+  /// turning on, then for as long as spatial audio stays on.
   private func superviseCapture() {
     superviseTask?.cancel()
     superviseTask = Task { @MainActor [weak self] in
@@ -146,9 +156,13 @@ final class SpatialAudioController: ObservableObject {
   /// One tick of supervision. Returns whether supervision goes on.
   private func superviseOnce() -> Bool {
     guard var supervisor, let engine else { return false }
+    let audible = engine.audibleBlockCount
+    let hasSignal = audible > lastAudibleBlocks
+    lastAudibleBlocks = audible
     let decision = supervisor.observe(
-      hasSignal: engine.hasAudioSignal,
+      hasSignal: hasSignal,
       after: supervisor.pollInterval,
+      othersPlaying: othersPlaying,
       permission: { probePermission(of: engine) }
     )
     self.supervisor = supervisor
@@ -178,12 +192,15 @@ final class SpatialAudioController: ObservableObject {
       isEnabled = true
       clearError()
       startTempoPolling()
-      // Turning on is settled.
-      return false
+      // From here on the same loop watches the running capture.
+      return true
     case .rebuild:
-      Self.log.notice("rebuilding the tap")
+      Self.log.notice(
+        "\(self.isEnabled ? "tap silent while other audio plays" : "grant arrived while confirming", privacy: .public); rebuilding the tap"
+      )
       do {
         try buildEngine()
+        restoreListenerPose()
         return true
       } catch {
         Self.log.error("rebuild failed: \(String(describing: error), privacy: .public)")
@@ -250,16 +267,20 @@ final class SpatialAudioController: ObservableObject {
     guard isEnabled else { return }
     do {
       try buildEngine()
-      if let listenerOrientation {
-        engine?.updateListener(listenerOrientation)
-        engine?.setListenerDistance(ratio: listenerDistanceRatio)
-      }
+      restoreListenerPose()
       clearError()
     } catch {
       Self.log.error("reconfigure failed: \(String(describing: error), privacy: .public)")
       teardown()
       errorMessage = L("空間オーディオを再設定できませんでした。", "Could not reconfigure Spatial Audio.")
     }
+  }
+
+  /// Hands a rebuilt engine the pose the previous one had.
+  private func restoreListenerPose() {
+    guard let listenerOrientation else { return }
+    engine?.updateListener(listenerOrientation)
+    engine?.setListenerDistance(ratio: listenerDistanceRatio)
   }
 
   /// Follows the engine's tempo estimate while capture runs. The engine object may be
@@ -315,6 +336,11 @@ extension CaptureSupervisor.Revocation {
       L(
         "音声を検出できませんでした。何か再生してからお試しください。",
         "No audio detected. Play something, then try again."
+      )
+    case .captureLost:
+      L(
+        "再生中の音声を取り込めなくなったため、空間オーディオをオフにしました。続く場合は、システムオーディオ録音の許可を確認してください。",
+        "Spatial Audio turned off because the playing audio could no longer be captured. If this keeps happening, check the system audio recording permission."
       )
     }
   }

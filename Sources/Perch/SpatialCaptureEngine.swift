@@ -6,8 +6,9 @@ import SpatialAudioKit
 /// without ever creating a process tap (which would raise the system-audio prompt).
 @MainActor
 protocol SpatialCaptureEngine: AnyObject {
-  /// Whether a non-silent sample has been captured since this engine started.
-  var hasAudioSignal: Bool { get }
+  /// Blocks with a non-silent sample captured since this engine started. A count that
+  /// grew between two looks means audio arrived in between.
+  var audibleBlockCount: Int { get }
   /// The system-audio recording grant, asked of the running tap.
   func probeCapturePermission() -> SystemAudioPermission
   /// The tempo heard in the captured audio; nil while no steady beat is found.
