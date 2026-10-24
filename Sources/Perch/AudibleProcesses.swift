@@ -16,7 +16,8 @@ enum AudibleProcesses {
     /// pid or bundle ID.
     let objectID: AudioObjectID
     let bundleID: String?
-    let isRunningOutput: Bool
+    /// nil when it cannot be read — which is not the same as "not outputting".
+    let isRunningOutput: Bool?
   }
 
   /// nil when the process objects cannot be read — older macOS or a Core Audio error —
@@ -28,25 +29,34 @@ enum AudibleProcesses {
   /// Whether a process other than Perch is outputting audio. Perch itself is left out:
   /// while spatial audio runs, its own output is the spatialised copy of everyone else's.
   /// It is told apart by its process object, translated from its pid the same way the tap
-  /// excludes it. nil when the process objects, or Perch's own, cannot be read —
+  /// excludes it. nil when the process objects, or Perch's own, cannot be read, or when
+  /// another process's output state cannot be read and none is known to be outputting —
   /// "unknown", not silence.
   static func isAnotherProcessOutputting() -> Bool? {
     guard #available(macOS 14.4, *), let ownObject = SystemAudioTap.currentProcessObjectID()
     else { return nil }
-    return snapshots().map { anyOutputting($0, excluding: ownObject) }
+    return snapshots().flatMap { anyOutputting($0, excluding: ownObject) }
   }
 
+  /// Only processes known to be outputting: the artist rules ask "who is making sound",
+  /// and an unreadable state does not answer it.
   static func bundleIDs(outputtingIn snapshots: [Snapshot]) -> Set<String> {
     Set(
       snapshots
-        .filter(\.isRunningOutput)
+        .filter { $0.isRunningOutput == true }
         .compactMap(\.bundleID)
         .filter { !$0.isEmpty }
     )
   }
 
-  static func anyOutputting(_ snapshots: [Snapshot], excluding ownObject: AudioObjectID) -> Bool {
-    snapshots.contains { $0.isRunningOutput && $0.objectID != ownObject }
+  /// true once another process is known to be outputting; otherwise nil if any other
+  /// process's state could not be read (it may be the one playing); false only when
+  /// every other process is known to be quiet. Perch's own state does not matter.
+  static func anyOutputting(_ snapshots: [Snapshot], excluding ownObject: AudioObjectID) -> Bool? {
+    let others = snapshots.filter { $0.objectID != ownObject }
+    if others.contains(where: { $0.isRunningOutput == true }) { return true }
+    if others.contains(where: { $0.isRunningOutput == nil }) { return nil }
+    return false
   }
 
   private static func snapshots() -> [Snapshot]? {
@@ -72,14 +82,15 @@ enum AudibleProcesses {
       let outputting = isRunningOutput(process)
       return Snapshot(
         objectID: process,
-        bundleID: outputting ? bundleID(process) : nil,
+        bundleID: outputting == true ? bundleID(process) : nil,
         isRunningOutput: outputting
       )
     }
   }
 
   @available(macOS 14.4, *)
-  private static func isRunningOutput(_ process: AudioObjectID) -> Bool {
+  /// nil when the state cannot be read.
+  private static func isRunningOutput(_ process: AudioObjectID) -> Bool? {
     var address = AudioObjectPropertyAddress(
       mSelector: kAudioProcessPropertyIsRunningOutput,
       mScope: kAudioObjectPropertyScopeGlobal,
@@ -88,7 +99,7 @@ enum AudibleProcesses {
     var running: UInt32 = 0
     var size = UInt32(MemoryLayout<UInt32>.size)
     guard AudioObjectGetPropertyData(process, &address, 0, nil, &size, &running) == noErr else {
-      return false
+      return nil
     }
     return running != 0
   }
