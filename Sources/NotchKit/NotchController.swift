@@ -295,13 +295,11 @@ public final class NotchController: ObservableObject {
     let overNotch = isOverNotch(click.location)
     let insidePanel = panelTarget.contains(click.location)
     let catcherNumber = catcher?.windowNumber
-    Self.log.debug(
-      """
-      click via \(click.route.rawValue, privacy: .public) at \
-      (\(Double(click.location.x)), \(Double(click.location.y))), count \
-      \(click.clickCount): over notch \(overNotch), on catcher \
-      \(click.landed(onWindow: catcherNumber)), inside panel \(insidePanel)
-      """
+    logClick(
+      click,
+      onCatcher: click.landed(onWindow: catcherNumber),
+      overNotch: overNotch,
+      insidePanel: insidePanel
     )
     let event = Self.presenterEvent(
       for: click,
@@ -315,6 +313,42 @@ public final class NotchController: ObservableObject {
       return
     }
     apply()
+  }
+
+  /// The route and the verdicts always; the level and whether the location goes in by
+  /// `ClickLogPolicy`.
+  private func logClick(
+    _ click: PointerClick, onCatcher: Bool, overNotch: Bool, insidePanel: Bool
+  ) {
+    let policy = ClickLogPolicy(
+      route: click.route,
+      landedOnCatcher: onCatcher,
+      isOverNotch: overNotch,
+      isInsidePanel: insidePanel,
+      presentation: presenter.presentation
+    )
+    // `.default` is the level `Logger.notice` writes at — the lowest one persisted.
+    let level: OSLogType = policy.isNotable ? .default : .debug
+    let route = click.route.rawValue
+    if policy.recordsLocation {
+      Self.log.log(
+        level: level,
+        """
+        click via \(route, privacy: .public) at \
+        (\(Double(click.location.x)), \(Double(click.location.y))), count \
+        \(click.clickCount): over notch \(overNotch), on catcher \(onCatcher), \
+        inside panel \(insidePanel)
+        """
+      )
+    } else {
+      Self.log.log(
+        level: level,
+        """
+        click via \(route, privacy: .public), count \(click.clickCount): over notch \
+        \(overNotch), on catcher \(onCatcher), inside panel \(insidePanel)
+        """
+      )
+    }
   }
 
   private func isOverNotch(_ location: CGPoint) -> Bool {

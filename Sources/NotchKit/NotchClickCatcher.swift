@@ -15,6 +15,12 @@ import AppKit
 /// it: a handler here as well would see the same press twice, opening the panel and
 /// closing it again on a single click.
 final class NotchClickCatcher: NSPanel {
+  /// The alpha of the black fill that leaves no pixel fully transparent. Three percent
+  /// is 8 of 255 — clear of a threshold at or near nothing, which the 1 percent this
+  /// once was (3 of 255) sat too close to — and still nothing anyone can see: under it
+  /// is the black bar, or the few points of slack beside it.
+  static let fillAlpha: CGFloat = 0.03
+
   private var frameRequest = FrameRequest()
 
   init() {
@@ -59,9 +65,8 @@ final class NotchClickCatcher: NSPanel {
 /// view or window behind. The pointer monitor has already reported the press by the
 /// time it is dispatched here.
 private final class SwallowingView: NSView {
-  /// Black at one percent: nothing anyone can see — under it is the black bar, or a
-  /// few points of slack around it — but no pixel left fully transparent.
-  private static let fill = NSColor.black.withAlphaComponent(0.01).cgColor
+  private static let fill = NSColor.black
+    .withAlphaComponent(NotchClickCatcher.fillAlpha).cgColor
 
   override init(frame: NSRect) {
     super.init(frame: frame)
