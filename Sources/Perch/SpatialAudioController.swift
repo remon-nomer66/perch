@@ -1,6 +1,6 @@
-import CoreGraphics
 import Foundation
 import SpatialAudioKit
+import os
 
 /// Drives the system-wide spatial audio from the notch's common sheet.
 ///
@@ -8,10 +8,12 @@ import SpatialAudioKit
 /// depends on the connected headphones. Requires macOS 14.4+ (Core Audio process taps).
 ///
 /// The switch reflects *confirmed* capture, not the mere attempt. Creating the tap
-/// succeeds immediately even while the system-audio permission prompt is still up, and
-/// audio only flows once it is granted — so turning on waits for real audio to arrive
-/// before it commits. A denial (no audio) reverts and says why. The on/off state is not
-/// persisted; a launch never starts capturing on its own. The sub-options are remembered.
+/// succeeds even without the system-audio recording grant — such a tap just delivers
+/// silence — so turning on asks the tap itself whether recording is allowed, and turns
+/// on at once when it is, even with nothing playing. When the tap cannot tell, real
+/// audio has to arrive first. A refusal (or no audio) reverts and says why; the policy
+/// lives in `CaptureSupervisor`. The on/off state is not persisted; a launch never starts
+/// capturing on its own. The sub-options are remembered.
 @MainActor
 final class SpatialAudioController: ObservableObject {
   @Published private(set) var isEnabled = false
@@ -19,6 +21,8 @@ final class SpatialAudioController: ObservableObject {
   /// system-audio prompt is up, or the first buffers are still on their way.
   @Published private(set) var isStarting = false
   @Published private(set) var errorMessage: String?
+  /// Why the last attempt was given up, while its message is still showing.
+  private(set) var revocation: CaptureSupervisor.Revocation?
   /// The tempo the engine hears in whatever is playing, rounded to whole BPM.
   /// nil while off, or while no steady beat can be found.
   @Published private(set) var estimatedBPM: Double?
@@ -42,10 +46,15 @@ final class SpatialAudioController: ObservableObject {
     }
   }
 
-  /// The running spatialiser, type-erased so this controller need not itself be gated to
-  /// macOS 14.4 (it is created only inside availability checks).
-  private var engine: AnyObject?
-  private var verifyTask: Task<Void, Never>?
+  private static let log = Logger(subsystem: "dev.perch.mac", category: "spatial")
+
+  private var engine: (any SpatialCaptureEngine)?
+  private let makeEngine: SpatialEngineFactory
+  private let timing: CaptureSupervisor.Timing
+  private var supervisor: CaptureSupervisor?
+  /// The last grant the tap reported, so the log records changes rather than every look.
+  private var loggedPermission: SystemAudioPermission?
+  private var superviseTask: Task<Void, Never>?
   private var tempoTask: Task<Void, Never>?
   private var configRebuildTask: Task<Void, Never>?
   private let defaults: UserDefaults
@@ -56,8 +65,18 @@ final class SpatialAudioController: ObservableObject {
     return false
   }
 
-  init(defaults: UserDefaults = .standard) {
+  /// - Parameters:
+  ///   - makeEngine: builds and starts the capture engine. The default is the real
+  ///     spatialiser over a process tap; tests pass a fake so no tap is ever created.
+  ///   - timing: how often the capture is looked at, and how long each wait may last.
+  init(
+    defaults: UserDefaults = .standard,
+    makeEngine: @escaping SpatialEngineFactory = SpatialEngines.makeSpatializer,
+    timing: CaptureSupervisor.Timing = CaptureSupervisor.Timing()
+  ) {
     self.defaults = defaults
+    self.makeEngine = makeEngine
+    self.timing = timing
     autoBalance = defaults.object(forKey: Keys.auto) as? Bool ?? true
     wander = defaults.object(forKey: Keys.wander) as? Bool ?? true
     beat = defaults.object(forKey: Keys.beat) as? Bool ?? false
@@ -69,124 +88,123 @@ final class SpatialAudioController: ObservableObject {
       guard !isEnabled, !isStarting else { return }
       start()
     } else {
-      errorMessage = nil
+      clearError()
       teardown()
     }
   }
 
-  @available(macOS 14.4, *)
-  private func makeAndStartEngine() throws -> MultibandSpatializer {
-    // タップは出力デバイスのレートでフレームを届けるので、グラフもそれに合わせて組む。
-    // 48kHz 決め打ちだと 44.1kHz の機器（AAC 接続の Bluetooth 等）で全システム音の
-    // 速度とピッチが狂う。読めなければ従来通り 48kHz で試み、開始時の照合が実レートを
-    // 教えてくれたらそのレートで一度だけ作り直す。
-    let preferred = SystemAudioTap.defaultOutputNominalSampleRate() ?? 48_000
-    do {
-      return try makeAndStartEngine(sampleRate: preferred)
-    } catch SpatializerStartError.sampleRateMismatch(_, let actual) where actual > 0 {
-      return try makeAndStartEngine(sampleRate: actual)
-    }
+  private var options: SpatialEngineOptions {
+    SpatialEngineOptions(autoBalance: autoBalance, wander: wander, beat: beat)
   }
 
-  @available(macOS 14.4, *)
-  private func makeAndStartEngine(sampleRate: Double) throws -> MultibandSpatializer {
-    let spatializer = try MultibandSpatializer(
-      muteOriginal: true,
-      autoBalance: autoBalance,
-      wanderDegrees: wander ? 6 : 0,
-      beatDegrees: beat ? 5 : 0,
-      sampleRate: sampleRate
-    )
-    spatializer.onConfigurationChange = { [weak self] in
+  /// Replaces the engine (if any) with a freshly built and started one.
+  private func buildEngine() throws {
+    engine?.stop()
+    engine = nil
+    engine = try makeEngine(options) { [weak self] in
       Task { @MainActor [weak self] in
         self?.handleEngineConfigurationChange()
       }
     }
-    try spatializer.start()
-    return spatializer
   }
 
   private func start() {
-    guard #available(macOS 14.4, *) else { return }
     teardown()
-    errorMessage = nil
+    clearError()
+    loggedPermission = nil
     do {
-      // Creating the tap raises the system-audio prompt the first time. Capture is
-      // confirmed by real audio later; whether it works at all is a permission question,
-      // answered separately below.
-      engine = try makeAndStartEngine()
-      isStarting = true
-      confirmCapture(retryAfterGrant: true)
+      // The first start raises the system-audio prompt. Whether capture is allowed is
+      // asked of the tap afterwards, by the supervisor.
+      try buildEngine()
     } catch {
-      NSLog("Perch spatial: start failed: %@", String(describing: error))
+      Self.log.error("start failed: \(String(describing: error), privacy: .public)")
       teardown()
       errorMessage = L(
         "空間オーディオを開始できませんでした。システムオーディオ録音の許可を確認してください。",
         "Could not start Spatial Audio. Check the system audio recording permission."
       ) + " [\(error)]"
+      return
+    }
+    isStarting = true
+    supervisor = CaptureSupervisor(timing: timing)
+    superviseCapture()
+  }
+
+  /// Looks at the capture every tick and carries out what the supervisor decides, until
+  /// the attempt is settled.
+  private func superviseCapture() {
+    superviseTask?.cancel()
+    superviseTask = Task { @MainActor [weak self] in
+      while !Task.isCancelled {
+        guard let interval = self?.supervisor?.pollInterval else { return }
+        try? await Task.sleep(for: interval)
+        guard !Task.isCancelled, let self, self.superviseOnce() else { return }
+      }
     }
   }
 
-  /// Waits for *real* capture — a non-silent sample — before committing to on, then
-  /// separates the two reasons it might not arrive:
-  ///  1. Permission: the system-audio recording grant is a distinct, persistent state
-  ///     (the same TCC as screen recording), read directly. If it is off, say only that.
-  ///  2. Nothing playing: only once permission is confirmed does the audio matter.
-  /// A tap created the instant the grant is given can stay silent, so a permitted-but-
-  /// silent first attempt rebuilds the tap once before concluding nothing is playing.
-  private func confirmCapture(retryAfterGrant: Bool) {
-    verifyTask = Task { @MainActor [weak self] in
-      for _ in 0..<15 {
-        try? await Task.sleep(for: .milliseconds(400))
-        guard let self, !Task.isCancelled, self.isStarting else { return }
-        if #available(macOS 14.4, *),
-          (self.engine as? MultibandSpatializer)?.hasAudioSignal == true {
-          self.isStarting = false
-          self.isEnabled = true
-          self.errorMessage = nil
-          self.startTempoPolling()
-          return
-        }
-      }
-      guard let self, self.isStarting else { return }
+  /// One tick of supervision. Returns whether supervision goes on.
+  private func superviseOnce() -> Bool {
+    guard var supervisor, let engine else { return false }
+    let decision = supervisor.observe(
+      hasSignal: engine.hasAudioSignal,
+      after: supervisor.pollInterval,
+      permission: { probePermission(of: engine) }
+    )
+    self.supervisor = supervisor
+    return carryOut(decision)
+  }
 
-      // Phase 1 — permission. Rule it out first, and if it is the cause, say only that.
-      guard CGPreflightScreenCaptureAccess() else {
-        NSLog("Perch spatial: system-audio recording permission not granted")
-        self.teardown()
-        self.errorMessage = L(
-          "「システムオーディオ録音」の許可がありません。設定 → プライバシーとセキュリティ → 画面収録とシステムオーディオ録音 で Perch をオンにしてください。",
-          "System Audio Recording is not allowed. Turn Perch on in Settings → Privacy & Security → Screen & System Audio Recording."
-        )
-        return
-      }
-
-      // Permitted but silent. A tap made the moment the grant landed can stay silent —
-      // rebuild it once before blaming the audio.
-      if retryAfterGrant, #available(macOS 14.4, *) {
-        NSLog("Perch spatial: permitted but silent; rebuilding tap once")
-        (self.engine as? MultibandSpatializer)?.stop()
-        self.engine = nil
-        do {
-          self.engine = try self.makeAndStartEngine()
-          self.confirmCapture(retryAfterGrant: false)
-        } catch {
-          self.teardown()
-          self.errorMessage = L(
-            "空間オーディオを開始できませんでした。", "Could not start Spatial Audio."
-          ) + " [\(error)]"
-        }
-        return
-      }
-
-      // Phase 2 — permitted, but no audio is playing.
-      NSLog("Perch spatial: permitted but no audio captured; nothing playing")
-      self.teardown()
-      self.errorMessage = L(
-        "音声が検出できませんでした。何か再生してからお試しください。",
-        "No audio detected. Play something, then try again."
+  /// Asks the tap for the grant, logging the answer whenever it changes.
+  private func probePermission(of engine: any SpatialCaptureEngine) -> SystemAudioPermission {
+    let permission = engine.probeCapturePermission()
+    if permission != loggedPermission {
+      Self.log.notice(
+        "system audio recording, as the tap reports it: \(String(describing: permission), privacy: .public)"
       )
+      loggedPermission = permission
     }
+    return permission
+  }
+
+  /// Returns whether supervision goes on.
+  private func carryOut(_ decision: CaptureSupervisor.Decision) -> Bool {
+    switch decision {
+    case .hold:
+      return true
+    case .commit:
+      Self.log.notice("capture confirmed; spatial audio on")
+      isStarting = false
+      isEnabled = true
+      clearError()
+      startTempoPolling()
+      // Turning on is settled.
+      return false
+    case .rebuild:
+      Self.log.notice("rebuilding the tap")
+      do {
+        try buildEngine()
+        return true
+      } catch {
+        Self.log.error("rebuild failed: \(String(describing: error), privacy: .public)")
+        teardown()
+        errorMessage = L(
+          "空間オーディオを開始できませんでした。", "Could not start Spatial Audio."
+        ) + " [\(error)]"
+        return false
+      }
+    case .revoke(let reason):
+      Self.log.notice("spatial audio given up: \(String(describing: reason), privacy: .public)")
+      teardown()
+      revocation = reason
+      errorMessage = reason.message
+      return false
+    }
+  }
+
+  private func clearError() {
+    errorMessage = nil
+    revocation = nil
   }
 
   /// The last listener pose from head tracking, kept so an engine rebuild (options
@@ -197,12 +215,11 @@ final class SpatialAudioController: ObservableObject {
 
   /// The listener pose from head tracking. Only a running engine cares.
   func updateListenerPose(_ orientation: SpatialAudioKit.ListenerOrientation, distanceRatio: Double) {
-    guard isEnabled, #available(macOS 14.4, *) else { return }
+    guard isEnabled else { return }
     listenerOrientation = orientation
     listenerDistanceRatio = distanceRatio
-    let spatializer = engine as? MultibandSpatializer
-    spatializer?.updateListener(orientation)
-    spatializer?.setListenerDistance(ratio: distanceRatio)
+    engine?.updateListener(orientation)
+    engine?.setListenerDistance(ratio: distanceRatio)
   }
 
   /// The output configuration changed under a live engine — headphones swapped for
@@ -213,7 +230,7 @@ final class SpatialAudioController: ObservableObject {
   /// if the new route is not headphones after all, the gate turns the feature off
   /// right after, which is the intended cascade.
   private func handleEngineConfigurationChange() {
-    guard #available(macOS 14.4, *), isEnabled || isStarting else { return }
+    guard isEnabled || isStarting else { return }
     configRebuildTask?.cancel()
     configRebuildTask = Task { @MainActor [weak self] in
       // A device switch fires a burst of these; rebuild once, after it settles.
@@ -230,20 +247,16 @@ final class SpatialAudioController: ObservableObject {
   /// A running engine with new options: rebuild in place, staying on. Capture is already
   /// confirmed, so no prompt and no waiting are involved.
   private func reconfigureIfRunning() {
-    guard isEnabled, #available(macOS 14.4, *) else { return }
-    verifyTask?.cancel()
-    verifyTask = nil
-    (engine as? MultibandSpatializer)?.stop()
-    engine = nil
+    guard isEnabled else { return }
     do {
-      engine = try makeAndStartEngine()
+      try buildEngine()
       if let listenerOrientation {
-        let spatializer = engine as? MultibandSpatializer
-        spatializer?.updateListener(listenerOrientation)
-        spatializer?.setListenerDistance(ratio: listenerDistanceRatio)
+        engine?.updateListener(listenerOrientation)
+        engine?.setListenerDistance(ratio: listenerDistanceRatio)
       }
-      errorMessage = nil
+      clearError()
     } catch {
+      Self.log.error("reconfigure failed: \(String(describing: error), privacy: .public)")
       teardown()
       errorMessage = L("空間オーディオを再設定できませんでした。", "Could not reconfigure Spatial Audio.")
     }
@@ -257,27 +270,23 @@ final class SpatialAudioController: ObservableObject {
     tempoTask = Task { @MainActor [weak self] in
       while !Task.isCancelled {
         guard let self, self.isEnabled else { return }
-        if #available(macOS 14.4, *) {
-          let bpm = (self.engine as? MultibandSpatializer)?
-            .movementState.estimatedBPM.map { $0.rounded() }
-          if self.estimatedBPM != bpm { self.estimatedBPM = bpm }
-        }
+        let bpm = self.engine?.estimatedBPM.map { $0.rounded() }
+        if self.estimatedBPM != bpm { self.estimatedBPM = bpm }
         try? await Task.sleep(for: .milliseconds(500))
       }
     }
   }
 
   private func teardown() {
-    verifyTask?.cancel()
-    verifyTask = nil
+    superviseTask?.cancel()
+    superviseTask = nil
+    supervisor = nil
     tempoTask?.cancel()
     tempoTask = nil
     configRebuildTask?.cancel()
     configRebuildTask = nil
     estimatedBPM = nil
-    if #available(macOS 14.4, *) {
-      (engine as? MultibandSpatializer)?.stop()
-    }
+    engine?.stop()
     engine = nil
     isEnabled = false
     isStarting = false
@@ -289,5 +298,24 @@ final class SpatialAudioController: ObservableObject {
     static let auto = "Spatial.autoBalance"
     static let wander = "Spatial.wander"
     static let beat = "Spatial.beat"
+  }
+}
+
+extension CaptureSupervisor.Revocation {
+  /// What the switch says when it reverts. Where the grant lives in System Settings is
+  /// named as macOS 15+ labels it; the wording is the OS's to change, so it is hedged.
+  var message: String {
+    switch self {
+    case .permissionDenied:
+      L(
+        "システムオーディオ録音が許可されていません。システム設定 → プライバシーとセキュリティ → 画面収録とシステムオーディオ録音 の「システムオーディオ録音のみ」で Perch をオンにしてください（表記は macOS により異なることがあります）。",
+        "System audio recording isn’t allowed. Turn on Perch under “System Audio Recording Only” in System Settings → Privacy & Security → Screen & System Audio Recording (names may vary by macOS version)."
+      )
+    case .noAudioDetected:
+      L(
+        "音声を検出できませんでした。何か再生してからお試しください。",
+        "No audio detected. Play something, then try again."
+      )
+    }
   }
 }
