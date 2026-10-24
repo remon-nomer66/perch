@@ -73,11 +73,18 @@ fi
 # the developer's own build tree and crashed at launch anywhere else.
 #
 # Everything under Contents/Resources has to land before codesign seals the bundle.
+#
+# Where inside the bundle the PNGs sit depends on the toolchain: older SwiftPM builds
+# leave them flat at the bundle's root, while the Swift Build backend (Swift 6.4,
+# `.build/debug -> out/Products/Debug`) makes a real macOS bundle and puts them in
+# Contents/Resources. Looking only at the root found nothing on the newer toolchain,
+# so debug builds quietly fell back to the symbol and release builds aborted below.
+# Both layouts are searched; the signature directory is never a source of icons.
 mkdir -p "$app_dir/Contents/Resources"
 icon_bundle="$build_dir/Perch_Perch.bundle"
 if [ -d "$icon_bundle" ]; then
-    find "$icon_bundle" -maxdepth 1 -type f -name '*.png' -exec \
-        install -m 0644 {} "$app_dir/Contents/Resources/" \;
+    find "$icon_bundle" -maxdepth 3 -type f -name '*.png' -not -path '*/_CodeSignature/*' \
+        -exec install -m 0644 {} "$app_dir/Contents/Resources/" \;
 fi
 
 # Checked, not assumed. The build tree is the one place these are certain to exist,
