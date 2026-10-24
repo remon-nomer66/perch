@@ -50,18 +50,41 @@ private let second = "00-11-22-77-88-99"
   await controller.stop()
 }
 
+/// The same right after a connect, and away from Bose altogether: moving the output to the
+/// speakers takes the device off the panel at once. The connect's own teardown used to
+/// clear the identity a switch is judged against, so in the poll after a connect a move
+/// to the speakers looked like no change and woke nothing.
+@MainActor
+@Test func aSwitchToTheSpeakersRightAfterAConnectWakesTheLoop() async throws {
+  let audio = ScriptedAudioOutput(bluetooth: first)
+  let devices = ScriptedBmapDevices([first: .readsBack])
+  let controller = BoseDeviceController(
+    audio: audio, devices: devices, refreshInterval: .seconds(3600)
+  )
+  controller.start()
+
+  try await eventually { controller.readout?.status == .ready }
+
+  audio.emit(.other)
+  try await eventually { controller.readout == nil }
+  #expect(controller.panelModel == nil)
+
+  await controller.stop()
+}
+
 /// Only a change of *device* is a switch. Core Audio also reports the same output again,
 /// and waking for that would rerun the synchronous SDP scan — or reopen a channel the
 /// device just refused — for nothing.
 @Test func onlyADifferentDeviceCountsAsASwitch() {
-  let correlated = DeviceIdentity(first).rawValue
+  let observed = DeviceIdentity(first).rawValue
   let isSwitch = BoseDeviceController.isSwitch(to:awayFrom:)
 
-  #expect(!isSwitch(.identified(DeviceIdentity(first)), correlated))
-  #expect(isSwitch(.identified(DeviceIdentity(second)), correlated))
-  #expect(isSwitch(.other, correlated))
-  #expect(isSwitch(.unidentifiedBluetooth(uid: "unidentified"), correlated))
-  // Nothing correlated: a Bose device appearing is a switch, the speakers are not.
+  #expect(!isSwitch(.identified(DeviceIdentity(first)), observed))
+  #expect(isSwitch(.identified(DeviceIdentity(second)), observed))
+  #expect(isSwitch(.other, observed))
+  #expect(isSwitch(.unidentifiedBluetooth(uid: "unidentified"), observed))
+  // Last seen on the speakers: a Bluetooth device appearing is a switch, the speakers
+  // reported again are not.
   #expect(isSwitch(.identified(DeviceIdentity(first)), nil))
   #expect(!isSwitch(.other, nil))
 }

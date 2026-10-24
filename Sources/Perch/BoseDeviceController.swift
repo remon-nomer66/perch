@@ -54,6 +54,11 @@ final class BoseDeviceController: ObservableObject {
   /// OUI-keyed cache stays "valid" when the output moves from one to the other and pins the
   /// session to the device that is no longer playing.
   private var correlatedOutput: String?
+  /// The output the loop last looked at, whatever came of it — a Bose device, another
+  /// maker's, or none. A reported change is a switch only against this: the correlation
+  /// above is cleared by every teardown, including the one that precedes a connect, so
+  /// judged by it a move to the speakers just after connecting looked like no change.
+  private var observedOutput: String?
   /// BMAP addresses that would not open, and the audio output they were tried against.
   ///
   /// A paired Bose product can publish more than one BMAP address — a probe of QC Ultra
@@ -183,7 +188,7 @@ final class BoseDeviceController: ObservableObject {
   /// writes to headphones nobody is listening to. So a switch to another device wakes the
   /// loop now: the pause in progress is cut short, or, mid-tick, the next one is skipped.
   private func outputChanged(to output: AudioOutput) {
-    guard Self.isSwitch(to: output, awayFrom: correlatedOutput) else { return }
+    guard Self.isSwitch(to: output, awayFrom: observedOutput) else { return }
     if let pauseTask {
       pauseTask.cancel()
     } else {
@@ -205,7 +210,8 @@ final class BoseDeviceController: ObservableObject {
   /// none, so `getServiceRecord` returns empty there. It reads cached records (no live
   /// query), so it does not block; only opening a channel is slow, and that is async.
   private func currentBoseControlAddress() -> String? {
-    guard let output = currentOutputIdentifier() else {
+    observedOutput = currentOutputIdentifier()
+    guard let output = observedOutput else {
       correlatedOutput = nil
       return nil
     }
@@ -257,11 +263,11 @@ final class BoseDeviceController: ObservableObject {
     }
   }
 
-  /// Whether a reported output names a device other than the one the session was
-  /// correlated from — the only change worth waking the loop for. Core Audio reports the
-  /// same output again too, and each wake costs a synchronous SDP scan or a reopen.
-  nonisolated static func isSwitch(to output: AudioOutput, awayFrom correlated: String?) -> Bool {
-    identifier(of: output) != correlated
+  /// Whether a reported output names a device other than the one the loop last looked at
+  /// — the only change worth waking it for. Core Audio reports the same output again too,
+  /// and each wake costs a synchronous SDP scan or a reopen.
+  nonisolated static func isSwitch(to output: AudioOutput, awayFrom observed: String?) -> Bool {
+    identifier(of: output) != observed
   }
 
   // MARK: - Session lifecycle
