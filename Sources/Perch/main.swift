@@ -318,10 +318,9 @@ final class AppModel: ObservableObject {
       ruleHold = nil
     }
 
-    // The same condition NotchPanelView.hasContent widens the bar by: its rising
-    // edge opens the five-second announcement window the quiet mode shows.
-    let hasContent = next.summary.isControllable
-      && (next.summary.modelName != nil || next.battery != .unknown)
+    // The same condition the bar widens by: its rising edge opens the five-second
+    // announcement window the quiet mode shows.
+    let hasContent = next.hasContent
     if hasContent, !hadContent {
       arrivalAnnounceUntil = ContinuousClock.now.advanced(by: .seconds(5))
       // A device arriving always turns spatial audio off. Arriving mid-capture — the
@@ -832,17 +831,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       // whichever way the notch went.
       MainActor.assumeIsolated { self?.installStatusItem() }
     }
-    // The hover target follows the bar's drawn size: while the bar stays bare —
-    // nothing to carry yet, or quiet mode with the panel closed — only the cutout
-    // itself reacts to the pointer, not the invisible side reaches of the hidden bar.
+    // The hover target follows the bar's drawn size by the very rule the view draws
+    // by: while the bar stays bare — nothing to carry yet, or quiet mode with nothing
+    // to announce — only the cutout itself reacts, not the hidden bar's side reaches.
     controller.isBarVisible = { [weak controller] in
       guard let controller else { return true }
-      let summary = model.panel.summary
-      // The same condition NotchPanelView.hasContent widens the bar by.
-      let hasContent = summary.isControllable
-        && (summary.modelName != nil || model.panel.battery != .unknown)
-      guard hasContent else { return false }
-      return settingsStore.notchDisplayMode == .always || controller.presentation != .closed
+      return NotchBarVisibility.isExtended(
+        model: model.panel,
+        isVirtual: controller.isVirtualNotch,
+        displayMode: settingsStore.notchDisplayMode,
+        presentation: controller.presentation
+      )
     }
     self.controller = controller
 
