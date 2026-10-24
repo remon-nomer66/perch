@@ -7,7 +7,10 @@ extension SessionCoordinator {
     public var backoffUnit: Duration
     /// How long one write may take to reach the channel. A write is normally done in
     /// milliseconds; one held this long means the remote has stopped granting flow
-    /// control, and waiting on it would stall every write queued behind it.
+    /// control, and waiting on it would stall every write queued behind it. Kept
+    /// shorter than `response`, whose deadline covers the write as well, so that a
+    /// stalled write is reported as a stall rather than racing its own request's
+    /// timeout.
     public var write: Duration
     /// How long `contended` waits before trying the channel again. Slow on purpose:
     /// while another host really holds the channel, every try hangs for the whole
@@ -28,7 +31,7 @@ extension SessionCoordinator {
       // wearing change is back about a second later, which should feel immediate.
       // Doubling still spaces persistent failures out to sixteen seconds.
       backoffUnit: Duration = .milliseconds(500),
-      write: Duration = .seconds(5),
+      write: Duration = .seconds(3),
       contentionRetry: Duration = .seconds(30)
     ) {
       self.response = response

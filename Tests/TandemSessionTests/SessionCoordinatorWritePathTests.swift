@@ -66,6 +66,27 @@ private func readySession(
   await coordinator.handle(.manualRelease)
 }
 
+@Test func aStalledWriteIsReportedAsAStallNotAsAMissingAnswer() async throws {
+  // The response deadline now covers the write too. With both at the same length, a
+  // stalled write raced its own request's timeout, and which failure the caller saw —
+  // and whether the frame still left the queue later — depended on which fired first.
+  let defaults = SessionCoordinator.Timeouts()
+  #expect(defaults.write < defaults.response)
+
+  let (coordinator, link) = try await readySession(
+    timeouts: .init(response: .milliseconds(400), backoffUnit: .seconds(60), write: .milliseconds(100))
+  )
+  await link.stallWrites()
+  do {
+    _ = try await coordinator.send(frame(markerRequest), matching: { _ in true })
+    Issue.record("a request whose write never left was answered")
+  } catch let failure as SessionRequestFailure {
+    #expect(failure == .channel(.writeTimedOut))
+  }
+  #expect(await waitFor { await coordinator.phase == .retryWaiting })
+  await coordinator.handle(.manualRelease)
+}
+
 // MARK: - Acknowledgements
 
 @Test func aStalledAcknowledgementDoesNotHoldUpWhatArrivesNext() async throws {
