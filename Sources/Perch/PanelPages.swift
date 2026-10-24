@@ -69,7 +69,8 @@ enum PanelPages {
 /// connected model. Needs macOS 14.4+ (Core Audio taps); older systems say so.
 private struct SpatialAudioPage: View {
   @ObservedObject var controller: SpatialAudioController
-  @ObservedObject var headTracking: HeadTrackingController
+  /// Handed on to its column, which observes it; this page draws nothing from it.
+  let headTracking: HeadTrackingController
   @ObservedObject var outputRoute: OutputRouteWatcher
 
   var body: some View {
@@ -98,7 +99,7 @@ private struct SpatialAudioPage: View {
         }
         .frame(width: fifth * 2, alignment: .topLeading)
 
-        headTrackingColumn
+        HeadTrackingColumn(spatial: controller, headTracking: headTracking)
           .frame(width: fifth * 3, alignment: .topLeading)
       }
     }
@@ -170,101 +171,6 @@ private struct SpatialAudioPage: View {
         .foregroundStyle(.white.opacity(0.5))
         .fixedSize(horizontal: false, vertical: true)
     }
-  }
-
-  /// The right three fifths: camera head tracking. The toggle is gated on the
-  /// spatialiser being on — orientation goes nowhere without a running engine — and
-  /// every state the camera can be in (permission, calibration, tracking, lost) is
-  /// said out loud, because an active camera must never be a mystery.
-  @ViewBuilder
-  private var headTrackingColumn: some View {
-    VStack(alignment: .leading, spacing: 7) {
-      Text(L("ヘッドトラッキング", "Head Tracking"))
-        .font(.system(size: 10, weight: .medium))
-        .foregroundStyle(.white.opacity(0.45))
-
-      if controller.isAvailable {
-        SwitchRow(
-          title: L("カメラで頭に追従", "Follow with the camera"),
-          isOn: headTracking.isEnabled
-        ) {
-          headTracking.setEnabled($0)
-        }
-        .disabled(!controller.isEnabled)
-        .opacity(controller.isEnabled ? 1 : 0.45)
-
-        if !controller.isEnabled {
-          trackingCaption(
-            L("空間オーディオをオンにすると使えます。", "Turn on Spatial Audio to use this.")
-          )
-        } else {
-          if headTracking.isEnabled {
-            SwitchRow(
-              title: L("距離も反映（実験的）", "Distance too (experimental)"),
-              isOn: headTracking.distanceEnabled
-            ) {
-              headTracking.distanceEnabled = $0
-            }
-          }
-          trackingStatus
-        }
-      } else {
-        trackingCaption(
-          L("空間オーディオと同じく macOS 14.4 以降が必要です。", "Requires macOS 14.4 or later, like Spatial Audio.")
-        )
-      }
-    }
-  }
-
-  @ViewBuilder
-  private var trackingStatus: some View {
-    switch headTracking.status {
-    case .off:
-      trackingCaption(
-        L("頭を回すと音場が部屋に残るように追従します。", "Keeps the sound field in place as you turn your head.")
-      )
-    case .requestingPermission:
-      trackingCaption(L("カメラの許可を確認しています…", "Waiting for camera permission…"))
-    case .calibrating:
-      trackingCaption(
-        L("較正中 — 正面を向いたままお待ちください。", "Calibrating — keep facing forward.")
-      )
-    case .tracking:
-      HStack(spacing: 8) {
-        trackingCaption(L("追跡中（カメラ使用中）", "Tracking (camera in use)"))
-        SegmentButton(
-          title: L("再センター", "Recenter"), isSelected: false, fixedWidth: false
-        ) {
-          headTracking.recenter()
-        }
-      }
-    case .faceLost:
-      trackingCaption(
-        L("顔を見失っています — 音場をゆっくり正面へ戻します。", "Face lost — easing the sound field back to front.")
-      )
-    case .denied:
-      Text(
-        L(
-          "カメラの許可がありません。設定 → プライバシーとセキュリティ → カメラ で Perch をオンにしてください。",
-          "Camera access is not allowed. Turn Perch on in Settings → Privacy & Security → Camera."
-        )
-      )
-        .font(.system(size: 9))
-        .foregroundStyle(.orange)
-        .fixedSize(horizontal: false, vertical: true)
-    case .failed(let message):
-      Text(message)
-        .font(.system(size: 9))
-        .foregroundStyle(.orange)
-        .fixedSize(horizontal: false, vertical: true)
-    }
-  }
-
-  private func trackingCaption(_ text: String) -> some View {
-    Text(text)
-      .font(.system(size: 9))
-      .foregroundStyle(.white.opacity(0.5))
-      .fixedSize(horizontal: false, vertical: true)
   }
 }
 
@@ -871,7 +777,8 @@ private struct SpeakToChatPage: View {
   }
 }
 
-private struct SwitchRow: View {
+/// Internal, not private: the head-tracking column lives in its own file.
+struct SwitchRow: View {
   let title: String
   let isOn: Bool
   let set: (Bool) -> Void
@@ -916,7 +823,8 @@ private struct PanelSwitchStyle: ToggleStyle {
   }
 }
 
-private struct SegmentButton: View {
+/// Internal for the same reason as `SwitchRow`.
+struct SegmentButton: View {
   let title: String
   let isSelected: Bool
   var fixedWidth = true
