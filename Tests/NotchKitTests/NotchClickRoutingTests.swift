@@ -28,13 +28,19 @@ private func press(
 
 // MARK: - Catcher frame
 
+/// The bar as drawn with the default reaches, 64 a side: 726 to 1074 across.
+private let drawnBar = CGRect(x: 726, y: 1131, width: 348, height: 38)
+
 @Test(arguments: [NotchPresenter.Presentation.closed, .popping])
-func theCatcherCoversTheNotchTargetOnScreen(presentation: NotchPresenter.Presentation) {
+func theCatcherIsTheDrawnBarWithItsSlackCutAtTheTop(
+  presentation: NotchPresenter.Presentation
+) {
+  // Four points of slack on every side but the top, where the screen ends.
   let frame = NotchController.catcherFrame(
     presentation: presentation, notchTarget: barTarget, screenFrame: screen
   )
 
-  #expect(frame == barTarget.intersection(screen))
+  #expect(frame == CGRect(x: 722, y: 1127, width: 356, height: 42))
 }
 
 @Test func theCatcherStepsAsideWhileThePanelIsOpen() {
@@ -55,14 +61,21 @@ func theCatcherCoversTheNotchTargetOnScreen(presentation: NotchPresenter.Present
       presentation: .closed, notchTarget: barTarget, screenFrame: screen
     )
   )
-  let menuBarY = screen.maxY - 20
+  let menuBarY: CGFloat = 1150
   let strip = NotchController.stripRect(screenFrame: screen, expandedHeight: 200)
+  let farMenuItem = CGPoint(x: 100, y: menuBarY)
+  let itemBesideTheRightEdge = CGPoint(x: drawnBar.maxX + 5, y: menuBarY)
+  let itemBesideTheLeftEdge = CGPoint(x: drawnBar.minX - 5, y: menuBarY)
+  let justUnderTheBar = CGPoint(x: notch.midX, y: drawnBar.minY - 5)
 
-  #expect(frame.width < strip.width / 4)
-  #expect(!frame.contains(CGPoint(x: 100, y: menuBarY)))
-  #expect(!frame.contains(CGPoint(x: barTarget.maxX + 1, y: menuBarY)))
-  #expect(!frame.contains(CGPoint(x: barTarget.minX - 1, y: menuBarY)))
-  #expect(!frame.contains(CGPoint(x: notch.midX, y: barTarget.minY - 1)))
+  // The strip does lie over each of these; the catcher over none.
+  for point in [farMenuItem, itemBesideTheRightEdge, itemBesideTheLeftEdge, justUnderTheBar] {
+    #expect(strip.contains(point))
+    #expect(!frame.contains(point))
+  }
+  // Everything drawn is covered, out to the slack the hover target allows.
+  #expect(frame.contains(drawnBar))
+  #expect(frame.contains(CGPoint(x: drawnBar.maxX + 2, y: menuBarY)))
 }
 
 @Test func theCatcherNeverReachesAScreenArrangedAbove() throws {
