@@ -1,20 +1,53 @@
 import Foundation
 import SpatialAudioKit
 import Testing
+import os
 
 @testable import Perch
 
 // コントローラの流れを、フェイクのエンジンで確かめる。実際のプロセスタップは作らない
 // （作るとシステムオーディオ録音の許可ダイアログが出てしまう）。判断そのものは
 // CaptureSupervisorTests の表にあり、ここではそれが結線どおりに効くことを見る:
-// エンジンを作る・止める・作り直す、オン/取り消しの状態と理由、オンの間の見張り。
+// エンジンを作る・止める・作り直す、オン/取り消しの状態と理由、オンの間の見張り、
+// 問い合わせを MainActor の外で時間を区切って行うこと。
+
+/// 問い合わせごとに順に返す許可の判定（尽きたら最後のものを返し続ける）。問い合わせは
+/// MainActor の外で走るので、記録はロックで守る。
+private final class PermissionScript: Sendable {
+  private struct State {
+    var asked = 0
+    var askedOnMain = false
+  }
+
+  private let answers: [SystemAudioPermission]
+  /// 1回の問い合わせにかける時間（戻らない問い合わせの代わり）。
+  private let delay: TimeInterval
+  private let state = OSAllocatedUnfairLock(initialState: State())
+
+  init(_ answers: [SystemAudioPermission], delay: TimeInterval = 0) {
+    self.answers = answers
+    self.delay = delay
+  }
+
+  var asked: Int { state.withLock { $0.asked } }
+  var askedOnMain: Bool { state.withLock { $0.askedOnMain } }
+
+  func answer() -> SystemAudioPermission {
+    let onMain = Thread.isMainThread
+    let index = state.withLock { state -> Int in
+      defer { state.asked += 1 }
+      state.askedOnMain = state.askedOnMain || onMain
+      return state.asked
+    }
+    if delay > 0 { Thread.sleep(forTimeInterval: delay) }
+    return answers[min(index, answers.count - 1)]
+  }
+}
 
 /// テストから許可の判定と信号を台本どおりに返すエンジン。
 @MainActor
 private final class FakeEngine: SpatialCaptureEngine {
-  /// 問い合わせごとに順に返す許可の判定。尽きたら最後のものを返し続ける。
-  private let permissions: [SystemAudioPermission]
-  private(set) var probes = 0
+  let script: PermissionScript
   private(set) var stopped = false
   /// 音が流れているか。流れている間は、読まれるたびに音のあるブロックが1つ増える。
   var flowing: Bool
@@ -24,8 +57,8 @@ private final class FakeEngine: SpatialCaptureEngine {
   private(set) var listener: ListenerOrientation?
   let estimatedBPM: Double? = nil
 
-  init(permissions: [SystemAudioPermission], flowing: Bool) {
-    self.permissions = permissions
+  init(script: PermissionScript, flowing: Bool) {
+    self.script = script
     self.flowing = flowing
   }
 
@@ -35,9 +68,9 @@ private final class FakeEngine: SpatialCaptureEngine {
     return audibleBlocks
   }
 
-  func probeCapturePermission() -> SystemAudioPermission {
-    defer { probes += 1 }
-    return permissions[min(probes, permissions.count - 1)]
+  var permissionProbe: (@Sendable () -> SystemAudioPermission)? {
+    let script = self.script
+    return { script.answer() }
   }
 
   func updateListener(_ orientation: ListenerOrientation) { listener = orientation }
@@ -47,6 +80,23 @@ private final class FakeEngine: SpatialCaptureEngine {
 
 private struct StartFailure: Error {}
 
+/// 呼ばれるたびに一定だけ進む時計。経過時間が観測の回数で決まり、テストが実時間に
+/// 左右されない。
+@MainActor
+private final class SteppingClock {
+  private var current = ContinuousClock.now
+  private let step: Duration
+
+  init(step: Duration) {
+    self.step = step
+  }
+
+  func now() -> ContinuousClock.Instant {
+    current += step
+    return current
+  }
+}
+
 @MainActor
 private struct Harness {
   /// 作ったエンジンの記録と、次に作るエンジンの台本。
@@ -55,11 +105,18 @@ private struct Harness {
     var built: [FakeEngine] = []
     /// n 個目に作るエンジンの許可の台本。尽きたら最後のものを使う。
     var scripts: [[SystemAudioPermission]]
+    /// 1回の問い合わせにかける時間。
+    var probeDelay: TimeInterval = 0
     /// 新しく作るエンジンで音が流れているか。
     var flowing: Bool
     var failToStart = false
-    /// 他のプロセスが音を出しているか（AudibleProcesses の代わり）。
-    var othersPlaying: Bool? = false
+    /// 他のプロセスが音を出しているか（AudibleProcesses の代わり）。MainActor の外から
+    /// 読まれるので、ロックの中に持つ。
+    let playback = OSAllocatedUnfairLock<Bool?>(initialState: false)
+    var othersPlaying: Bool? {
+      get { playback.withLock { $0 } }
+      set { playback.withLock { $0 = newValue } }
+    }
 
     var allStopped: Bool { built.allSatisfy { $0.stopped } }
 
@@ -75,32 +132,43 @@ private struct Harness {
   init(
     permissions: [[SystemAudioPermission]],
     flowing: Bool = false,
-    timing: CaptureSupervisor.Timing = Harness.fastTiming
+    timing: CaptureSupervisor.Timing = Harness.fastTiming,
+    clockStep: Duration = .milliseconds(1),
+    probeTimeout: Duration = .seconds(2),
+    probeDelay: TimeInterval = 0
   ) {
     let engines = Engines(scripts: permissions, flowing: flowing)
+    engines.probeDelay = probeDelay
     self.engines = engines
     let defaults = UserDefaults(suiteName: "SpatialAudioControllerTests-\(UUID().uuidString)")!
+    let clock = SteppingClock(step: clockStep)
+    let playback = engines.playback
     controller = SpatialAudioController(
       defaults: defaults,
       makeEngine: { _, _ in
         if engines.failToStart { throw StartFailure() }
-        let script = engines.scripts[min(engines.built.count, engines.scripts.count - 1)]
-        let engine = FakeEngine(permissions: script, flowing: engines.flowing)
+        let answers = engines.scripts[min(engines.built.count, engines.scripts.count - 1)]
+        let engine = FakeEngine(
+          script: PermissionScript(answers, delay: engines.probeDelay), flowing: engines.flowing
+        )
         engines.built.append(engine)
         return engine
       },
-      othersPlaying: { engines.othersPlaying },
+      othersPlaying: { playback.withLock { $0 } },
+      now: { clock.now() },
+      probeTimeout: probeTimeout,
       timing: timing
     )
   }
 
-  /// 時間の進みは観測の回数で数える（実時間ではない）ので、刻みを詰めても判断は変わらない。
-  /// 見張りは5回続けて無音なら手を打つ。
+  /// 時計は観測ごとに 1ms 進むので、時間の進みは観測の回数で決まる。刻みを詰めても
+  /// 判断は変わらない。見張りは5回続けて無音なら手を打ち、他の再生が3回止まれば忘れる。
   static let fastTiming = CaptureSupervisor.Timing(
     confirmInterval: .milliseconds(1),
     confirmDeadline: .milliseconds(15),
     watchInterval: .milliseconds(1),
-    stallTimeout: .milliseconds(5)
+    stallTimeout: .milliseconds(5),
+    quietReset: .milliseconds(3)
   )
 
   /// 監視タスク（MainActor 上の別タスク）に回す。条件が満ちるまで譲る。
@@ -325,6 +393,70 @@ func revokedGrantIsReportedAsPermission() async {
   #expect(harness.controller.revocation == .permissionDenied)
   #expect(harness.engines.built.count == 2)
   #expect(harness.engines.allStopped)
+}
+
+// MARK: - 問い合わせの置き場所と時間
+
+@MainActor
+@Test("許可の問い合わせ（coreaudiod との同期の往復）は MainActor の外で行う")
+func permissionProbeRunsOffTheMainActor() async {
+  let harness = Harness(permissions: [[.granted]])
+  harness.controller.setEnabled(true)
+  await harness.settle()
+
+  let script = harness.engines.built[0].script
+  #expect(script.asked >= 1)
+  #expect(!script.askedOnMain)
+}
+
+@MainActor
+@Test("問い合わせが戻らなくても MainActor は止まらず、判定できないとして期限で取り消す")
+func hungProbeCountsAsUnknown() async {
+  // 1回の問い合わせに 0.5 秒かかるが、待つのは 20ms まで。戻らない間の問い合わせは
+  // 積まずに「判定できない」とする。
+  let harness = Harness(
+    permissions: [[.granted]], probeTimeout: .milliseconds(20), probeDelay: 0.5
+  )
+  let started = ContinuousClock.now
+  harness.controller.setEnabled(true)
+  await harness.settle()
+
+  #expect(harness.controller.revocation == .noAudioDetected)
+  #expect(ContinuousClock.now - started < .milliseconds(450))
+  #expect(harness.engines.built[0].script.asked == 1)
+}
+
+@MainActor
+@Test("期限は時計で測った実際の経過で数える（名目の間隔ではない）")
+func deadlineFollowsTheClock() async {
+  // 時計は観測ごとに2秒進む。6秒の期限には3回目の観測で届く。
+  let timing = CaptureSupervisor.Timing(
+    confirmInterval: .milliseconds(1),
+    confirmDeadline: .seconds(6)
+  )
+  let harness = Harness(permissions: [[.denied]], timing: timing, clockStep: .seconds(2))
+  harness.controller.setEnabled(true)
+  await harness.settle()
+
+  #expect(harness.controller.revocation == .permissionDenied)
+  #expect(harness.engines.built[0].script.asked == 3)
+}
+
+@MainActor
+@Test("問い合わせの最中にオフにされたら、戻ってきた答えは捨てる（勝手にオンへ戻らない）")
+func answerArrivingAfterTurningOffIsDropped() async {
+  let harness = Harness(permissions: [[.granted]], probeDelay: 0.15)
+  harness.controller.setEnabled(true)
+  let engine = harness.engines.built[0]
+  await harness.drain { engine.script.asked >= 1 }
+  harness.controller.setEnabled(false)
+  try? await Task.sleep(for: .milliseconds(300))
+
+  #expect(!harness.controller.isEnabled)
+  #expect(!harness.controller.isStarting)
+  #expect(harness.controller.errorMessage == nil)
+  #expect(harness.engines.built.count == 1)
+  #expect(engine.stopped)
 }
 
 // MARK: - 文言

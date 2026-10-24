@@ -9,8 +9,10 @@ protocol SpatialCaptureEngine: AnyObject {
   /// Blocks with a non-silent sample captured since this engine started. A count that
   /// grew between two looks means audio arrived in between.
   var audibleBlockCount: Int { get }
-  /// The system-audio recording grant, asked of the running tap.
-  func probeCapturePermission() -> SystemAudioPermission
+  /// How to ask the running tap for the system-audio recording grant. The question is a
+  /// blocking round trip to coreaudiod, so the caller runs it off the main actor. nil
+  /// while there is no tap to ask.
+  var permissionProbe: (@Sendable () -> SystemAudioPermission)? { get }
   /// The tempo heard in the captured audio; nil while no steady beat is found.
   var estimatedBPM: Double? { get }
   func updateListener(_ orientation: ListenerOrientation)
@@ -35,6 +37,11 @@ typealias SpatialEngineFactory = @MainActor (
 @available(macOS 14.4, *)
 extension MultibandSpatializer: SpatialCaptureEngine {
   var estimatedBPM: Double? { movementState.estimatedBPM }
+
+  var permissionProbe: (@Sendable () -> SystemAudioPermission)? {
+    guard let probe = capturePermissionProbe else { return nil }
+    return { probe.run() }
+  }
 }
 
 enum SpatialEngines {

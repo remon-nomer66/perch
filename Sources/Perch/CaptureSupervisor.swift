@@ -120,24 +120,28 @@ struct CaptureSupervisor: Equatable {
     isRunning ? timing.watchInterval : timing.confirmInterval
   }
 
-  /// One look at the capture, `elapsed` after the previous one.
+  /// One look at the capture, `elapsed` after the previous one — the time that really
+  /// passed, questions included, not the nominal interval.
   /// - Parameters:
   ///   - hasSignal: a non-silent block arrived since the previous look.
   ///   - othersPlaying: whether a process other than Perch is outputting audio; nil when
-  ///     that cannot be read. Called only when the answer matters.
-  ///   - permission: asks the tap for the grant. Called only when the answer matters.
-  mutating func observe(
+  ///     that cannot be read. Asked only when the answer matters.
+  ///   - permission: asks the tap for the grant. Asked only when the answer matters.
+  ///
+  /// The questions are round trips to coreaudiod that the caller runs elsewhere; the
+  /// decision itself is pure, and runs wherever it is called from.
+  nonisolated(nonsending) mutating func observe(
     hasSignal: Bool,
     after elapsed: Duration,
-    othersPlaying: () -> Bool?,
-    permission: () -> SystemAudioPermission
-  ) -> Decision {
+    othersPlaying: () async -> Bool?,
+    permission: () async -> SystemAudioPermission
+  ) async -> Decision {
     switch phase {
     case .confirming(var confirmation):
       confirmation.elapsed += elapsed
-      return confirm(hasSignal: hasSignal, confirmation, permission: permission)
+      return await confirm(hasSignal: hasSignal, confirmation, permission: permission)
     case .running(let watch):
-      return self.watch(
+      return await self.watch(
         hasSignal: hasSignal,
         elapsed: elapsed,
         watch,
@@ -147,18 +151,18 @@ struct CaptureSupervisor: Equatable {
     }
   }
 
-  private mutating func confirm(
+  private nonisolated(nonsending) mutating func confirm(
     hasSignal: Bool,
     _ confirmation: Confirmation,
-    permission: () -> SystemAudioPermission
-  ) -> Decision {
+    permission: () async -> SystemAudioPermission
+  ) async -> Decision {
     // Real audio is proof whatever the tap says about the grant.
     if hasSignal {
       phase = .running(Watch(heardSignal: true))
       return .commit
     }
     var next = confirmation
-    let answer = permission()
+    let answer = await permission()
     switch answer {
     case .granted where confirmation.sawNonGrant && !confirmation.rebuilt:
       // The grant landed while this tap was live (it said no, or could not tell, before),
@@ -180,13 +184,13 @@ struct CaptureSupervisor: Equatable {
     }
   }
 
-  private mutating func watch(
+  private nonisolated(nonsending) mutating func watch(
     hasSignal: Bool,
     elapsed: Duration,
     _ watch: Watch,
-    othersPlaying: () -> Bool?,
-    permission: () -> SystemAudioPermission
-  ) -> Decision {
+    othersPlaying: () async -> Bool?,
+    permission: () async -> SystemAudioPermission
+  ) async -> Decision {
     var next = watch
     if hasSignal {
       // Audio flows: the capture is fine, and a later silence is a new stretch with a
@@ -196,7 +200,7 @@ struct CaptureSupervisor: Equatable {
     }
     // Unreadable counts as "may be playing": that is the side where a muted Mac gets
     // its sound back.
-    guard othersPlaying() != false else {
+    guard await othersPlaying() != false else {
       // Nothing else is playing: silence is what there is to hear. Only once that has
       // lasted is the stretch forgotten — one quiet look between two silent ones must
       // not throw away a vouched tap and cost another rebuild.
@@ -218,7 +222,7 @@ struct CaptureSupervisor: Equatable {
       return .rebuild
     case .rebuilt:
       // The whole Mac is muted meanwhile: a refusal from the fresh tap ends it at once.
-      let answer = permission()
+      let answer = await permission()
       if answer == .denied { return .revoke(.permissionDenied) }
       guard timedOut else { return keepWatching(next) }
       // "Allowed" is only believed once real audio has borne capture out. Without that,
@@ -230,7 +234,7 @@ struct CaptureSupervisor: Equatable {
       return keepWatching(next)
     case .vouched:
       guard timedOut else { return keepWatching(next) }
-      switch permission() {
+      switch await permission() {
       case .granted:
         next.silent = .zero
         return keepWatching(next)

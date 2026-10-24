@@ -147,30 +147,52 @@ public final class SystemAudioTap {
     cleanUp()
   }
 
-  /// システムオーディオ録音の許可を、このタップに問い合わせる（`start()` の後に呼ぶ）。
+  /// システムオーディオ録音の許可を、このタップに問い合わせる手立て（`start()` の後で
+  /// 有効。タップが無ければ nil）。
   ///
-  /// 作ったときと同じ記述を `kAudioTapPropertyDescription` へ設定し直し、返ってきた結果で
-  /// 判定する（`SystemAudioPermission` を参照）。記述は変わらないので、取り込みは続く。
-  /// タップがまだ無ければ判定できない。
+  /// 問い合わせは coreaudiod との同期の往復なので、呼び出し側がメインスレッドの外で
+  /// `run()` すること。持つのは値だけで、どのスレッドからでも走らせられる。
+  public var permissionProbe: PermissionProbe? {
+    guard tapID != AudioObjectID(kAudioObjectUnknown), let tapDescription else { return nil }
+    return PermissionProbe(tapID: tapID, tapDescription: tapDescription)
+  }
+
+  /// `permissionProbe` をその場で走らせる。呼んだスレッドを往復の間ふさぐ。
   public func probePermission() -> SystemAudioPermission {
-    guard tapID != AudioObjectID(kAudioObjectUnknown), var description = tapDescription else {
-      return .unknown
+    permissionProbe?.run() ?? .unknown
+  }
+
+  /// 作ったときと同じ記述を `kAudioTapPropertyDescription` へ設定し直し、返ってきた結果で
+  /// 許可を判定する（`SystemAudioPermission` を参照）。記述は変わらないので、取り込みは
+  /// 続く。タップが先に片付けられていれば、Core Audio が不正なオブジェクトとして断る
+  /// だけで、判定できないになる。
+  ///
+  /// `CATapDescription` は Sendable ではないが、タップを作った後は誰も書き換えず、ここでは
+  /// Core Audio へ渡すだけなので、スレッドをまたいで持ち運んでよい。
+  public struct PermissionProbe: @unchecked Sendable {
+    fileprivate let tapID: AudioObjectID
+    fileprivate let tapDescription: CATapDescription
+
+    public func run() -> SystemAudioPermission {
+      var description = tapDescription
+      var address = AudioObjectPropertyAddress(
+        mSelector: kAudioTapPropertyDescription,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+      )
+      let size = UInt32(MemoryLayout<CATapDescription>.stride)
+      let status = withUnsafeMutablePointer(to: &description) { pointer in
+        AudioObjectSetPropertyData(tapID, &address, 0, nil, size, pointer)
+      }
+      let permission = SystemAudioPermission(probeStatus: status)
+      if permission == .unknown {
+        // 許可と関係のない失敗。後から原因を追えるよう、生の値を残す。
+        SystemAudioTap.log.notice(
+          "tap permission probe inconclusive: status \(status, privacy: .public)"
+        )
+      }
+      return permission
     }
-    var address = AudioObjectPropertyAddress(
-      mSelector: kAudioTapPropertyDescription,
-      mScope: kAudioObjectPropertyScopeGlobal,
-      mElement: kAudioObjectPropertyElementMain
-    )
-    let size = UInt32(MemoryLayout<CATapDescription>.stride)
-    let status = withUnsafeMutablePointer(to: &description) { pointer in
-      AudioObjectSetPropertyData(tapID, &address, 0, nil, size, pointer)
-    }
-    let permission = SystemAudioPermission(probeStatus: status)
-    if permission == .unknown {
-      // 許可と関係のない失敗。後から原因を追えるよう、生の値を残す。
-      Self.log.notice("tap permission probe inconclusive: status \(status, privacy: .public)")
-    }
-    return permission
   }
 
   private func cleanUp() {

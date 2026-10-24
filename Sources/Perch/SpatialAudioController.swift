@@ -54,11 +54,21 @@ final class SpatialAudioController: ObservableObject {
   /// The engine's audible-block count at the previous look; a new engine starts at zero.
   private var lastAudibleBlocks = 0
   private let makeEngine: SpatialEngineFactory
-  private let othersPlaying: () -> Bool?
+  private let othersPlaying: @Sendable () -> Bool?
+  private let now: () -> ContinuousClock.Instant
   private let timing: CaptureSupervisor.Timing
+  /// The two questions the supervisor asks are blocking round trips to coreaudiod. They
+  /// run off the main actor, each with a time limit; no answer in time counts as unknown.
+  private let probeGate: BlockingCallGate<SystemAudioPermission>
+  private let playbackGate: BlockingCallGate<Bool?>
   private var supervisor: CaptureSupervisor?
+  /// When the capture was last looked at — elapsed time is measured, not assumed.
+  private var lastLook = ContinuousClock.now
+  /// Bumped by every teardown, so an answer that comes back after the attempt it was
+  /// asked for has ended (turned off, or started over) is dropped.
+  private var attempt = 0
   /// The last grant the tap reported, so the log records changes rather than every look.
-  private var loggedPermission: SystemAudioPermission?
+  private var loggedPermission: SystemAudioPermission??
   private var superviseTask: Task<Void, Never>?
   private var tempoTask: Task<Void, Never>?
   private var configRebuildTask: Task<Void, Never>?
@@ -75,16 +85,27 @@ final class SpatialAudioController: ObservableObject {
   ///     spatialiser over a process tap; tests pass a fake so no tap is ever created.
   ///   - othersPlaying: whether a process other than Perch is outputting audio (nil when
   ///     unreadable) — what tells a tap that lost capture from one that hears silence.
+  ///     A blocking call; it is run off the main actor.
+  ///   - now: the clock elapsed time is measured with.
+  ///   - probeTimeout: how long either blocking question may take before it counts as
+  ///     unanswered.
   ///   - timing: how often the capture is looked at, and how long each wait may last.
   init(
     defaults: UserDefaults = .standard,
     makeEngine: @escaping SpatialEngineFactory = SpatialEngines.makeSpatializer,
-    othersPlaying: @escaping () -> Bool? = { AudibleProcesses.isAnotherProcessOutputting() },
+    othersPlaying: @escaping @Sendable () -> Bool? = {
+      AudibleProcesses.isAnotherProcessOutputting()
+    },
+    now: @escaping () -> ContinuousClock.Instant = { ContinuousClock.now },
+    probeTimeout: Duration = .milliseconds(500),
     timing: CaptureSupervisor.Timing = CaptureSupervisor.Timing()
   ) {
     self.defaults = defaults
     self.makeEngine = makeEngine
     self.othersPlaying = othersPlaying
+    self.now = now
+    probeGate = BlockingCallGate(label: "dev.perch.spatial.permission", timeout: probeTimeout)
+    playbackGate = BlockingCallGate(label: "dev.perch.spatial.playback", timeout: probeTimeout)
     self.timing = timing
     autoBalance = defaults.object(forKey: Keys.auto) as? Bool ?? true
     wander = defaults.object(forKey: Keys.wander) as? Bool ?? true
@@ -121,7 +142,7 @@ final class SpatialAudioController: ObservableObject {
   private func start() {
     teardown()
     clearError()
-    loggedPermission = nil
+    loggedPermission = .none
     do {
       // The first start raises the system-audio prompt. Whether capture is allowed is
       // asked of the tap afterwards, by the supervisor.
@@ -137,6 +158,7 @@ final class SpatialAudioController: ObservableObject {
     }
     isStarting = true
     supervisor = CaptureSupervisor(timing: timing)
+    lastLook = now()
     superviseCapture()
   }
 
@@ -148,37 +170,53 @@ final class SpatialAudioController: ObservableObject {
       while !Task.isCancelled {
         guard let interval = self?.supervisor?.pollInterval else { return }
         try? await Task.sleep(for: interval)
-        guard !Task.isCancelled, let self, self.superviseOnce() else { return }
+        guard !Task.isCancelled, let self, await self.superviseOnce() else { return }
       }
     }
   }
 
   /// One tick of supervision. Returns whether supervision goes on.
-  private func superviseOnce() -> Bool {
+  private func superviseOnce() async -> Bool {
     guard var supervisor, let engine else { return false }
+    let attempt = self.attempt
+    let current = now()
+    let elapsed = current - lastLook
+    lastLook = current
     let audible = engine.audibleBlockCount
     let hasSignal = audible > lastAudibleBlocks
     lastAudibleBlocks = audible
-    let decision = supervisor.observe(
+    let probe = engine.permissionProbe
+    let othersPlaying = self.othersPlaying
+    let decision = await supervisor.observe(
       hasSignal: hasSignal,
-      after: supervisor.pollInterval,
-      othersPlaying: othersPlaying,
-      permission: { probePermission(of: engine) }
+      after: elapsed,
+      othersPlaying: { await self.playbackGate.run(othersPlaying) ?? nil },
+      permission: { await self.askPermission(probe) }
     )
+    // The questions took time, and the world may have moved on meanwhile. Turned off or
+    // started over: this look belongs to an attempt that is gone. Rebuilt underneath
+    // (options changed): its verdict is about the old engine — look again instead.
+    guard attempt == self.attempt else { return false }
+    guard self.engine === engine else { return true }
     self.supervisor = supervisor
     return carryOut(decision)
   }
 
-  /// Asks the tap for the grant, logging the answer whenever it changes.
-  private func probePermission(of engine: any SpatialCaptureEngine) -> SystemAudioPermission {
-    let permission = engine.probeCapturePermission()
-    if permission != loggedPermission {
+  /// Asks the tap for the grant off the main actor, logging the answer whenever it
+  /// changes. No answer in time counts as unknown.
+  private func askPermission(
+    _ probe: (@Sendable () -> SystemAudioPermission)?
+  ) async -> SystemAudioPermission {
+    guard let probe else { return .unknown }
+    let answer = await probeGate.run(probe)
+    if answer != loggedPermission {
+      let reported = answer.map { String(describing: $0) } ?? "no answer in time"
       Self.log.notice(
-        "system audio recording, as the tap reports it: \(String(describing: permission), privacy: .public)"
+        "system audio recording, as the tap reports it: \(reported, privacy: .public)"
       )
-      loggedPermission = permission
+      loggedPermission = answer
     }
-    return permission
+    return answer ?? .unknown
   }
 
   /// Returns whether supervision goes on.
@@ -299,6 +337,7 @@ final class SpatialAudioController: ObservableObject {
   }
 
   private func teardown() {
+    attempt &+= 1
     superviseTask?.cancel()
     superviseTask = nil
     supervisor = nil

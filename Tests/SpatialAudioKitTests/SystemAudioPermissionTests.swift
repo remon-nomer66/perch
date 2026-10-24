@@ -29,6 +29,7 @@ func probeStatusMapsToPermission(row: (OSStatus, SystemAudioPermission)) {
 @Test("開始前のタップには問い合わせる相手が無い: 判定できない")
 func aTapThatHasNotStartedCannotTell() {
   let tap = SystemAudioTap { _ in }
+  #expect(tap.permissionProbe == nil)
   #expect(tap.probePermission() == .unknown)
 }
 
@@ -36,5 +37,6 @@ func aTapThatHasNotStartedCannotTell() {
 @Test("取り込みを始めていない空間化エンジンも判定できない")
 func aSpatializerWithoutCaptureCannotTell() throws {
   let spatializer = try MultibandSpatializer(muteOriginal: false)
+  #expect(spatializer.capturePermissionProbe == nil)
   #expect(spatializer.probeCapturePermission() == .unknown)
 }
