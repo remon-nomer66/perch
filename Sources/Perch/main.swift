@@ -537,20 +537,12 @@ final class AppModel: ObservableObject {
 
   func playingNow() async -> NowPlayingService.PlayingAnswer { await nowPlayingService.playing() }
 
-  /// Whether rules can act on the device that owns the panel right now.
-  ///
-  /// A rule's actions are the Sony session's own vocabulary — a noise state, an equaliser
-  /// *preset identifier* the device declared, a listening mode — and `applyRule` writes
-  /// them through that session alone. None of it reaches a Bose device, so while Bose owns
-  /// the panel a rule can be neither applied nor meaningfully written.
-  var supportsRules: Bool { panel.summary.isControllable && !panel.isBose }
+  /// Whether rules can act on the device that owns the panel right now. See
+  /// `PanelModel.supportsRules`.
+  var supportsRules: Bool { panel.supportsRules }
 
   /// Why the rule editor is withheld, for the notice shown in its place.
-  var ruleUnavailableReason: RuleEditorUnavailableNotice.Reason {
-    panel.isBose
-      ? .unsupportedDevice(modelName: panel.summary.modelName)
-      : .noDevice
-  }
+  var ruleUnavailableReason: RuleEditorUnavailableNotice.Reason { panel.ruleUnavailableReason }
 
   /// Applies the matched rule, first undoing whichever rule held before it.
   ///
