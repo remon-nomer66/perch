@@ -1,6 +1,7 @@
 import AudioToolbox
 import CoreAudio
 import Foundation
+import os
 
 /// システム音声を Core Audio プロセスタップで横取りする（macOS 14.4+）。
 ///
@@ -30,8 +31,11 @@ public final class SystemAudioTap {
   private let muteOriginal: Bool
   private let excludeCurrentProcess: Bool
   private let queue = DispatchQueue(label: "app.perch.spatial.systemtap", qos: .userInteractive)
+  private static let log = Logger(subsystem: "dev.perch.mac", category: "spatial")
 
   private var tapID = AudioObjectID(kAudioObjectUnknown)
+  /// タップを作った記述。許可の問い合わせで、同じものを設定し直すために持っておく。
+  private var tapDescription: CATapDescription?
   private var aggregateID = AudioObjectID(kAudioObjectUnknown)
   private var ioProcID: AudioDeviceIOProcID?
   private var running = false
@@ -72,6 +76,7 @@ public final class SystemAudioTap {
     let tapStatus = AudioHardwareCreateProcessTap(description, &newTap)
     guard tapStatus == noErr else { throw TapError.createTapFailed(tapStatus) }
     tapID = newTap
+    tapDescription = description
 
     // 2. タップのストリームフォーマットを読む（Float の解釈に必要）。
     var formatAddress = AudioObjectPropertyAddress(
@@ -142,6 +147,32 @@ public final class SystemAudioTap {
     cleanUp()
   }
 
+  /// システムオーディオ録音の許可を、このタップに問い合わせる（`start()` の後に呼ぶ）。
+  ///
+  /// 作ったときと同じ記述を `kAudioTapPropertyDescription` へ設定し直し、返ってきた結果で
+  /// 判定する（`SystemAudioPermission` を参照）。記述は変わらないので、取り込みは続く。
+  /// タップがまだ無ければ判定できない。
+  public func probePermission() -> SystemAudioPermission {
+    guard tapID != AudioObjectID(kAudioObjectUnknown), var description = tapDescription else {
+      return .unknown
+    }
+    var address = AudioObjectPropertyAddress(
+      mSelector: kAudioTapPropertyDescription,
+      mScope: kAudioObjectPropertyScopeGlobal,
+      mElement: kAudioObjectPropertyElementMain
+    )
+    let size = UInt32(MemoryLayout<CATapDescription>.stride)
+    let status = withUnsafeMutablePointer(to: &description) { pointer in
+      AudioObjectSetPropertyData(tapID, &address, 0, nil, size, pointer)
+    }
+    let permission = SystemAudioPermission(probeStatus: status)
+    if permission == .unknown {
+      // 許可と関係のない失敗。後から原因を追えるよう、生の値を残す。
+      Self.log.notice("tap permission probe inconclusive: status \(status, privacy: .public)")
+    }
+    return permission
+  }
+
   private func cleanUp() {
     if running, let procID = ioProcID {
       AudioDeviceStop(aggregateID, procID)
@@ -158,6 +189,7 @@ public final class SystemAudioTap {
       AudioHardwareDestroyProcessTap(tapID)
       tapID = AudioObjectID(kAudioObjectUnknown)
     }
+    tapDescription = nil
     running = false
   }
 

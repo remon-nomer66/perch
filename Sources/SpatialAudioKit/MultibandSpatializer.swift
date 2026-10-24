@@ -242,6 +242,12 @@ public final class MultibandSpatializer: @unchecked Sendable {
     tap?.streamFormat ?? AudioStreamBasicDescription()
   }
 
+  /// システムオーディオ録音の許可を、取り込み中のタップに問い合わせる
+  /// （`SystemAudioTap.probePermission()`）。取り込んでいなければ判定できない。
+  public func probeCapturePermission() -> SystemAudioPermission {
+    tap?.probePermission() ?? .unknown
+  }
+
   /// 出力構成の変化でエンジンが止まった時の通知（PositionedSourceGraph へ転送）。
   /// `start()` の前に設定すること。
   public var onConfigurationChange: (@Sendable () -> Void)? {
