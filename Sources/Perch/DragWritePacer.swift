@@ -24,14 +24,18 @@ struct DragWritePacer {
 
   private let debounce: Duration
   private let settle: Duration
+  private let sleep: @MainActor (Duration) async -> Void
   private var pending: Task<Void, Never>?
 
+  /// `sleep` times both waits; tests pass one they advance by hand.
   init(
     debounce: Duration = DragWritePacer.defaultDebounce,
-    settle: Duration = DragWritePacer.defaultSettle
+    settle: Duration = DragWritePacer.defaultSettle,
+    sleep: @escaping @MainActor (Duration) async -> Void = { try? await Task.sleep(for: $0) }
   ) {
     self.debounce = debounce
     self.settle = settle
+    self.sleep = sleep
   }
 
   /// Takes one drag report. `write` is called with `isFinal` false for the paused-on
@@ -46,14 +50,15 @@ struct DragWritePacer {
     }
     let debounce = self.debounce
     let settle = self.settle
+    let sleep = self.sleep
     pending = Task { @MainActor in
       // Checked after each sleep, not only through it: a sleep that already finished
       // can still be cancelled before this task resumes, and a stale value written
       // then would land after the release that superseded it.
-      try? await Task.sleep(for: debounce)
+      await sleep(debounce)
       guard !Task.isCancelled else { return }
       write(false)
-      try? await Task.sleep(for: settle)
+      await sleep(settle)
       guard !Task.isCancelled else { return }
       Self.log.info("A drag ended without a release; finalised where it stopped")
       write(true)

@@ -26,25 +26,34 @@ struct DeviceWriteChain {
   private static let log = Logger(subsystem: "dev.perch.mac", category: "DeviceWrite")
 
   private let limit: Duration
+  private let sleep: @MainActor (Duration) async -> Void
   private var tail: Task<Void, Never>?
 
-  init(limit: Duration = DeviceWriteChain.defaultLimit) {
+  /// `sleep` times the limit; tests pass one they advance by hand, so whether a write
+  /// was given up on never depends on how busy the machine running them is.
+  init(
+    limit: Duration = DeviceWriteChain.defaultLimit,
+    sleep: @escaping @MainActor (Duration) async -> Void = { try? await Task.sleep(for: $0) }
+  ) {
     self.limit = limit
+    self.sleep = sleep
   }
 
   mutating func enqueue(_ operation: @escaping @MainActor () async -> Void) {
     let previous = tail
     let limit = self.limit
+    let sleep = self.sleep
     tail = Task { @MainActor in
       await previous?.value
-      await Self.run(operation, within: limit)
+      await Self.run(operation, within: limit, sleep: sleep)
     }
   }
 
   /// Returns once `operation` finishes or `limit` passes, whichever comes first.
   private static func run(
     _ operation: @escaping @MainActor () async -> Void,
-    within limit: Duration
+    within limit: Duration,
+    sleep: @escaping @MainActor (Duration) async -> Void
   ) async {
     let finish = FirstFinish()
     Task { @MainActor in
@@ -53,7 +62,8 @@ struct DeviceWriteChain {
     }
     // The deadline runs as its own task, so the very write being stuck cannot delay it.
     let deadline = Task { @MainActor in
-      guard (try? await Task.sleep(for: limit)) != nil else { return }
+      await sleep(limit)
+      guard !Task.isCancelled else { return }
       if finish.signal() {
         log.error(
           "A device write did not return within \(limit.components.seconds, privacy: .public) s; the writes behind it go ahead"
