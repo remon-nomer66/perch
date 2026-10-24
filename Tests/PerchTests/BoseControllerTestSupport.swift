@@ -59,6 +59,9 @@ enum ScriptedBmapBehaviour {
   case opensSilently
   /// The channel opens and answers the device name and battery GETs.
   case readsBack
+  /// As `readsBack` under the given name, plus the current mode and its [31.6] config, so
+  /// the live noise-control fields (wind reduction among them) reach the panel.
+  case readsModes(named: String)
 }
 
 /// A `BmapDeviceAccess` with scripted candidates, recording every open it is asked for.
@@ -95,6 +98,8 @@ final class ScriptedBmapDevices: BmapDeviceAccess {
       return AnsweringBmapChannel(answers: [:]).opened
     case .readsBack:
       return AnsweringBmapChannel(answers: AnsweringBmapChannel.readsBack).opened
+    case .readsModes(let name):
+      return AnsweringBmapChannel(answers: AnsweringBmapChannel.readsModes(named: name)).opened
     }
   }
 }
@@ -110,6 +115,20 @@ actor AnsweringBmapChannel: BmapChannel {
     .deviceName: Data([0x00] + Array("Model X".utf8)),
     .battery: Data([0x50, 0xff, 0xff, 0x00]),
   ]
+
+  /// A named device in mode 0, whose [31.6] config is configured (prompt 1) with wind
+  /// reduction on. Every slot asked for answers with that same config.
+  static func readsModes(named name: String) -> [BmapFunctionAddress: Data] {
+    var modeConfig = [UInt8](repeating: 0, count: 48)
+    modeConfig[2] = 0x01
+    modeConfig[45] = 0x01
+    return [
+      .deviceName: Data([0x00] + Array(name.utf8)),
+      .battery: Data([0x50, 0xff, 0xff, 0x00]),
+      BmapAudioMode.currentAddress: Data([0x00]),
+      BmapAudioMode.configAddress: Data(modeConfig),
+    ]
+  }
 
   nonisolated let inbound: AsyncStream<Data>
   private nonisolated let continuation: AsyncStream<Data>.Continuation

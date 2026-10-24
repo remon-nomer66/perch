@@ -299,10 +299,15 @@ final class BoseDeviceController: ObservableObject {
       }
       // One config drives both the wire and the panel. The display axes it carries — wind
       // reduction above all, which the earbuds lack though their [31.10] payload still
-      // has the byte — now come from the catalog entry for the announced product id,
-      // rather than from looking for "earbud" in a name that is localisable and, on a
-      // renamed device, not the model's at all.
-      panelModel = BosePanelModel(snapshot: snapshot, config: config, session: session)
+      // has the byte — come from the catalog entry for the announced product id, rather
+      // than from looking for "earbud" in a name that is localisable and, on a renamed
+      // device, not the model's at all. Only a device the catalog cannot describe falls
+      // back to the name, and only to withhold wind reduction (see `panelConfig`).
+      panelModel = BosePanelModel(
+        snapshot: snapshot,
+        config: Self.panelConfig(wire: config, productId: productId, modelName: snapshot.modelName),
+        session: session
+      )
       publishReadout(status: .ready)
       Self.log.notice("bose connected: controllable")
     } catch {
