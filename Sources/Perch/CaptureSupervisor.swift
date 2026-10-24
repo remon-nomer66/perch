@@ -23,7 +23,8 @@ import SpatialAudioKit
 /// timeout in case the grant goes. But only once real audio has been heard since
 /// turning on: the tap's "allowed" is itself an unproven answer, so on its own it never
 /// keeps a silent Mac — wrong answers, or a tap that is allowed but cannot capture,
-/// still give the sound back.
+/// still give the sound back. And not for ever: the vouch lapses once the tap has been
+/// silent for `vouchLimit` while others play, counted from the last real audio.
 ///
 /// The other half of a running feature is the spatialised output. When it stops for
 /// longer than a configuration change takes to be rebuilt, the original is still muted
@@ -48,6 +49,14 @@ struct CaptureSupervisor: Equatable {
     var outputGrace: Duration = .seconds(2)
     /// How long either question to coreaudiod may take before it counts as unanswered.
     var questionTimeout: Duration = .milliseconds(500)
+    /// How long a vouched tap may stay silent while others play, counted from the last
+    /// real audio, before the vouch lapses.
+    ///
+    /// The trade-off, chosen on purpose: a paused browser tab that keeps its output open
+    /// in silence turns spatial audio off after this long (never within seconds); in
+    /// exchange, if the tap's "allowed" was wrong — or the tap went deaf after the audio
+    /// that vouched for it — the original stays muted for at most this long.
+    var vouchLimit: Duration = .seconds(180)
 
     /// The longest gap between two looks that still counts as time watched: the interval
     /// overrun by both questions, with slack. Anything longer — the Mac slept, the main
@@ -108,6 +117,10 @@ struct CaptureSupervisor: Equatable {
     var silent: Duration = .zero
     /// How long nothing else has been playing, without audio either.
     var quiet: Duration = .zero
+    /// How long the tap has been silent while others may be playing, since the last real
+    /// audio. Only real audio resets it — a pause in the others' playing only stops it
+    /// counting.
+    var unheard: Duration = .zero
     var recovery = Recovery.none
     var output = OutputWatch()
   }
@@ -261,12 +274,13 @@ struct CaptureSupervisor: Equatable {
       // not throw away a vouched tap and cost another rebuild.
       next.quiet += elapsed
       if next.quiet >= timing.quietReset {
-        next = Watch(heardSignal: next.heardSignal, output: next.output)
+        next = Watch(heardSignal: next.heardSignal, unheard: next.unheard, output: next.output)
       }
       return keepWatching(next)
     }
     next.quiet = .zero
     next.silent += elapsed
+    next.unheard += elapsed
     let timedOut = next.silent >= timing.stallTimeout
     switch watch.recovery {
     case .none:
@@ -288,6 +302,8 @@ struct CaptureSupervisor: Equatable {
       next.recovery = .vouched
       return keepWatching(next)
     case .vouched:
+      // The vouch rests on audio heard before; it does not outlast this much silence.
+      if next.unheard >= timing.vouchLimit { return .revoke(.captureLost) }
       guard timedOut else { return keepWatching(next) }
       switch await permission() {
       case .granted:

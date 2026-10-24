@@ -24,6 +24,9 @@ import Testing
 //  - 空間化した音の出力（AVAudioEngine）が止まれば、構成変更の作り直しを待つ猶予
 //    （2秒）の後で1回作り直し、それでも止まるなら取り消す
 //  - スリープ明けなどで観測の間が大きく空いたら、その回はどのタイマーも進めない
+//  - 許可ありの答えで居座れるのは、最後の実音から（他が再生中の時間で数えて）3分まで。
+//    無音のまま出力を開いているタブだけなら数秒では取り消さないが、いつまでもは
+//    居座らない
 
 private typealias Decision = CaptureSupervisor.Decision
 
@@ -247,6 +250,28 @@ private let watchScenarios: [WatchScenario] = [
     name: "実音を聞いた後で、作り直したタップが許可ありと答えるなら、無音は相手の音: オンのまま",
     looks: [.flowing] + stall() + stall() + stall(15),
     decisions: [.hold] + holds(4) + [.rebuild] + holds(5) + holds(15)
+  ),
+  WatchScenario(
+    name: "無音のまま出力を開いているタブだけなら、2分たってもオンのまま（数秒では取り消さない）",
+    looks: [.flowing] + stall(120),
+    decisions: [.hold] + holds(4) + [.rebuild] + holds(115)
+  ),
+  WatchScenario(
+    name: "実音のあと、他が再生中の無音が3分続けば、許可ありの答えでも取り消す",
+    looks: [.flowing] + stall(180),
+    decisions: [.hold] + holds(4) + [.rebuild] + holds(174) + [.revoke(.captureLost)]
+  ),
+  WatchScenario(
+    name: "他の再生が止まっている間は3分を数えず、止まっても埋め合わせない（戻すのは実音だけ）",
+    looks: [.flowing] + stall(100) + stall(10, .quiet) + stall(80),
+    decisions: [.hold] + holds(4) + [.rebuild] + holds(95) + holds(10)
+      + holds(4) + [.rebuild] + holds(74) + [.revoke(.captureLost)]
+  ),
+  WatchScenario(
+    name: "実音が戻れば、3分は数え直す",
+    looks: [.flowing] + stall(170) + [.flowing] + stall(170),
+    decisions: [.hold] + holds(4) + [.rebuild] + holds(165)
+      + [.hold] + holds(4) + [.rebuild] + holds(165)
   ),
   WatchScenario(
     name: "実音を一度も聞いていなければ、作り直したタップが許可ありと答えても取り消す",
