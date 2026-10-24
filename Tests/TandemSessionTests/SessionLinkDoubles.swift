@@ -61,6 +61,13 @@ actor LinkDouble: TandemChannel {
     payloads.filter { Array($0.prefix(prefix.count)) == prefix }.count
   }
 
+  /// Pushes `payload` and ends the channel in one step, so that nothing can run on
+  /// the session between the answer and the close.
+  func sendThenDrop(_ payload: [UInt8]) throws {
+    try send(payload)
+    inbound.finish()
+  }
+
   /// Pushes a frame the device sends on its own: a reply, or an unsolicited notice.
   func send(_ payload: [UInt8]) throws {
     let frame = try TandemFrame(

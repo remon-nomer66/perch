@@ -143,19 +143,7 @@ public actor SessionCoordinator {
   public var unsupportedReason: TandemDeviceVerificationFailure? { rejection }
   public var readings: DeviceReadings { latestReadings }
 
-  /// Everything a panel refresh needs, read in one actor hop so the fields are always
-  /// of the same instant. Taken one accessor at a time, an `invalidate()` could land
-  /// between them and hand the panel a `.ready` phase with a nil fingerprint for a
-  /// frame; with device-scoped rules that momentary nil model name unmatched a rule and
-  /// set noise/EQ flapping. A single hop cannot be interrupted.
-  public struct Snapshot: Sendable {
-    public let phase: SessionState.Phase
-    public let fingerprint: TandemDeviceFingerprint?
-    public let unsupportedReason: TandemDeviceVerificationFailure?
-    public let acceptsWrites: Bool
-    public let readings: DeviceReadings
-  }
-
+  /// Everything a panel refresh needs, in one actor hop (see `Snapshot`).
   public var snapshot: Snapshot {
     Snapshot(
       phase: state.phase,
@@ -402,13 +390,20 @@ public actor SessionCoordinator {
   /// a refresh tick (see `NoiseControlReading.applying(unsolicited:)`).
   private func applyUnsolicited(_ frame: TandemFrame) {
     guard let updated = latestReadings.noiseControl?.applying(unsolicited: frame) else { return }
-    settle(.noiseControl) { $0.noiseControl = updated }
+    settle(.noiseControl, from: epoch) { $0.noiseControl = updated }
   }
 
   /// Stores a setting that changed outside the poll — a write's read-back or the
   /// device's own announcement — and marks it, so that a poll cycle already under way
-  /// does not put back the value it read before the change.
-  private func settle(_ setting: DeviceReadings.Setting, _ update: (inout DeviceReadings) -> Void) {
+  /// does not put back the value it read before the change. A write can outlive its
+  /// session between the read-back's answer and this store; what it read then
+  /// belongs to a device that is gone, so it is dropped like a stale poll cycle.
+  private func settle(
+    _ setting: DeviceReadings.Setting,
+    from admittedEpoch: SessionEpoch,
+    _ update: (inout DeviceReadings) -> Void
+  ) {
+    guard admittedEpoch == epoch else { return }
     update(&latestReadings)
     settingRevisions = settingRevisions.bumping(setting)
   }
@@ -565,6 +560,7 @@ public actor SessionCoordinator {
   /// happens once, on the value the drag settles on.
   public func apply(noiseControl target: TandemNoiseControlState, isFinal: Bool = true) async throws {
     guard acceptsWrites else { throw WriteFailure.notPermitted }
+    let admittedEpoch = epoch
     guard let reading = latestReadings.noiseControl else {
       throw WriteFailure.unsupported
     }
@@ -611,7 +607,7 @@ public actor SessionCoordinator {
     }
 
     let confirmed = try await readNoiseControlNow(inquiry)
-    settle(.noiseControl) { $0.noiseControl = confirmed }
+    settle(.noiseControl, from: admittedEpoch) { $0.noiseControl = confirmed }
     guard confirmed.state == target else {
       throw WriteFailure.notApplied(confirmed.state)
     }
@@ -625,6 +621,7 @@ public actor SessionCoordinator {
   /// device declared, so a device without listening modes is never written to here.
   public func apply(listeningSelection target: TandemListeningSelection) async throws {
     guard acceptsWrites else { throw WriteFailure.notPermitted }
+    let admittedEpoch = epoch
     guard let reading = latestReadings.listeningMode, !reading.features.isEmpty else {
       throw WriteFailure.unsupported
     }
@@ -646,7 +643,7 @@ public actor SessionCoordinator {
     }
 
     let confirmed = try await readListeningNow(features: reading.features)
-    settle(.listeningMode) { $0.listeningMode = confirmed }
+    settle(.listeningMode, from: admittedEpoch) { $0.listeningMode = confirmed }
     guard confirmed.selection == target else {
       throw WriteFailure.notAppliedListening(confirmed.selection)
     }
@@ -690,6 +687,7 @@ public actor SessionCoordinator {
     isFinal: Bool = true
   ) async throws {
     guard acceptsWrites else { throw WriteFailure.notPermitted }
+    let admittedEpoch = epoch
     guard let reading = latestReadings.equalizer else { throw WriteFailure.unsupported }
     let inquiry = TandemReadOnlyEqualizer.inquiry(for: fingerprint?.dialect ?? .current)
     // The older generation writes band levels against "the current preset" (0xFF)
@@ -712,7 +710,7 @@ public actor SessionCoordinator {
     guard isFinal else { return }
 
     let confirmed = try await readEqualizerParameterNow(reading)
-    settle(.equalizer) { $0.equalizer = confirmed }
+    settle(.equalizer, from: admittedEpoch) { $0.equalizer = confirmed }
     // A preset selection is judged on the preset; a band write on the bands. The
     // preset byte of a legacy band write is an addressing detail ("the current
     // preset"), so the bands are the requested value there.
@@ -734,6 +732,7 @@ public actor SessionCoordinator {
   /// reason as the listening writes; the read-back is the check.
   public func apply(speakToChatEnabled isEnabled: Bool) async throws {
     guard acceptsWrites else { throw WriteFailure.notPermitted }
+    let admittedEpoch = epoch
     guard let reading = latestReadings.speakToChat else { throw WriteFailure.unsupported }
     try? await writeWithoutReply {
       try TandemSpeakToChatProtocol.setEnabledRequest(
@@ -744,7 +743,7 @@ public actor SessionCoordinator {
       )
     }
     let confirmed = try await readSpeakToChatNow(reading)
-    settle(.speakToChat) { $0.speakToChat = confirmed }
+    settle(.speakToChat, from: admittedEpoch) { $0.speakToChat = confirmed }
     guard confirmed.isEnabled == isEnabled else {
       throw WriteFailure.notAppliedSpeakToChat(confirmed)
     }
@@ -755,6 +754,7 @@ public actor SessionCoordinator {
     timeout: TandemSpeakToChatTimeout
   ) async throws {
     guard acceptsWrites else { throw WriteFailure.notPermitted }
+    let admittedEpoch = epoch
     guard let reading = latestReadings.speakToChat else { throw WriteFailure.unsupported }
     try? await writeWithoutReply {
       try TandemSpeakToChatProtocol.setDetailRequest(
@@ -765,7 +765,7 @@ public actor SessionCoordinator {
       )
     }
     let confirmed = try await readSpeakToChatNow(reading)
-    settle(.speakToChat) { $0.speakToChat = confirmed }
+    settle(.speakToChat, from: admittedEpoch) { $0.speakToChat = confirmed }
     guard confirmed.sensitivity == sensitivity, confirmed.timeout == timeout else {
       throw WriteFailure.notAppliedSpeakToChat(confirmed)
     }
@@ -778,6 +778,7 @@ public actor SessionCoordinator {
   /// as the listening writes; the read-back is the check.
   public func apply(sidetoneEnabled isEnabled: Bool) async throws {
     guard acceptsWrites else { throw WriteFailure.notPermitted }
+    let admittedEpoch = epoch
     guard let reading = latestReadings.sidetone, reading.isEnabled != nil else {
       throw WriteFailure.unsupported
     }
@@ -789,7 +790,7 @@ public actor SessionCoordinator {
       )
     }
     let confirmed = try await readSidetoneNow(reading)
-    settle(.sidetone) { $0.sidetone = confirmed }
+    settle(.sidetone, from: admittedEpoch) { $0.sidetone = confirmed }
     guard confirmed.isEnabled == isEnabled else {
       throw WriteFailure.notAppliedSidetone(confirmed)
     }

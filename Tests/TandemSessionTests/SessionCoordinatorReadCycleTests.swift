@@ -120,3 +120,44 @@ private func noiseControl(level: Int) -> NoiseControlReading {
   #expect(keptEqualizer.equalizer == current.equalizer)
   #expect(keptEqualizer.noiseControl == nil)
 }
+
+// MARK: - A read-back outliving its session
+
+@Test func aReadBackThatLandsAsTheChannelDropsIsNotStoredAfterTheSessionEnds() async throws {
+  // A write is reading back when the output moves away (suspending the session), and
+  // the device answers the read-back and closes the channel in the same breath. The
+  // close ends the session before the write gets to store its answer — and storing it
+  // anyway put the gone device's value into readings no session owns.
+  let opener = LinkOpener(script: speakToChatScript)
+  let coordinator = SessionCoordinator(
+    opener: opener,
+    verifier: FixedOutcomeVerifier(
+      outcome: try verifiedOutcome(declaring: [TandemSpeakToChatProtocol.functionCodeType2])
+    ),
+    timeouts: SessionCoordinator.Timeouts(response: .seconds(60), backoffUnit: .seconds(60))
+  )
+  await coordinator.handle(.defaultOutputChanged(linkTarget))
+  #expect(await waitFor { await coordinator.readings.speakToChat != nil })
+  let link = try #require(opener.latest)
+
+  // The read-back's last request goes unanswered until the test says so.
+  await link.answer([0xFA, speakToChat], with: nil)
+  let finished = Latch()
+  let writer = Task {
+    _ = try? await coordinator.apply(speakToChatEnabled: true)
+    await finished.set()
+  }
+  #expect(await waitFor { await link.writes(withPrefix: [0xFA, speakToChat]) == 2 })
+
+  await coordinator.handle(.defaultOutputChanged(nil))
+  #expect(await coordinator.phase == .suspended(resume: .ready))
+  try await link.sendThenDrop([0xFB, speakToChat, 0x01, 0x02])
+
+  #expect(await waitFor { await finished.isSet })
+  #expect(await coordinator.phase == .released)
+  #expect(
+    await coordinator.readings.speakToChat == nil,
+    "a write stored the closed session's value"
+  )
+  writer.cancel()
+}
