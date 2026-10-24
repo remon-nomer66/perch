@@ -10,34 +10,6 @@ import TandemSession
 // control, listening mode, speak-to-chat, and call-time sidetone are all read from
 // the headset.
 
-/// Guards one panel field against the periodic refresh while writes are in flight.
-///
-/// Consecutive writes to the same field overlap: were the guard a plain flag, the
-/// first write's completion would lift it while the second is still waiting, and the
-/// refresh would snap the control back to the device's lagging value. Each `begin`
-/// issues a fresh token; only the latest token's holder may lift the guard.
-private struct AdjustmentGuard {
-  private(set) var isHolding = false
-  private var generation = 0
-
-  mutating func begin() -> Int {
-    generation += 1
-    isHolding = true
-    return generation
-  }
-
-  /// Lifts the guard, unless a later `begin` has superseded this token.
-  mutating func end(_ token: Int) {
-    if generation == token { isHolding = false }
-  }
-
-  /// Lifts the guard now and invalidates every outstanding token.
-  mutating func cancel() {
-    generation += 1
-    isHolding = false
-  }
-}
-
 @MainActor
 final class AppModel: ObservableObject {
   @Published var panel = PanelModel()
@@ -92,18 +64,8 @@ final class AppModel: ObservableObject {
   /// device that takes a moment to apply a mode change cannot snap the picker back.
   private var listeningAdjustment = AdjustmentGuard()
 
-  /// Device writes land in the order they were asked. Each write is its own Task, and
-  /// two independent Tasks can reach the session actor in either order — a rule switch
-  /// whose "restore the old value" landed *after* the new rule's write was exactly that
-  /// race. Every write hops onto the tail of the previous one instead.
-  private var deviceWriteChain: Task<Void, Never>?
-  private func enqueueDeviceWrite(_ operation: @escaping @MainActor () async -> Void) {
-    let previous = deviceWriteChain
-    deviceWriteChain = Task { @MainActor in
-      await previous?.value
-      await operation()
-    }
-  }
+  /// Device writes land in the order they were asked; see `DeviceWriteChain`.
+  private var deviceWrites = DeviceWriteChain()
 
   func applyListening(_ target: TandemListeningSelection, using service: SessionService) {
     guard let current = panel.listeningMode else { return }
@@ -115,7 +77,7 @@ final class AppModel: ObservableObject {
       selection: target,
       savedRoom: savedRoom
     )
-    enqueueDeviceWrite { [weak self] in
+    deviceWrites.enqueue { [weak self] in
       let session = await service.session
       try? await session.apply(listeningSelection: target)
       await self?.refresh(from: service)
@@ -126,7 +88,7 @@ final class AppModel: ObservableObject {
   func applyNoiseControl(_ target: TandemNoiseControlState, using service: SessionService) {
     levelDrag?.cancel()
     levelAdjustment.cancel()
-    enqueueDeviceWrite { [weak self] in
+    deviceWrites.enqueue { [weak self] in
       let session = await service.session
       try? await session.apply(noiseControl: target)
       await self?.refresh(from: service)
@@ -195,7 +157,7 @@ final class AppModel: ObservableObject {
       selectedPreset: identifier,
       bandSteps: bandSteps.isEmpty ? reading.bandSteps : bandSteps.map(Int.init)
     )
-    enqueueDeviceWrite { [weak self] in
+    deviceWrites.enqueue { [weak self] in
       let session = await service.session
       try? await session.apply(equalizerPreset: identifier, bandSteps: bandSteps)
       await self?.refresh(from: service)
@@ -293,13 +255,13 @@ final class AppModel: ObservableObject {
 
     let readings = snap.readings
     next.summary.codec = readings.codec?.description
-    next.equalizer = equalizerAdjustment.isHolding ? panel.equalizer : readings.equalizer
-    next.listeningMode = listeningAdjustment.isHolding ? panel.listeningMode : readings.listeningMode
-    next.speakToChat = speakToChatAdjustment.isHolding ? panel.speakToChat : readings.speakToChat
-    next.sidetone = sidetoneAdjustment.isHolding ? panel.sidetone : readings.sidetone
+    next.equalizer = equalizerAdjustment.isHolding() ? panel.equalizer : readings.equalizer
+    next.listeningMode = listeningAdjustment.isHolding() ? panel.listeningMode : readings.listeningMode
+    next.speakToChat = speakToChatAdjustment.isHolding() ? panel.speakToChat : readings.speakToChat
+    next.sidetone = sidetoneAdjustment.isHolding() ? panel.sidetone : readings.sidetone
     // A drag in progress owns the level; the device's lagging value must not clobber
     // it mid-gesture.
-    next.noiseControl = levelAdjustment.isHolding ? panel.noiseControl : readings.noiseControl
+    next.noiseControl = levelAdjustment.isHolding() ? panel.noiseControl : readings.noiseControl
     next.battery = Self.batteryLayout(for: fingerprint, readings: readings)
     next.nowPlaying = nowPlaying.map {
       PanelModel.NowPlaying(
