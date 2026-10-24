@@ -90,7 +90,7 @@ public final class FullScreenMonitor {
     hysteresis = FullScreenHysteresis()
     lastReason = nil
     guard wasFullScreen else { return }
-    Self.log.info("Notch screen released: no longer watched")
+    Self.log.notice("Notch screen released: no longer watched")
     onChange?(false)
   }
 
@@ -107,8 +107,10 @@ public final class FullScreenMonitor {
     hysteresis = previous.applying(reading, at: now())
     if hysteresis.isAwaitingConfirmation { scheduleFollowUp() }
     guard hysteresis.isFullScreen != previous.isFullScreen else { return }
+    // Notice, not info: info stays in memory only, and a report that the notch stepped
+    // aside unasked usually arrives after the fact, when only a persisted line can say why.
     let state = hysteresis.isFullScreen ? "taken" : "released"
-    Self.log.info("Notch screen \(state, privacy: .public): \(reason, privacy: .public)")
+    Self.log.notice("Notch screen \(state, privacy: .public): \(reason, privacy: .public)")
     onChange?(hysteresis.isFullScreen)
   }
 
