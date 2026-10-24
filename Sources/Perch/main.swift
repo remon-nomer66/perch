@@ -376,11 +376,11 @@ final class AppModel: ObservableObject {
     guard let current = panel.speakToChat else { return }
     let token = speakToChatAdjustment.begin()
     panel.speakToChat = Self.speakToChat(current, isEnabled: enabled)
-    Task {
+    deviceWrites.enqueue { [weak self] in
       let session = await service.session
       try? await session.apply(speakToChatEnabled: enabled)
-      await refresh(from: service)
-      speakToChatAdjustment.end(token)
+      await self?.refresh(from: service)
+      self?.speakToChatAdjustment.end(token)
     }
   }
 
@@ -392,11 +392,11 @@ final class AppModel: ObservableObject {
     guard let current = panel.speakToChat else { return }
     let token = speakToChatAdjustment.begin()
     panel.speakToChat = Self.speakToChat(current, sensitivity: sensitivity, timeout: timeout)
-    Task {
+    deviceWrites.enqueue { [weak self] in
       let session = await service.session
       try? await session.apply(speakToChatSensitivity: sensitivity, timeout: timeout)
-      await refresh(from: service)
-      speakToChatAdjustment.end(token)
+      await self?.refresh(from: service)
+      self?.speakToChatAdjustment.end(token)
     }
   }
 
@@ -431,11 +431,11 @@ final class AppModel: ObservableObject {
         value: .boolean(enabled)
       )
     )
-    Task {
+    deviceWrites.enqueue { [weak self] in
       let session = await service.session
       try? await session.apply(sidetoneEnabled: enabled)
-      await refresh(from: service)
-      sidetoneAdjustment.end(token)
+      await self?.refresh(from: service)
+      self?.sidetoneAdjustment.end(token)
     }
   }
 
