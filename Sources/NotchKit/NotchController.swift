@@ -128,13 +128,15 @@ public final class NotchController: ObservableObject {
   /// settings without accumulating observers or windows.
   public func start() {
     stop()
+    // Set before building: `rebuild()` refuses to run without it.
+    isRunning = true
     rebuild()
     screenObserver = NotificationCenter.default.addObserver(
       forName: NSApplication.didChangeScreenParametersNotification,
       object: nil,
       queue: .main
     ) { [weak self] _ in
-      MainActor.assumeIsolated { self?.rebuild() }
+      MainActor.assumeIsolated { self?.screenParametersDidChange() }
     }
 
     pointer.onPointerMoved = { [weak self] location in
@@ -144,9 +146,20 @@ public final class NotchController: ObservableObject {
       MainActor.assumeIsolated { self?.clicked(click) }
     }
     pointer.start()
-    isRunning = true
     Self.log.debug("start: usable notch \(self.hasUsableNotch), virtual \(self.isVirtualNotch)")
   }
+
+  /// The screen observer's handler. Removing the observer in `stop()` does not recall a
+  /// block the main queue already holds, so one can still arrive after it — and, acted
+  /// on, would rebuild a stopped notch with a live catcher over the menu bar.
+  func screenParametersDidChange() {
+    guard isRunning else { return }
+    rebuild()
+  }
+
+  /// Whether any window of the notch is up. Read by the tests, which must not put one
+  /// on screen to find out.
+  var hasWindows: Bool { window != nil || catcher != nil }
 
   /// Re-evaluates which screen hosts the notch without tearing anything down, for the
   /// moments the geometry did not change but the choice of it did — the virtual-notch
@@ -182,6 +195,9 @@ public final class NotchController: ObservableObject {
   // MARK: - Screens
 
   private func rebuild() {
+    // Every route here is meant for a running notch; one that arrives otherwise must
+    // not conjure windows the next `stop()` would never be asked to take down.
+    guard isRunning else { return }
     // A real notch wins wherever one exists; only when none does, and the setting asks
     // for it, is a notch synthesised over the main screen's menu bar.
     let screen: NSScreen?
