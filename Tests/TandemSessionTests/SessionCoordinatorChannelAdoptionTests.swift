@@ -9,6 +9,35 @@ import Testing
 private let probeRequest: [UInt8] = [0x0A, 0x01]
 private let probeAnswer: [UInt8] = [0x0B, 0x01]
 
+@Test func anOpenAbandonedByAReleaseCannotPassForTheNextDevicesOpen() async throws {
+  // The output moves away (releasing the session) and then to a different device
+  // while the first device's open is still out. Releasing reset the attempt counter,
+  // so the next open reused the abandoned one's number, and when the first device's
+  // channel landed it was adopted as the second device's.
+  let opener = GatedLinkOpener()
+  let coordinator = SessionCoordinator(
+    opener: opener,
+    verifier: HeldVerifier(outcome: try verifiedOutcome(declaring: [])),
+    timeouts: SessionCoordinator.Timeouts(response: .seconds(60), backoffUnit: .seconds(60))
+  )
+
+  await coordinator.handle(.defaultOutputChanged(DeviceIdentity("device-a")))
+  #expect(await waitFor { opener.links.count == 1 })
+  await coordinator.handle(.defaultOutputChanged(nil))
+  #expect(await coordinator.phase == .released)
+  await coordinator.handle(.defaultOutputChanged(DeviceIdentity("device-b")))
+  #expect(await waitFor { opener.links.count == 2 })
+
+  let otherDevice = opener.links[0]
+  opener.release(0)
+  #expect(await waitFor { await otherDevice.isClosed }, "the abandoned channel was not closed")
+  #expect(await coordinator.phase == .connecting, "another device's channel was adopted")
+
+  opener.release(1)
+  #expect(await waitFor { await coordinator.phase == .verifying })
+  await coordinator.handle(.manualRelease)
+}
+
 @Test func anAbandonedOpenLandingWhileTheLiveOneVerifiesIsClosedNotAdopted() async throws {
   // The output moves from one device to another while the first open is still out.
   // The second open lands and starts verifying; then the first, abandoned open lands

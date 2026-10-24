@@ -164,6 +164,8 @@ public struct SessionState: Equatable, Sendable {
     self.isTargetDefaultOutput = self.target == nil ? false : isTargetDefaultOutput
   }
 
+  /// The state before anything has connected. A session that releases later goes
+  /// through `releasing()` instead, which keeps its attempt counter.
   public static let released = SessionState()
 
   /// `suspended` is deliberately excluded even though the channel is still open:
@@ -199,7 +201,7 @@ public struct SessionPolicy: Sendable {
       )
     case .manualRelease:
       guard state.phase != .released else { return (state, []) }
-      return (.released, teardown(from: state))
+      return (state.releasing(), teardown(from: state))
     default:
       break
     }
@@ -211,7 +213,7 @@ public struct SessionPolicy: Sendable {
 
     if case .bluetoothDisconnected = event {
       guard state.target != nil else { return (state, []) }
-      return (.released, teardown(from: state))
+      return (state.releasing(), teardown(from: state))
     }
 
     if let outcome = reduceTargetChange(state, event) { return outcome }
@@ -285,7 +287,7 @@ public struct SessionPolicy: Sendable {
       // what is being listened to, so release and let the output notification
       // reconnect — the same path a verified device takes.
       if blocked == .unverified {
-        guard let device else { return (.released, []) }
+        guard let device else { return (state.releasing(), []) }
         return start(connectingTo: device, from: state)
       }
       let restored: SessionState.Phase =
@@ -304,7 +306,7 @@ public struct SessionPolicy: Sendable {
       return (state.moved(to: restored, isTargetDefaultOutput: device != nil), effects)
     }
 
-    guard let device else { return (.released, []) }
+    guard let device else { return (state.releasing(), []) }
     return start(connectingTo: device, from: state)
   }
 
@@ -343,7 +345,7 @@ public struct SessionPolicy: Sendable {
       return failed(state)
 
     case (.connecting, .defaultOutputChanged(nil)):
-      return (.released, [.cancelOpen, .closeChannel])
+      return (state.releasing(), [.cancelOpen, .closeChannel])
 
     // Neither verdict restores the failure budget: a session that verifies and then
     // faults on its first poll would otherwise reconnect forever, wiping on every
@@ -369,7 +371,7 @@ public struct SessionPolicy: Sendable {
     // An unfinished session must not survive into `suspended`: resuming from there
     // would reach `ready` without completing verification or recovery.
     case (.verifying, .defaultOutputChanged(nil)), (.recovering, .defaultOutputChanged(nil)):
-      return (.released, [.closeChannel, .invalidateSession, .failPendingRequests])
+      return (state.releasing(), [.closeChannel, .invalidateSession, .failPendingRequests])
 
     case (.ready, .defaultOutputChanged(nil)):
       return (
@@ -393,10 +395,10 @@ public struct SessionPolicy: Sendable {
       }
 
     case (.suspended, .graceExpired):
-      return (.released, [.cancelGrace, .closeChannel, .invalidateSession])
+      return (state.releasing(), [.cancelGrace, .closeChannel, .invalidateSession])
 
     case (.suspended, .channelClosedUnexpectedly):
-      return (.released, [.cancelGrace, .invalidateSession, .failPendingRequests])
+      return (state.releasing(), [.cancelGrace, .invalidateSession, .failPendingRequests])
 
     case (.connecting, .controlContended):
       // The open hung until its timeout against a device the transport had already
@@ -431,7 +433,7 @@ public struct SessionPolicy: Sendable {
       return failed(state)
 
     case (.retryWaiting, .backoffExpired):
-      guard let target = state.target else { return (.released, [.cancelBackoff]) }
+      guard let target = state.target else { return (state.releasing(), [.cancelBackoff]) }
       let (next, open) = start(
         connectingTo: target,
         from: state,
@@ -440,10 +442,10 @@ public struct SessionPolicy: Sendable {
       return (next, [.cancelBackoff] + open)
 
     case (.retryWaiting, .defaultOutputChanged(nil)):
-      return (.released, [.cancelBackoff])
+      return (state.releasing(), [.cancelBackoff])
 
     case (.contended, .defaultOutputChanged(nil)), (.retryExhausted, .defaultOutputChanged(nil)):
-      return (.released, teardown(from: state))
+      return (state.releasing(), teardown(from: state))
 
     case (.contended, .manualRetry), (.retryExhausted, .manualRetry):
       // Seizing the session for a device the user is not listening to would take
@@ -535,6 +537,13 @@ public struct SessionPolicy: Sendable {
 }
 
 extension SessionState {
+  /// `released`, carrying the attempt counter forward. Starting it over would let
+  /// the next connection reuse the number of an attempt abandoned moments earlier,
+  /// and that attempt's late completion would then pass for the live one.
+  fileprivate func releasing() -> SessionState {
+    SessionState(phase: .released, attempt: attempt)
+  }
+
   fileprivate func withDefaultOutput(_ isDefaultOutput: Bool) -> SessionState {
     SessionState(
       phase: phase,

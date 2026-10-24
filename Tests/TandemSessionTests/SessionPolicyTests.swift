@@ -616,6 +616,38 @@ private let policy = SessionPolicy(maximumFailureCount: 3)
   #expect(verifying.phase == .verifying)
 }
 
+@Test func releasingKeepsTheAttemptCounter() {
+  // `released` used to be a fresh state, attempt and all, so the next connection
+  // reused the number of an attempt abandoned moments earlier — and that attempt's
+  // late completion (the cancelled open failing, or landing after all) passed for
+  // the live one.
+  let releases: [[SessionEvent]] = [
+    [.defaultOutputChanged(nil)],
+    [.manualRelease],
+    [.bluetoothDisconnected],
+    [.willSleep, .didWake(nil)],
+  ]
+  for release in releases {
+    let (connecting, _) = policy.reduce(.released, .defaultOutputChanged(deviceA))
+    let abandoned = connecting.attempt
+    var released = connecting
+    for event in release {
+      (released, _) = policy.reduce(released, event)
+    }
+    #expect(released.phase == .released)
+
+    let (reconnecting, _) = policy.reduce(released, .defaultOutputChanged(deviceB))
+    #expect(reconnecting.attempt != abandoned, "\(release) reused an abandoned attempt")
+
+    let (afterFailure, failureEffects) = policy.reduce(reconnecting, .channelFailed(abandoned))
+    #expect(afterFailure == reconnecting, "a cancelled open failing late failed the live one")
+    #expect(failureEffects.isEmpty)
+    let (afterOpen, openEffects) = policy.reduce(reconnecting, .channelOpened(abandoned))
+    #expect(afterOpen == reconnecting, "the other device's late channel was adopted")
+    #expect(openEffects == [.closeChannel])
+  }
+}
+
 @Test func aStaleOpenWhileTheLiveOneVerifiesOnlyClosesIt() {
   // The phase does not move for a stale completion, and here it is already
   // `verifying`: the coordinator adopts a channel only when told to verify it, so
@@ -728,6 +760,11 @@ private let policy = SessionPolicy(maximumFailureCount: 3)
         #expect(next.target != nil, "\(phase) + \(event) lost its target")
       }
       #expect(next.failureCount >= 0)
+      // Attempt numbers only ever move forward. Releasing must not rewind them, or
+      // an abandoned attempt's completion matches the next one.
+      if next.phase == .released {
+        #expect(next.attempt == attempt, "\(phase) + \(event) rewound the attempt")
+      }
       // Writes may only reopen from a phase that had a verified session.
       if next.acceptsWrites {
         // Waking restores whatever the session was before sleeping, so a usable
