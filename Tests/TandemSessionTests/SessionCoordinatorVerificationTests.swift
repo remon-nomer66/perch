@@ -62,11 +62,14 @@ private func coordinator(
   await session.handle(.defaultOutputChanged(linkTarget))
   #expect(await waitFor { await session.phase == .incompatible })
 
-  // Long enough for several backoffs at this unit; none may fire a reconnect.
+  // Long enough for several backoffs at this unit; none may fire a reconnect beyond
+  // the one that checks the first answer was not a fluke.
   try await Task.sleep(for: .milliseconds(300))
   #expect(await session.phase == .incompatible)
-  #expect(opener.links.count == 1, "a deterministic failure was retried")
-  #expect(await opener.links[0].isClosed, "the control channel was held for nothing")
+  #expect(opener.links.count == 2, "a deterministic failure was retried")
+  for link in opener.links {
+    #expect(await link.isClosed, "the control channel was held for nothing")
+  }
   await session.handle(.manualRelease)
 }
 

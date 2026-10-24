@@ -368,6 +368,20 @@ private let policy = SessionPolicy(maximumFailureCount: 3)
   }
 }
 
+@Test func aFirstUnreadableAnswerIsCheckedOnceMoreBeforeItIsBelieved() {
+  // One malformed answer right after connecting — a device still settling — would
+  // otherwise park the device until someone pressed retry. A second one, on a fresh
+  // connection, is the device's actual answer.
+  let (checking, effects) = policy.reduce(state(.verifying), .verificationFailedPermanently)
+  #expect(checking.phase == .retryWaiting)
+  #expect(effects.contains(.scheduleBackoff(attempt: 1)))
+
+  let (reconnecting, _) = policy.reduce(checking, .backoffExpired)
+  let (verifying, _) = policy.reduce(reconnecting, .channelOpened(reconnecting.attempt))
+  let (parked, _) = policy.reduce(verifying, .verificationFailedPermanently)
+  #expect(parked.phase == .incompatible)
+}
+
 @Test func anIncompatibleDeviceIsRetriedOnlyByHandOrByAnotherDevice() {
   let (retrying, effects) = policy.reduce(state(.incompatible), .manualRetry)
   #expect(retrying.phase == .connecting)
@@ -840,7 +854,8 @@ private let policy = SessionPolicy(maximumFailureCount: 3)
     (state(.verifying), .verificationSucceeded, .ready),
     (state(.verifying), .verificationRejected, .unverified),
     (state(.verifying), .verificationFailedTransient, .retryWaiting),
-    (state(.verifying), .verificationFailedPermanently, .incompatible),
+    (state(.verifying), .verificationFailedPermanently, .retryWaiting),
+    (state(.verifying, failureCount: 1), .verificationFailedPermanently, .incompatible),
     (state(.incompatible), .manualRetry, .connecting),
     (state(.incompatible), .defaultOutputChanged(nil), .released),
     (state(.verifying), .defaultOutputChanged(nil), .released),

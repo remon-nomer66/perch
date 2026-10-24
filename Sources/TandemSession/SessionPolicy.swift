@@ -113,11 +113,11 @@ public struct SessionState: Equatable, Sendable {
     case retryWaiting
     /// Transient failures reached the limit. Recoverable by hand.
     case retryExhausted
-    /// The device answered verification with something this application cannot
-    /// interpret. Retrying would only repeat the answer, so nothing reconnects until
-    /// the user asks or the output moves to another device, and the control channel
-    /// is closed so that another host can have it. The target is kept, so that a
-    /// different device still connects.
+    /// The device answered verification, twice, with something this application
+    /// cannot interpret. Retrying would only repeat the answer, so nothing reconnects
+    /// until the user asks or the output moves to another device, and the control
+    /// channel is closed so that another host can have it. The target is kept, so
+    /// that a different device still connects.
     case incompatible
     /// Connected and usable, but this model has never been verified against the
     /// encodings this application sends.
@@ -401,8 +401,12 @@ public struct SessionPolicy: Sendable {
       return failed(state)
 
     // Not on the retry budget: every retry would get the same unreadable answer
-    // while holding the channel away from the hosts that can use it.
+    // while holding the channel away from the hosts that can use it. A first one is
+    // checked once more on a fresh connection, though — a device still settling
+    // right after connecting must not be parked until someone presses retry — and is
+    // believed when the reconnect, already carrying a failure, gets it again.
     case (.verifying, .verificationFailedPermanently):
+      guard state.failureCount > 0 else { return failed(state) }
       return (
         state.moved(to: .incompatible),
         [.closeChannel, .invalidateSession, .failPendingRequests]
