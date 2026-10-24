@@ -435,3 +435,27 @@ func recenterIsIgnoredWhileFacingAway() async {
   harness.controller.recenter()
   #expect(harness.controller.status == .facingAway)
 }
+
+@MainActor
+@Test("後ろ向きの間にストリームが終わっても、従来どおり failed でカメラを止め、音場を正面へ戻す")
+func streamEndWhileFacingAwayFails() async {
+  let harness = Harness()
+  await harness.track()
+  for index in 4..<40 {
+    harness.provider.continuation.yield(harness.away(index))
+  }
+  await harness.drain { harness.controller.status == .facingAway && harness.isBehind }
+  #expect(harness.isBehind)
+
+  harness.provider.continuation.finish()
+  await harness.drain {
+    if case .failed = harness.controller.status { return true }
+    return false
+  }
+  guard case .failed = harness.controller.status else {
+    Issue.record("failed にならなかった: \(harness.controller.status)")
+    return
+  }
+  #expect(harness.provider.stopped)
+  #expect(harness.delivered.last == .forward)
+}

@@ -180,6 +180,46 @@ func theNearestPersonDecides() {
   #expect(classifier.classify([farBack, nearFacing], imageAspect: aspect) == .faceVisible)
 }
 
+@Test("手前の人の肩が弱くても、聴き手はその人 — 奥のはっきりした後ろ姿で後ろ向きにしない")
+func aFaintNearPersonStillOutranksAClearFarOne() {
+  // 手前の聴き手は肩がかすか（暗い・ぶれ）で判定できない。奥の人は後ろ姿がはっきり。
+  // 信頼度の足りる人の中で大きさを比べると、奥の人が聴き手に取り違えられる。
+  let faintListener = makeBody([.neck: 0.3, .leftShoulder: 0.3, .rightShoulder: 0.3])
+  let clearFarBack = makeBody(
+    backView,
+    moving: [.neck: (0.2, 0.45), .leftShoulder: (0.12, 0.45), .rightShoulder: (0.28, 0.45)]
+  )
+  let classifier = FacingAwayClassifier()
+  #expect(classifier.classify([clearFarBack, faintListener], imageAspect: aspect) == .undetermined)
+}
+
+@Test("頭の余白は画像の縦横比を考慮して測る（同じ配置でも横長ほど余白が要る）")
+func headroomAccountsForTheAspectRatio() {
+  let classifier = FacingAwayClassifier()
+  let placed = { (neckY: Double) in
+    makeBody(
+      backView,
+      moving: [.neck: (0.5, neckY), .leftShoulder: (0.35, neckY), .rightShoulder: (0.65, neckY)]
+    )
+  }
+  // 4:3 では幅 0.3 の肩幅は高さの 0.4 にあたり、首の上に 0.28 の余白が要る。
+  #expect(classifier.classify(placed(0.70), imageAspect: 4.0 / 3.0) == .facingAway)
+  #expect(classifier.classify(placed(0.78), imageAspect: 4.0 / 3.0) == .undetermined)
+  // 16:9 では同じ配置でも高さの 0.53 にあたり、首 0.70 では頭が上端からはみ出す。
+  #expect(classifier.classify(placed(0.70), imageAspect: 16.0 / 9.0) == .undetermined)
+}
+
+@Test("傾いた肩の幅も縦横比を考慮して測る（縦方向の差を幅の単位に直す）")
+func tiltedShouldersAccountForTheAspectRatio() {
+  let classifier = FacingAwayClassifier()
+  // 横 0.06・縦 0.10 の差は、4:3 では幅の 0.096 — 最小の肩幅 0.1 に届かない。
+  let narrow = makeBody(backView, moving: [.leftShoulder: (0.47, 0.30), .rightShoulder: (0.53, 0.40)])
+  #expect(classifier.classify(narrow, imageAspect: 4.0 / 3.0) == .undetermined)
+  // 横 0.08・縦 0.10 なら幅の 0.11 で届く。
+  let wide = makeBody(backView, moving: [.leftShoulder: (0.46, 0.30), .rightShoulder: (0.54, 0.40)])
+  #expect(classifier.classify(wide, imageAspect: 4.0 / 3.0) == .facingAway)
+}
+
 @Test("体が1つも無い・画像の縦横比が不正なら判定しない")
 func nothingToJudge() {
   let classifier = FacingAwayClassifier()

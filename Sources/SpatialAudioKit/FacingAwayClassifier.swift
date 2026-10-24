@@ -89,9 +89,16 @@ public struct FacingAwayClassifier: Sendable {
 
   private static let frontJoints: [BodyKeypoints.Joint] = [.nose, .leftEye, .rightEye]
   private static let wristJoints: [BodyKeypoints.Joint] = [.leftWrist, .rightWrist]
+  /// 聴き手を大きさで選ぶときに、肩の位置を使ってよい最低限の信頼度。判定のしきい値
+  /// （`torsoConfidence`）よりずっと低い — 位置がおおよそ合っていれば大きさは比べられる。
+  private static let sizingConfidence = 0.1
 
   /// 写っている全員から決める。一番大きく写っている（肩幅の最も広い）人を聴き手と
   /// みなす — カメラの前に座る聴き手は、背景の人より大きく写る。
+  ///
+  /// 選ぶのは判定より先で、判定のしきい値は使わない。しきい値を満たす人の中で比べると、
+  /// 手前の聴き手の肩がかすかなとき（暗い・ぶれ）に、奥のはっきりした後ろ姿が聴き手に
+  /// 取り違えられて後ろ向きになる。手前の人が判定できないなら、判定不能のままにする。
   /// - Parameter imageAspect: 画像の 幅 ÷ 高さ。
   public func classify(_ bodies: [BodyKeypoints], imageAspect: Double) -> HeadPresence {
     let primary = bodies.max {
@@ -131,11 +138,11 @@ public struct FacingAwayClassifier: Sendable {
     return .facingAway
   }
 
-  /// 両肩がはっきり写っているときの肩幅（画像の幅に対する比）。写っていなければ 0。
+  /// 聴き手を選ぶための肩幅（画像の幅に対する比）。両肩の位置が無ければ 0。
   private func shoulderSpan(of body: BodyKeypoints, imageAspect: Double) -> Double {
     guard imageAspect.isFinite, imageAspect > 0,
-      let left = body.point(.leftShoulder, atLeast: torsoConfidence),
-      let right = body.point(.rightShoulder, atLeast: torsoConfidence)
+      let left = body.point(.leftShoulder, atLeast: Self.sizingConfidence),
+      let right = body.point(.rightShoulder, atLeast: Self.sizingConfidence)
     else { return 0 }
     return Self.distanceInWidths(left, right, imageAspect: imageAspect)
   }

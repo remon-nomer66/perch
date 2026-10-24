@@ -39,6 +39,7 @@ public struct TrackingBlend: Sendable {
   }
 
   /// 1フレームぶん進める。`tracked` が nil のフレームはロスト（後ろ向きは区別しない）。
+  /// 後ろ向きを判定しない姿勢ソース（将来のヘッドホン IMU など）向けに残している。
   public mutating func advance(
     tracked: Rotation?,
     distanceRatio: Double?,

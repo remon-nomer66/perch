@@ -606,3 +606,39 @@ func aStartThatNeverFinishesFails() async {
     provider?.releaseStart()
   }
 }
+
+/// applyPose へ届いた最後の向き。
+@MainActor
+private final class DeliveredPose {
+  var last: ListenerOrientation?
+}
+
+@MainActor
+@Test("後ろ向きの間にカメラを選び直したら、音場を正面へ戻し、後ろ向きを新しいカメラへ持ち越さない")
+func switchingCamerasWhileFacingAwayStartsOver() async {
+  await withDefaults { defaults in
+    let harness = CameraHarness(cameras: [builtIn, webcam], defaults: defaults)
+    let delivered = DeliveredPose()
+    harness.controller.applyPose = { orientation, _ in delivered.last = orientation }
+    harness.controller.setEnabled(true)
+    await harness.track(on: harness.launches.last)
+    let first = harness.launches.last
+    for index in 4..<40 {
+      first?.continuation.yield(.facingAway(time: Double(index) / 15))
+    }
+    await harness.drain {
+      harness.controller.status == .facingAway && abs(abs(delivered.last?.yaw ?? 0) - .pi) < 1e-3
+    }
+    #expect(harness.controller.status == .facingAway)
+
+    harness.controller.selectCamera(id: "webcam")
+    #expect(first?.stopped == true)
+    #expect(harness.controller.status == .calibrating)
+    #expect(delivered.last == .forward)
+
+    // 新しいカメラで較正が済めば、真後ろからではなく正面から追跡を始める。
+    await harness.track(on: harness.launches.last)
+    #expect(harness.controller.status == .tracking)
+    #expect(abs(delivered.last?.yaw ?? .pi) < 1.0)
+  }
+}
