@@ -68,6 +68,33 @@ final class AppModel: ObservableObject {
   /// drags alike; see `DeviceWriteChain`.
   private var deviceWrites = DeviceWriteChain()
 
+  /// Waits until every device write asked so far has landed or been given up on.
+  /// Exposed for tests; nothing in the app waits on the chain.
+  func settleDeviceWrites() async {
+    await deviceWrites.settled()
+  }
+
+  /// Queues a write to a guarded field. `send` puts it on the wire; what happens around
+  /// it — sent at all, read back, guard lifted — is `GuardedWrite`'s decision, taken
+  /// when the write's turn comes rather than when it was asked.
+  private func enqueueGuardedWrite(
+    _ field: ReferenceWritableKeyPath<AppModel, AdjustmentGuard>,
+    token: Int,
+    isFinal: Bool = true,
+    using service: SessionService,
+    send: @escaping @MainActor (SessionCoordinator) async -> Void
+  ) {
+    deviceWrites.enqueue { [weak self] in
+      guard let self else { return }
+      let step = GuardedWrite.step(isFinal: isFinal, isCurrent: self[keyPath: field].isCurrent(token))
+      guard step.sends else { return }
+      await send(await service.session)
+      guard step.liftsGuard else { return }
+      await self.refresh(from: service, cause: .deviceWrite)
+      self[keyPath: field].end(token)
+    }
+  }
+
   func applyListening(_ target: TandemListeningSelection, using service: SessionService) {
     guard let current = panel.listeningMode else { return }
     let savedRoom: TandemListeningRoom
@@ -78,11 +105,8 @@ final class AppModel: ObservableObject {
       selection: target,
       savedRoom: savedRoom
     )
-    deviceWrites.enqueue { [weak self] in
-      let session = await service.session
-      try? await session.apply(listeningSelection: target)
-      await self?.refresh(from: service, cause: .deviceWrite)
-      self?.listeningAdjustment.end(token)
+    enqueueGuardedWrite(\.listeningAdjustment, token: token, using: service) {
+      try? await $0.apply(listeningSelection: target)
     }
   }
 
@@ -131,19 +155,14 @@ final class AppModel: ObservableObject {
     }
   }
 
-  /// Queues one level write behind the others. A value overtaken while it waited in
-  /// line is dropped — a newer one is queued behind it — but a final always lands: it
-  /// ends the drag on the device and carries the read-back that lifts the guard.
+  /// Queues one level write behind the others. An intermediate value overtaken while
+  /// it waited is dropped and a final always lands; why dropping is safe — every report
+  /// that takes the token reaches the pacer, which writes it — is on `GuardedWrite`.
   private func writeLevel(
     _ target: TandemNoiseControlState, isFinal: Bool, token: Int, using service: SessionService
   ) {
-    deviceWrites.enqueue { [weak self] in
-      guard let self, isFinal || self.levelAdjustment.isCurrent(token) else { return }
-      let session = await service.session
-      try? await session.apply(noiseControl: target, isFinal: isFinal)
-      guard isFinal else { return }
-      await self.refresh(from: service, cause: .deviceWrite)
-      self.levelAdjustment.end(token)
+    enqueueGuardedWrite(\.levelAdjustment, token: token, isFinal: isFinal, using: service) {
+      try? await $0.apply(noiseControl: target, isFinal: isFinal)
     }
   }
 
@@ -165,11 +184,8 @@ final class AppModel: ObservableObject {
       selectedPreset: identifier,
       bandSteps: bandSteps.isEmpty ? reading.bandSteps : bandSteps.map(Int.init)
     )
-    deviceWrites.enqueue { [weak self] in
-      let session = await service.session
-      try? await session.apply(equalizerPreset: identifier, bandSteps: bandSteps)
-      await self?.refresh(from: service, cause: .deviceWrite)
-      self?.equalizerAdjustment.end(token)
+    enqueueGuardedWrite(\.equalizerAdjustment, token: token, using: service) {
+      try? await $0.apply(equalizerPreset: identifier, bandSteps: bandSteps)
     }
   }
 
@@ -190,20 +206,15 @@ final class AppModel: ObservableObject {
     }
   }
 
-  /// Queues one band write, dropping an overtaken intermediate the way `writeLevel` does.
+  /// Queues one band write, the way `writeLevel` queues a level.
   private func writeBands(
     _ bands: [UInt8], preset: UInt8, isFinal: Bool, token: Int, using service: SessionService
   ) {
     // The settled curve is remembered app-side as well as by the device, so the
     // user's own shape survives the device being adjusted from elsewhere.
     if isFinal { onBandsCommitted?(preset, bands.map(Int.init)) }
-    deviceWrites.enqueue { [weak self] in
-      guard let self, isFinal || self.equalizerAdjustment.isCurrent(token) else { return }
-      let session = await service.session
-      try? await session.apply(equalizerPreset: preset, bandSteps: bands, isFinal: isFinal)
-      guard isFinal else { return }
-      await self.refresh(from: service, cause: .deviceWrite)
-      self.equalizerAdjustment.end(token)
+    enqueueGuardedWrite(\.equalizerAdjustment, token: token, isFinal: isFinal, using: service) {
+      try? await $0.apply(equalizerPreset: preset, bandSteps: bands, isFinal: isFinal)
     }
   }
 
@@ -381,11 +392,8 @@ final class AppModel: ObservableObject {
     guard let current = panel.speakToChat else { return }
     let token = speakToChatAdjustment.begin()
     panel.speakToChat = Self.speakToChat(current, isEnabled: enabled)
-    deviceWrites.enqueue { [weak self] in
-      let session = await service.session
-      try? await session.apply(speakToChatEnabled: enabled)
-      await self?.refresh(from: service, cause: .deviceWrite)
-      self?.speakToChatAdjustment.end(token)
+    enqueueGuardedWrite(\.speakToChatAdjustment, token: token, using: service) {
+      try? await $0.apply(speakToChatEnabled: enabled)
     }
   }
 
@@ -397,11 +405,8 @@ final class AppModel: ObservableObject {
     guard let current = panel.speakToChat else { return }
     let token = speakToChatAdjustment.begin()
     panel.speakToChat = Self.speakToChat(current, sensitivity: sensitivity, timeout: timeout)
-    deviceWrites.enqueue { [weak self] in
-      let session = await service.session
-      try? await session.apply(speakToChatSensitivity: sensitivity, timeout: timeout)
-      await self?.refresh(from: service, cause: .deviceWrite)
-      self?.speakToChatAdjustment.end(token)
+    enqueueGuardedWrite(\.speakToChatAdjustment, token: token, using: service) {
+      try? await $0.apply(speakToChatSensitivity: sensitivity, timeout: timeout)
     }
   }
 
@@ -436,11 +441,8 @@ final class AppModel: ObservableObject {
         value: .boolean(enabled)
       )
     )
-    deviceWrites.enqueue { [weak self] in
-      let session = await service.session
-      try? await session.apply(sidetoneEnabled: enabled)
-      await self?.refresh(from: service, cause: .deviceWrite)
-      self?.sidetoneAdjustment.end(token)
+    enqueueGuardedWrite(\.sidetoneAdjustment, token: token, using: service) {
+      try? await $0.apply(sidetoneEnabled: enabled)
     }
   }
 

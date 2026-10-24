@@ -50,6 +50,12 @@ struct DeviceWriteChain {
     }
   }
 
+  /// Returns once every write asked so far has finished or been given up on — the
+  /// links run one after another, so the last one's end is everyone's. For tests.
+  func settled() async {
+    await tail?.value
+  }
+
   /// Returns once `operation` finishes or `limit` passes, whichever comes first.
   private static func run(
     _ operation: @escaping @MainActor () async -> Void,
