@@ -309,23 +309,9 @@ final class AppModel: ObservableObject {
 
     // Bose runs in parallel. When Sony has no controllable device, a Bose device that is
     // the current audio output owns the summary and battery, so the shared closed bar and
-    // the General tab show it instead of "対応機器なし".
-    //
-    // This is the *only* place device ownership is decided — "Sony while it is
-    // controllable, otherwise Bose" — and `panel.isBose` is the answer every screen reads.
-    // The notch and the settings window used to judge it separately (settings on
-    // `bose.panelModel != nil` alone), so with both sessions live one drew Sony and the
-    // other Bose at the same time.
-    if !next.summary.isControllable, let bose = bose.readout {
-      next.summary.status = bose.status
-      next.summary.modelName = bose.modelName
-      next.summary.firmwareVersion = bose.firmwareVersion
-      // Ultra 2 accepts the live noise-control and equalizer writes the Bose panel sends,
-      // so the header shows no read-only caveat — matching the writable Bose controls.
-      next.summary.acceptsWrites = true
-      next.battery = bose.battery
-      next.isBose = true
-    }
+    // the General tab show it instead of "対応機器なし". This is the one place ownership is
+    // decided; see `PanelModel.foldingIn(bose:)`.
+    next = next.foldingIn(bose: bose.readout)
 
     next.nowPlaying = nowPlaying.map {
       PanelModel.NowPlaying(
@@ -370,7 +356,8 @@ final class AppModel: ObservableObject {
     // sheets it actually has, not the fixed Sony count. The non-readable states collapse
     // to the common sheets plus one status sheet for either brand.
     let stops: Int
-    if next.isBose, next.summary.isControllable, let boseModel = bose.panelModel {
+    if case .bose(let boseModel) = DeviceControls(panel: next, bosePanel: bose.panelModel),
+      next.summary.isControllable {
       stops = BoseNotchLayout.pageCount(for: boseModel.state)
     } else {
       stops = Self.pagerStops(for: next.summary.status)
@@ -1401,7 +1388,9 @@ private struct NotchPanelBridge: View {
   /// spatial/sidetone), matching the General tab; otherwise the Sony sheets are shown, which
   /// also carry the common spatial sheet when no device is connected at all.
   private var notchPages: [PanelPage] {
-    if model.panel.isBose, let boseModel = model.bose.panelModel {
+    // The same decision the General tab draws from, so the two show one brand.
+    let controls = DeviceControls(panel: model.panel, bosePanel: model.bose.panelModel)
+    if case .bose(let boseModel) = controls {
       return model.bosePanelPages(boseModel)
     }
     return model.panelPages(using: service)

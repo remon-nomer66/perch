@@ -144,6 +144,10 @@ private struct GeneralTab: View {
   @ObservedObject var bose: BoseDeviceController
   let service: SessionService
 
+  private var controls: DeviceControls {
+    DeviceControls(panel: model.panel, bosePanel: bose.panelModel)
+  }
+
   var body: some View {
     ScrollView {
       VStack(alignment: .leading, spacing: 12) {
@@ -157,13 +161,16 @@ private struct GeneralTab: View {
         // immersive audio) reading and writing over the live BMAP session. Shown instead
         // of the Sony pages, which are for the Tandem session that is idle here.
         //
-        // Ownership is `model.panel.isBose` — the one decision the notch reads too. A live
-        // `bose.panelModel` alone is not it: a Bose session can be open while Sony still
-        // holds a controllable device, and judging by the session drew Bose controls here
-        // while the notch drew Sony's.
-        if model.panel.isBose, let boseModel = bose.panelModel {
+        // Which brand draws is `DeviceControls` — the one decision the notch reads too,
+        // made from the panel's ownership (`model.panel.isBose`). A live `bose.panelModel`
+        // alone is not it: a Bose session can be open while Sony still holds a
+        // controllable device, and judging by the session drew Bose controls here while
+        // the notch drew Sony's. Nor is "anything controllable": under Bose ownership with
+        // no live panel, that fell through to Sony's controls.
+        switch controls {
+        case .bose(let boseModel):
           BoseControlsSection(model: boseModel)
-        } else if model.panel.summary.isControllable {
+        case .sony:
           if let caveat = model.panel.summary.caveat {
             Label(caveat, systemImage: "exclamationmark.triangle.fill")
               .font(.system(size: 11))
@@ -183,6 +190,8 @@ private struct GeneralTab: View {
               await service.session.gestureCaptures()
             }
           )
+        case .neither:
+          EmptyView()
         }
 
         // The common (device-independent) sheets — spatial audio above all — need no
@@ -193,10 +202,7 @@ private struct GeneralTab: View {
         // just the common sheets follow.
         ForEach(
           model.panelPages(using: service)
-            .filter { page in
-              if model.panel.isBose { return page.isCommon }
-              return model.panel.summary.isControllable || page.isCommon
-            }
+            .filter { page in controls.drawsSonyPages || page.isCommon }
         ) { page in
           page.content
             .frame(maxWidth: .infinity, alignment: .topLeading)

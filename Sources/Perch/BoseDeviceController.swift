@@ -12,9 +12,10 @@ import os
 /// From it this drives two things: a `Readout` the shared closed bar / General header show
 /// (model name, battery, status), and a live `BosePanelModel` that reads every feature back
 /// and turns the panel's gestures — noise control, ambient level, equalizer, immersive
-/// audio — into device writes. The Sony session runs alongside untouched: it maps any
-/// non-Sony output to "no device", and this only ever engages a device whose audio output
-/// correlates to a BMAP control service, so the two never fight for a device.
+/// audio — into device writes. The Sony session runs alongside untouched, and the two can
+/// both be live at once — it targets any identified output, whatever the brand, while this
+/// engages a device whose audio output correlates to a BMAP control service. Which of them
+/// owns the screens is therefore decided in one place, `PanelModel.foldingIn(bose:)`.
 ///
 /// It runs its own loop rather than doing work inside `AppModel.refresh`, so opening a
 /// channel (seconds) never stalls the 500 ms Sony refresh. The loop polls, and a switch of
