@@ -437,3 +437,101 @@ private func read27(_ windows: [[String: Any]]) -> FullScreenReading {
 
   #expect(read27(windows).isTaken)
 }
+
+// MARK: - Reporting
+
+private let takenReading = FullScreenReading(reason: .menuBarWithoutDesktop)
+private let releasedReading = FullScreenReading(reason: .menuBarOverTheDesktop)
+
+/// Stands in for the screen and the clock: one prepared reading per look, and a time that
+/// moves only when the test lets it.
+@MainActor
+private final class ScreenScript {
+  private var remaining: [FullScreenReading]
+  private var time: TimeInterval = 100
+
+  init(_ readings: [FullScreenReading]) {
+    remaining = readings
+  }
+
+  /// "Nothing at the top" once the script runs out, so an extra read cannot trap.
+  func next() -> FullScreenReading {
+    remaining.isEmpty ? FullScreenReading(reason: .nothingAtTheTop) : remaining.removeFirst()
+  }
+
+  func now() -> TimeInterval { time }
+
+  func wait(_ seconds: TimeInterval) {
+    time += seconds
+  }
+}
+
+@MainActor
+private func monitor(_ script: ScreenScript) -> FullScreenMonitor {
+  FullScreenMonitor(read: script.next, now: script.now)
+}
+
+@MainActor
+@Test func theMonitorReportsATakeoverOnlyOnceConfirmed() {
+  let script = ScreenScript([takenReading, takenReading, releasedReading])
+  let subject = monitor(script)
+  var reports: [Bool] = []
+  subject.onChange = { reports.append($0) }
+
+  subject.evaluate()
+  #expect(reports.isEmpty, "a single taken reading moved the notch")
+  #expect(subject.isFollowUpPending, "nothing will look again before the slow poll")
+
+  script.wait(FullScreenHysteresis.settleTime)
+  subject.evaluate()
+  #expect(reports == [true])
+  #expect(subject.isFullScreen)
+
+  subject.evaluate()
+  #expect(reports == [true, false], "the release waited for confirmation")
+  subject.stop()
+}
+
+@MainActor
+@Test func readingsTakenAtTheSameMomentDoNotConfirmEachOther() {
+  // A space change and the app switch it causes arrive together, and both read the
+  // same half-finished slide. Only a reading taken later can confirm the first.
+  let script = ScreenScript([takenReading, takenReading, takenReading])
+  let subject = monitor(script)
+  var reports: [Bool] = []
+  subject.onChange = { reports.append($0) }
+
+  subject.evaluate()
+  script.wait(0.003)
+  subject.evaluate()
+  #expect(reports.isEmpty)
+  #expect(subject.isFollowUpPending)
+
+  script.wait(FullScreenHysteresis.settleTime)
+  subject.evaluate()
+  #expect(reports == [true])
+  subject.stop()
+}
+
+@MainActor
+@Test func stoppingReleasesTheScreenAndForgetsWhatItSaw() {
+  let script = ScreenScript([takenReading, takenReading, takenReading])
+  let subject = monitor(script)
+  var reports: [Bool] = []
+  subject.onChange = { reports.append($0) }
+  subject.evaluate()
+  script.wait(FullScreenHysteresis.settleTime)
+  subject.evaluate()
+
+  subject.stop()
+  #expect(reports == [true, false])
+  #expect(!subject.isFullScreen)
+
+  // Watching again starts from nothing: one taken reading is not enough, and stopping
+  // takes the pending look with it.
+  script.wait(FullScreenHysteresis.settleTime)
+  subject.evaluate()
+  #expect(reports == [true, false])
+  subject.stop()
+  #expect(!subject.isFollowUpPending)
+}
