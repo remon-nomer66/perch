@@ -63,6 +63,10 @@ public final class PositionedSourceGraph: @unchecked Sendable {
 
   public var sourceCount: Int { players.count }
 
+  /// エンジンが動いているか。構成変更（出力機器の差し替え等）で止まると、そのまま
+  /// 止まり続ける。
+  public var isRunning: Bool { engine.isRunning }
+
   /// テストが構成変更通知を差し込むための内部フック（通知は object 一致で届くため）。
   var engineForNotifications: AVAudioEngine { engine }
 
