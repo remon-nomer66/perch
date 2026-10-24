@@ -259,8 +259,11 @@ public struct SessionPolicy: Sendable {
     case .channelOpened(let attempt):
       // Matching the attempt is not enough. Cancelling moves the phase on while
       // keeping the attempt, so an open that lands afterwards must still be closed
-      // rather than left to leak.
-      if attempt == state.attempt, state.phase == .connecting { return nil }
+      // rather than left to leak. `contended` adopts only the try it started itself:
+      // entering it moves the attempt past the open that timed out into it.
+      if attempt == state.attempt, state.phase == .connecting || state.phase == .contended {
+        return nil
+      }
       return (state, [.closeChannel])
 
     case .channelFailed(let attempt), .channelClosedUnexpectedly(let attempt),
@@ -317,6 +320,8 @@ public struct SessionPolicy: Sendable {
         case .contended: .contended
         case .incompatible: .incompatible
         }
+      // A try that sleep cancelled must not land in the contention that wakes up.
+      let resumed = blocked == .contended ? state.contending() : state
       // The output is unknown until the audio system reports one, so the refusal
       // comes back without permission to reconnect. Exhaustion and contention re-arm
       // their slow-cadence timers, because nothing else ever advances them, and a
@@ -328,7 +333,7 @@ public struct SessionPolicy: Sendable {
         case .contended: [.scheduleContentionRetry]
         case .unverified, .incompatible: []
         }
-      return (state.moved(to: restored, isTargetDefaultOutput: device != nil), effects)
+      return (resumed.moved(to: restored, isTargetDefaultOutput: device != nil), effects)
     }
 
     guard let device else { return (state.releasing(), []) }
@@ -363,10 +368,12 @@ public struct SessionPolicy: Sendable {
       guard let device else { return (state, []) }
       return start(connectingTo: device, from: state)
 
-    case (.connecting, .channelOpened):
+    // A try contention started that finds the channel free is an ordinary connection.
+    case (.connecting, .channelOpened), (.contended, .channelOpened):
       return (state.moved(to: .verifying), [.startVerification])
 
-    case (.connecting, .channelFailed):
+    // A try that fails some other way than hanging is not contention.
+    case (.connecting, .channelFailed), (.contended, .channelFailed):
       return failed(state)
 
     case (.connecting, .defaultOutputChanged(nil)):
@@ -459,24 +466,40 @@ public struct SessionPolicy: Sendable {
       // A connecting state whose device stopped being the output has released
       // already, so the guard is only for states constructed by hand.
       guard state.isTargetDefaultOutput else { return failed(state) }
-      return (state.moved(to: .contended), [.cancelOpen, .scheduleContentionRetry])
+      return (state.contending(), [.cancelOpen, .scheduleContentionRetry])
 
     case (.ready, .controlContended), (.verifying, .controlContended),
       (.recovering, .controlContended), (.unverified, .controlContended):
       return (
-        state.moved(to: .contended),
+        state.contending(),
         [.closeChannel, .invalidateSession, .failPendingRequests, .scheduleContentionRetry]
       )
 
     case (.contended, .backoffExpired):
-      // A fresh budget, like a manual retry: contention is not a failure, and an open
-      // that times out again comes straight back here with the next tick armed.
+      // The try stays `contended` while it is out. Passing through `connecting` swapped
+      // the panel's "another device is in control" for "connecting" for up to the
+      // whole open timeout on every tick, and hid the retry button meanwhile. The
+      // budget starts fresh, like a manual retry: contention is not a failure.
       // Seizing the session for a device nobody is listening to would take control
       // away from the host that is, so a tick without the output only re-arms.
       guard let target = state.target, state.isTargetDefaultOutput else {
         return (state, [.scheduleContentionRetry])
       }
-      return start(connectingTo: target, from: state)
+      let attempt = state.attempt.next
+      return (
+        SessionState(
+          phase: .contended,
+          target: target,
+          failureCount: 0,
+          attempt: attempt,
+          isTargetDefaultOutput: true
+        ),
+        [.openChannel(target, attempt)]
+      )
+
+    // The try hung again: still contended, and the next tick is armed.
+    case (.contended, .controlContended):
+      return (state, [.cancelOpen, .scheduleContentionRetry])
 
     case (.ready, .channelClosedUnexpectedly), (.verifying, .channelClosedUnexpectedly),
       (.recovering, .channelClosedUnexpectedly), (.unverified, .channelClosedUnexpectedly):
@@ -586,9 +609,12 @@ public struct SessionPolicy: Sendable {
     case .released, .sleeping, .incompatible:
       // Incompatibility closed its channel on the way in and owns no timer.
       return []
-    case .retryExhausted, .contended:
-      // Both refusals own a slow-cadence retry timer.
+    case .retryExhausted:
+      // Exhaustion owns its slow-cadence retry timer.
       return [.cancelBackoff]
+    case .contended:
+      // Contention owns its timer and, while a try is out, that try's open.
+      return [.cancelBackoff, .cancelOpen]
     case .connecting:
       return [.cancelOpen, .closeChannel]
     case .verifying, .ready, .recovering, .unverified:
@@ -607,6 +633,18 @@ extension SessionState {
   /// and that attempt's late completion would then pass for the live one.
   fileprivate func releasing() -> SessionState {
     SessionState(phase: .released, attempt: attempt)
+  }
+
+  /// `contended`, under an attempt number no open owns. The open that timed out into
+  /// it is abandoned, so only a try that contention itself starts can land here.
+  fileprivate func contending() -> SessionState {
+    SessionState(
+      phase: .contended,
+      target: target,
+      failureCount: failureCount,
+      attempt: attempt.next,
+      isTargetDefaultOutput: isTargetDefaultOutput
+    )
   }
 
   fileprivate func withDefaultOutput(_ isDefaultOutput: Bool) -> SessionState {

@@ -465,15 +465,59 @@ private let policy = SessionPolicy(maximumFailureCount: 3)
   // been seen never calling back at all. Waiting for the user alone left a session
   // that was merely unlucky stuck until someone pressed retry, so contention tries
   // again on its own, slowly — each try can hang for the full open timeout.
-  let (retrying, effects) = policy.reduce(state(.contended), .backoffExpired)
-  #expect(retrying.phase == .connecting)
-  #expect(retrying.failureCount == 0)
-  #expect(effects.contains(.openChannel(deviceA, retrying.attempt)))
+  //
+  // The try stays `contended` while it is out: passing through `connecting` swapped
+  // the panel's "another device is in control" for "connecting" for up to the whole
+  // open timeout, every tick, and hid the retry button meanwhile.
+  let contended = state(.contended, failureCount: 2, attempt: ConnectionAttempt(4))
+  let (trying, effects) = policy.reduce(contended, .backoffExpired)
+  #expect(trying.phase == .contended)
+  #expect(trying.attempt != contended.attempt)
+  #expect(trying.failureCount == 0, "contention is not a failure")
+  #expect(effects == [.openChannel(deviceA, trying.attempt)])
 
-  // Timing out again goes straight back with the next tick armed.
-  let (again, againEffects) = policy.reduce(retrying, .controlContended(retrying.attempt))
+  // Timing out again only arms the next tick.
+  let (again, againEffects) = policy.reduce(trying, .controlContended(trying.attempt))
   #expect(again.phase == .contended)
   #expect(againEffects == [.cancelOpen, .scheduleContentionRetry])
+
+  // The channel being free at last is an ordinary connection.
+  let (verifying, openEffects) = policy.reduce(trying, .channelOpened(trying.attempt))
+  #expect(verifying.phase == .verifying)
+  #expect(openEffects == [.startVerification])
+
+  // Failing some other way is not contention, and goes on the retry budget.
+  let (failed, _) = policy.reduce(trying, .channelFailed(trying.attempt))
+  #expect(failed.phase == .retryWaiting)
+}
+
+@Test func aTryLeftOverFromContentionIsCancelledAndItsChannelClosed() {
+  let (trying, _) = policy.reduce(state(.contended), .backoffExpired)
+
+  // The user's retry replaces the try; the try's late completion is then stale.
+  let (retrying, retryEffects) = policy.reduce(trying, .manualRetry)
+  #expect(retrying.phase == .connecting)
+  #expect(retryEffects == [.openChannel(deviceA, retrying.attempt)])
+  let (_, staleEffects) = policy.reduce(retrying, .channelOpened(trying.attempt))
+  #expect(staleEffects == [.closeChannel])
+
+  // Leaving the device cancels the try along with the timer.
+  let (released, releaseEffects) = policy.reduce(trying, .defaultOutputChanged(nil))
+  #expect(released.phase == .released)
+  #expect(releaseEffects.contains(.cancelOpen))
+  #expect(releaseEffects.contains(.cancelBackoff))
+  let (_, lateEffects) = policy.reduce(released, .channelOpened(trying.attempt))
+  #expect(lateEffects == [.closeChannel])
+}
+
+@Test func anOpenThatTimedOutIntoContentionCannotLandLater() {
+  // Only a try contention starts may be adopted while contended; the open that
+  // timed out into it was cancelled, and must be closed if it lands after all.
+  let connecting = state(.connecting, attempt: ConnectionAttempt(4))
+  let (contended, _) = policy.reduce(connecting, .controlContended(ConnectionAttempt(4)))
+  let (still, effects) = policy.reduce(contended, .channelOpened(ConnectionAttempt(4)))
+  #expect(still.phase == .contended)
+  #expect(effects == [.closeChannel])
 }
 
 @Test func aContentionTickWhileTheDeviceIsNotTheOutputRearms() {
@@ -816,6 +860,7 @@ private let policy = SessionPolicy(maximumFailureCount: 3)
     (state(.retryExhausted), .manualRetry, .connecting),
     (state(.retryExhausted), .defaultOutputChanged(nil), .released),
     (state(.contended), .manualRetry, .connecting),
+    (state(.contended), .backoffExpired, .contended),
     (state(.contended), .defaultOutputChanged(deviceA), .contended),
     (state(.contended), .defaultOutputChanged(nil), .released),
     (state(.unverified), .defaultOutputChanged(deviceA), .unverified),

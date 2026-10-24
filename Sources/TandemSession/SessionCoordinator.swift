@@ -303,6 +303,7 @@ public actor SessionCoordinator {
         // hardware behaves while another host holds its single control channel.
         // An unreachable or unpaired device fails fast with a different error and
         // stays on the ordinary retry path.
+        SessionLog.openFailed(ChannelFailure.openTimedOut)
         await self.handle(.controlContended(attempt))
       } catch {
         SessionLog.openFailed(error)
