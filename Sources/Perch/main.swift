@@ -56,7 +56,7 @@ final class AppModel: ObservableObject {
   /// The panel is not updated optimistically: on an unverified model the headset may
   /// do something other than what was asked, and showing the requested value would
   /// hide exactly the mismatch worth seeing.
-  private var levelDrag: Task<Void, Never>?
+  private var levelDrag = DragWritePacer()
   /// While holding, the periodic refresh leaves the noise-control reading alone, so
   /// the device's not-yet-updated value cannot overwrite the level being dragged.
   private var levelAdjustment = AdjustmentGuard()
@@ -64,7 +64,8 @@ final class AppModel: ObservableObject {
   /// device that takes a moment to apply a mode change cannot snap the picker back.
   private var listeningAdjustment = AdjustmentGuard()
 
-  /// Device writes land in the order they were asked; see `DeviceWriteChain`.
+  /// Device writes land in the order they were asked — tiles, pickers, switches and
+  /// drags alike; see `DeviceWriteChain`.
   private var deviceWrites = DeviceWriteChain()
 
   func applyListening(_ target: TandemListeningSelection, using service: SessionService) {
@@ -86,7 +87,7 @@ final class AppModel: ObservableObject {
   }
 
   func applyNoiseControl(_ target: TandemNoiseControlState, using service: SessionService) {
-    levelDrag?.cancel()
+    levelDrag.cancel()
     levelAdjustment.cancel()
     deviceWrites.enqueue { [weak self] in
       let session = await service.session
@@ -99,8 +100,9 @@ final class AppModel: ObservableObject {
   ///
   /// The target is built from the current reading each time, so the release sends the
   /// value the finger actually settled on rather than a stale captured one.
-  /// Intermediate values are debounced and sent as non-final; only the release is read
-  /// back and reflected in the panel.
+  /// Intermediate values are debounced and sent as non-final; only the release — or,
+  /// should none come, the value the drag stopped on — is read back and reflected in
+  /// the panel. See `DragWritePacer`.
   func dragNoiseLevel(level: Int, isFinal: Bool, using service: SessionService) {
     guard let reading = panel.noiseControl else { return }
     let clamped = reading.quantizedLevel(level, mode: reading.state.ambientMode)
@@ -124,25 +126,31 @@ final class AppModel: ObservableObject {
       legacyWindKind: reading.legacyWindKind
     )
 
-    levelDrag?.cancel()
-    levelDrag = Task {
-      if !isFinal {
-        try? await Task.sleep(for: .milliseconds(90))
-        if Task.isCancelled { return }
-      }
+    levelDrag.report(isFinal: isFinal) { [weak self] isFinal in
+      self?.writeLevel(target, isFinal: isFinal, token: token, using: service)
+    }
+  }
+
+  /// Queues one level write behind the others. A value overtaken while it waited in
+  /// line is dropped — a newer one is queued behind it — but a final always lands: it
+  /// ends the drag on the device and carries the read-back that lifts the guard.
+  private func writeLevel(
+    _ target: TandemNoiseControlState, isFinal: Bool, token: Int, using service: SessionService
+  ) {
+    deviceWrites.enqueue { [weak self] in
+      guard let self, isFinal || self.levelAdjustment.isCurrent(token) else { return }
       let session = await service.session
       try? await session.apply(noiseControl: target, isFinal: isFinal)
-      if isFinal {
-        await refresh(from: service)
-        levelAdjustment.end(token)
-      }
+      guard isFinal else { return }
+      await self.refresh(from: service)
+      self.levelAdjustment.end(token)
     }
   }
 
   /// While holding, the periodic refresh leaves the equaliser reading alone so a band
   /// drag or preset change is not snapped back by the device's lagging value.
   private var equalizerAdjustment = AdjustmentGuard()
-  private var bandDrag: Task<Void, Never>?
+  private var bandDrag = DragWritePacer()
 
   /// Selects a preset. The bands are left empty so the device loads the preset's own
   /// curve rather than being handed the current custom values.
@@ -150,7 +158,7 @@ final class AppModel: ObservableObject {
     _ identifier: UInt8, bandSteps: [UInt8] = [], using service: SessionService
   ) {
     guard let reading = panel.equalizer else { return }
-    bandDrag?.cancel()
+    bandDrag.cancel()
     let token = equalizerAdjustment.begin()
     panel.equalizer = Self.equalizer(
       reading,
@@ -171,31 +179,31 @@ final class AppModel: ObservableObject {
     guard let reading = panel.equalizer, let presetIdentifier = reading.editablePresetIdentifier
     else { return }
     let bands = reading.settingBand(index, toStep: step)
-    // The settled curve is remembered app-side as well as by the device, so the
-    // user's own shape survives the device being adjusted from elsewhere.
-    if isFinal { onBandsCommitted?(presetIdentifier, bands.map(Int.init)) }
     let token = equalizerAdjustment.begin()
     panel.equalizer = Self.equalizer(
       reading,
       selectedPreset: presetIdentifier,
       bandSteps: bands.map(Int.init)
     )
-    bandDrag?.cancel()
-    bandDrag = Task {
-      if !isFinal {
-        try? await Task.sleep(for: .milliseconds(90))
-        if Task.isCancelled { return }
-      }
+    bandDrag.report(isFinal: isFinal) { [weak self] isFinal in
+      self?.writeBands(bands, preset: presetIdentifier, isFinal: isFinal, token: token, using: service)
+    }
+  }
+
+  /// Queues one band write, dropping an overtaken intermediate the way `writeLevel` does.
+  private func writeBands(
+    _ bands: [UInt8], preset: UInt8, isFinal: Bool, token: Int, using service: SessionService
+  ) {
+    // The settled curve is remembered app-side as well as by the device, so the
+    // user's own shape survives the device being adjusted from elsewhere.
+    if isFinal { onBandsCommitted?(preset, bands.map(Int.init)) }
+    deviceWrites.enqueue { [weak self] in
+      guard let self, isFinal || self.equalizerAdjustment.isCurrent(token) else { return }
       let session = await service.session
-      try? await session.apply(
-        equalizerPreset: presetIdentifier,
-        bandSteps: bands,
-        isFinal: isFinal
-      )
-      if isFinal {
-        await refresh(from: service)
-        equalizerAdjustment.end(token)
-      }
+      try? await session.apply(equalizerPreset: preset, bandSteps: bands, isFinal: isFinal)
+      guard isFinal else { return }
+      await self.refresh(from: service)
+      self.equalizerAdjustment.end(token)
     }
   }
 
