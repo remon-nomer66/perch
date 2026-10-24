@@ -91,18 +91,22 @@ private final class FakeEngine: SpatialCaptureEngine {
 private struct StartFailure: Error {}
 
 /// 呼ばれるたびに一定だけ進む時計。経過時間が観測の回数で決まり、テストが実時間に
-/// 左右されない。
+/// 左右されない。`jump` を渡せば、n 回目の呼び出しだけ大きく進む（スリープ明けの代わり）。
 @MainActor
 private final class SteppingClock {
   private var current = ContinuousClock.now
+  private var calls = 0
   private let step: Duration
+  private let jump: (call: Int, by: Duration)?
 
-  init(step: Duration) {
+  init(step: Duration, jump: (call: Int, by: Duration)? = nil) {
     self.step = step
+    self.jump = jump
   }
 
   func now() -> ContinuousClock.Instant {
-    current += step
+    calls += 1
+    current += calls == jump?.call ? (jump?.by ?? step) : step
     return current
   }
 }
@@ -146,14 +150,14 @@ private struct Harness {
     flowing: Bool = false,
     timing: CaptureSupervisor.Timing = Harness.fastTiming,
     clockStep: Duration = .milliseconds(1),
-    probeTimeout: Duration = .seconds(30),
+    clockJump: (call: Int, by: Duration)? = nil,
     probeHold: DispatchSemaphore? = nil
   ) {
     let engines = Engines(scripts: permissions, flowing: flowing)
     engines.probeHold = probeHold
     self.engines = engines
     let defaults = UserDefaults(suiteName: "SpatialAudioControllerTests-\(UUID().uuidString)")!
-    let clock = SteppingClock(step: clockStep)
+    let clock = SteppingClock(step: clockStep, jump: clockJump)
     let playback = engines.playback
     controller = SpatialAudioController(
       defaults: defaults,
@@ -170,21 +174,29 @@ private struct Harness {
       },
       othersPlaying: { playback.withLock { $0 } },
       now: { clock.now() },
-      probeTimeout: probeTimeout,
       timing: timing
     )
   }
 
   /// 時計は観測ごとに 1ms 進むので、時間の進みは観測の回数で決まる。刻みを詰めても
   /// 判断は変わらない。見張りは5回続けて無音なら手を打ち、他の再生が3回止まれば忘れる。
+  /// 問い合わせの上限は長く取り、負荷がかかっても打ち切りが紛れ込まないようにする。
   static let fastTiming = CaptureSupervisor.Timing(
     confirmInterval: .milliseconds(1),
     confirmDeadline: .milliseconds(15),
     watchInterval: .milliseconds(1),
     stallTimeout: .milliseconds(5),
     quietReset: .milliseconds(3),
-    outputGrace: .milliseconds(2)
+    outputGrace: .milliseconds(2),
+    questionTimeout: .seconds(30)
   )
+
+  /// `fastTiming` の問い合わせの上限だけを替えたもの。
+  static func fastTiming(questionTimeout: Duration) -> CaptureSupervisor.Timing {
+    var timing = fastTiming
+    timing.questionTimeout = questionTimeout
+    return timing
+  }
 
   /// 監視タスク（MainActor 上の別タスク）に回す。条件が満ちるまで譲る。
   func drain(until condition: () -> Bool) async {
@@ -483,7 +495,9 @@ func hungProbeCountsAsUnknown() async {
   // 問い合わせは積まずに「判定できない」とする。
   let hold = DispatchSemaphore(value: 0)
   let harness = Harness(
-    permissions: [[.granted]], probeTimeout: .milliseconds(20), probeHold: hold
+    permissions: [[.granted]],
+    timing: Harness.fastTiming(questionTimeout: .milliseconds(20)),
+    probeHold: hold
   )
   harness.controller.setEnabled(true)
   await harness.settle()
@@ -502,7 +516,8 @@ func deadlineFollowsTheClock() async {
   // 時計は観測ごとに2秒進む。6秒の期限には3回目の観測で届く。
   let timing = CaptureSupervisor.Timing(
     confirmInterval: .milliseconds(1),
-    confirmDeadline: .seconds(6)
+    confirmDeadline: .seconds(6),
+    questionTimeout: .seconds(30)
   )
   let harness = Harness(permissions: [[.denied]], timing: timing, clockStep: .seconds(2))
   harness.controller.setEnabled(true)
@@ -510,6 +525,19 @@ func deadlineFollowsTheClock() async {
 
   #expect(harness.controller.revocation == .permissionDenied)
   #expect(harness.engines.built[0].script.asked == 3)
+}
+
+@MainActor
+@Test("スリープ明けのように1回だけ大きく空いた観測は、期限を進めない")
+func oneLongGapIsNotCounted() async {
+  // 1回目の呼び出しは開始時。2回目（最初の観測）だけ1時間進む。期限（15ms）に届くのは、
+  // その後の通常の観測15回目。
+  let harness = Harness(permissions: [[.denied]], clockJump: (call: 2, by: .seconds(3_600)))
+  harness.controller.setEnabled(true)
+  await harness.settle()
+
+  #expect(harness.controller.revocation == .permissionDenied)
+  #expect(harness.engines.built[0].script.asked == 16)
 }
 
 @MainActor

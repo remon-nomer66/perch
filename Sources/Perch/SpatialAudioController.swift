@@ -93,9 +93,8 @@ final class SpatialAudioController: ObservableObject {
   ///     unreadable) — what tells a tap that lost capture from one that hears silence.
   ///     A blocking call; it is run off the main actor.
   ///   - now: the clock elapsed time is measured with.
-  ///   - probeTimeout: how long either blocking question may take before it counts as
-  ///     unanswered.
-  ///   - timing: how often the capture is looked at, and how long each wait may last.
+  ///   - timing: how often the capture is looked at, how long each wait may last, and how
+  ///     long either blocking question may take before it counts as unanswered.
   init(
     defaults: UserDefaults = .standard,
     makeEngine: @escaping SpatialEngineFactory = SpatialEngines.makeSpatializer,
@@ -103,15 +102,18 @@ final class SpatialAudioController: ObservableObject {
       AudibleProcesses.isAnotherProcessOutputting()
     },
     now: @escaping () -> ContinuousClock.Instant = { ContinuousClock.now },
-    probeTimeout: Duration = .milliseconds(500),
     timing: CaptureSupervisor.Timing = CaptureSupervisor.Timing()
   ) {
     self.defaults = defaults
     self.makeEngine = makeEngine
     self.othersPlaying = othersPlaying
     self.now = now
-    probeGate = BlockingCallGate(label: "dev.perch.spatial.permission", timeout: probeTimeout)
-    playbackGate = BlockingCallGate(label: "dev.perch.spatial.playback", timeout: probeTimeout)
+    probeGate = BlockingCallGate(
+      label: "dev.perch.spatial.permission", timeout: timing.questionTimeout
+    )
+    playbackGate = BlockingCallGate(
+      label: "dev.perch.spatial.playback", timeout: timing.questionTimeout
+    )
     self.timing = timing
     autoBalance = defaults.object(forKey: Keys.auto) as? Bool ?? true
     wander = defaults.object(forKey: Keys.wander) as? Bool ?? true

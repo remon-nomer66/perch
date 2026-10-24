@@ -23,22 +23,24 @@ import Testing
 //    居座らない（許可ありの答えそのものが誤っている環境でも、Mac の音を必ず戻す）
 //  - 空間化した音の出力（AVAudioEngine）が止まれば、構成変更の作り直しを待つ猶予
 //    （2秒）の後で1回作り直し、それでも止まるなら取り消す
+//  - スリープ明けなどで観測の間が大きく空いたら、その回はどのタイマーも進めない
 
 private typealias Decision = CaptureSupervisor.Decision
 
 /// 1回の観測を supervisor に見せる。表の行もそれ以外のテストも、ここを通して流す。
-/// 経過時間は名目の間隔そのもの（実時間の計測はコントローラの側で、ここでは決め打ち）。
+/// 経過時間は、指定が無ければ名目の間隔そのもの（実時間の計測はコントローラの側）。
 private func look(
   _ supervisor: inout CaptureSupervisor,
   signal: Bool,
   outputRunning: Bool = true,
+  after elapsed: Duration? = nil,
   othersPlaying: () -> Bool? = { false },
   permission: () -> SystemAudioPermission
 ) async -> Decision {
   await supervisor.observe(
     hasSignal: signal,
     outputRunning: outputRunning,
-    after: supervisor.pollInterval,
+    after: elapsed ?? supervisor.pollInterval,
     othersPlaying: { othersPlaying() },
     permission: { permission() }
   )
@@ -434,6 +436,59 @@ func vouchedTapIsAskedOncePerTimeout() async {
     #expect(decision == .hold)
   }
   #expect(probes == 7)
+}
+
+// MARK: - 観測の間が大きく空いたとき
+
+/// スリープ明けや、MainActor が長く止まった後の最初の観測。
+private let wakeGap = Duration.seconds(3_600)
+
+@Test("確認中に間が大きく空いた観測は、期限を進めない")
+func longGapDoesNotSpendTheConfirmDeadline() async {
+  var supervisor = CaptureSupervisor()
+  var decisions: [Decision] = []
+  decisions.append(await look(&supervisor, signal: false, after: wakeGap) { .denied })
+  for _ in 0..<15 {
+    decisions.append(await look(&supervisor, signal: false) { .denied })
+  }
+  #expect(decisions == holds(15) + [.revoke(.permissionDenied)])
+}
+
+@Test("出力が止まっていても、間が大きく空いた観測では猶予を使い切らない（構成変更の作り直しに任せる）")
+func longGapDoesNotSpendTheOutputGrace() async {
+  var supervisor = await runningSupervisor()
+  var decisions: [Decision] = []
+  decisions.append(await look(&supervisor, signal: true, outputRunning: false, after: wakeGap) {
+    .granted
+  })
+  decisions.append(await look(&supervisor, signal: true, outputRunning: false) { .granted })
+  decisions.append(await look(&supervisor, signal: true, outputRunning: false) { .granted })
+  #expect(decisions == [.hold, .hold, .rebuild])
+}
+
+@Test("他が再生中の無音でも、間が大きく空いた観測では作り直しの期限を進めない")
+func longGapDoesNotSpendTheStallTimeout() async {
+  var supervisor = await runningSupervisor()
+  var decisions: [Decision] = []
+  decisions.append(
+    await look(&supervisor, signal: false, after: wakeGap, othersPlaying: { true }) { .granted }
+  )
+  for _ in 0..<5 {
+    decisions.append(await look(&supervisor, signal: false, othersPlaying: { true }) { .granted })
+  }
+  #expect(decisions == holds(5) + [.rebuild])
+}
+
+@Test("問い合わせ2つぶん遅れた観測（間隔の2倍＋問い合わせの上限）までは数える")
+func lookDelayedByQuestionsStillCounts() async {
+  var supervisor = await runningSupervisor()
+  let timing = supervisor.timing
+  let delayed = timing.watchInterval * 2 + timing.questionTimeout
+  let decision = await look(&supervisor, signal: true, outputRunning: false, after: delayed) {
+    .granted
+  }
+  #expect(delayed >= timing.outputGrace)
+  #expect(decision == .rebuild)
 }
 
 @Test("音が流れている間は、他プロセスの再生も読みにいかない")

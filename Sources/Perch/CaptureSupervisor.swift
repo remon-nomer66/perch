@@ -46,6 +46,16 @@ struct CaptureSupervisor: Equatable {
     /// How long the spatialised output may be stopped before the watch steps in. A
     /// configuration change stops it too, and its own handler rebuilds within a moment.
     var outputGrace: Duration = .seconds(2)
+    /// How long either question to coreaudiod may take before it counts as unanswered.
+    var questionTimeout: Duration = .milliseconds(500)
+
+    /// The longest gap between two looks that still counts as time watched: the interval
+    /// overrun by both questions, with slack. Anything longer — the Mac slept, the main
+    /// actor stalled — says nothing about the capture, and would expire every timer at
+    /// once (the clock keeps running through sleep).
+    func longestCountedStep(after interval: Duration) -> Duration {
+      interval * 2 + questionTimeout
+    }
   }
 
   enum Decision: Equatable, Sendable {
@@ -143,7 +153,9 @@ struct CaptureSupervisor: Equatable {
   }
 
   /// One look at the capture, `elapsed` after the previous one — the time that really
-  /// passed, questions included, not the nominal interval.
+  /// passed, questions included, not the nominal interval. A gap far longer than a look
+  /// can take (sleep, a stalled main actor) is not counted: the look is still made, but
+  /// no timer moves.
   /// - Parameters:
   ///   - hasSignal: a non-silent block arrived since the previous look.
   ///   - outputRunning: the spatialised output is playing. Watched once on.
@@ -160,15 +172,16 @@ struct CaptureSupervisor: Equatable {
     othersPlaying: () async -> Bool?,
     permission: () async -> SystemAudioPermission
   ) async -> Decision {
+    let counted = elapsed <= timing.longestCountedStep(after: pollInterval) ? elapsed : .zero
     switch phase {
     case .confirming(var confirmation):
-      confirmation.elapsed += elapsed
+      confirmation.elapsed += counted
       return await confirm(hasSignal: hasSignal, confirmation, permission: permission)
     case .running(let watch):
       return await self.watch(
         hasSignal: hasSignal,
         outputRunning: outputRunning,
-        elapsed: elapsed,
+        elapsed: counted,
         watch,
         othersPlaying: othersPlaying,
         permission: permission
