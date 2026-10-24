@@ -29,12 +29,76 @@ private let policy = SessionPolicy(maximumFailureCount: 3)
   // An unverified device that connects successfully is a successful connection: a
   // headset that drops the channel on every wearing change would otherwise spend
   // the whole failure budget across hours of normal use and stick at exhausted.
-  let (next, _) = policy.reduce(
+  // The reset waits for the session to prove itself, so a session that fails before
+  // then still counts — see `aSessionThatFaultsBeforeProvingStableExhaustsItsBudget`.
+  let (unverified, _) = policy.reduce(
     state(.verifying, failureCount: 2),
     .verificationRejected
   )
+  #expect(unverified.phase == .unverified)
+
+  let (next, effects) = policy.reduce(unverified, .sessionProvedStable)
   #expect(next.phase == .unverified)
   #expect(next.failureCount == 0)
+  #expect(effects.isEmpty)
+}
+
+@Test func verificationAloneDoesNotRestoreTheBudget() {
+  // Reaching ready only says the handshake answered. Resetting the budget there let
+  // a session that faults on its first poll reconnect forever without ever reaching
+  // exhaustion: every reconnect verified again and wiped the count it had just spent.
+  for (event, phase) in [
+    (SessionEvent.verificationSucceeded, SessionState.Phase.ready),
+    (.verificationRejected, .unverified),
+  ] {
+    let (next, _) = policy.reduce(state(.verifying, failureCount: 2), event)
+    #expect(next.phase == phase)
+    #expect(next.failureCount == 2, "\(event) restored the budget before the session proved itself")
+  }
+}
+
+@Test func aSessionThatFaultsBeforeProvingStableExhaustsItsBudget() {
+  // Drive the real cycle: every reconnect verifies, reaches ready, and faults on the
+  // first poll — a declared read the device never answers. The loop must end.
+  var current = state(.connecting)
+  for _ in 0..<20 {
+    (current, _) = policy.reduce(current, .channelOpened(current.attempt))
+    #expect(current.phase == .verifying)
+    (current, _) = policy.reduce(current, .verificationSucceeded)
+    #expect(current.phase == .ready)
+    (current, _) = policy.reduce(current, .sessionFault(.responseTimedOut))
+    if current.phase == .retryExhausted { break }
+    #expect(current.phase == .retryWaiting)
+    (current, _) = policy.reduce(current, .backoffExpired)
+  }
+  #expect(current.phase == .retryExhausted, "a session that never settled reconnected forever")
+  #expect(current.failureCount == policy.maximumFailureCount)
+}
+
+@Test func aSessionThatProvedStableStartsItsBudgetOverOnEveryDrop() {
+  // The intent the reset exists for: a headset that drops its channel on every
+  // wearing change, after working normally in between, never sticks at exhausted.
+  var current = state(.connecting)
+  for _ in 0..<20 {
+    (current, _) = policy.reduce(current, .channelOpened(current.attempt))
+    (current, _) = policy.reduce(current, .verificationSucceeded)
+    (current, _) = policy.reduce(current, .sessionProvedStable)
+    #expect(current.failureCount == 0)
+    (current, _) = policy.reduce(current, .channelClosedUnexpectedly(current.attempt))
+    #expect(current.phase == .retryWaiting, "normal wearing changes spent the budget")
+    (current, _) = policy.reduce(current, .backoffExpired)
+  }
+}
+
+@Test func provingStableOutsideALiveSessionChangesNothing() {
+  // Only a live session can prove itself; a late signal must not restore the budget
+  // of a reconnect that is still paying for a failure.
+  for phase: SessionState.Phase in [.connecting, .verifying, .retryWaiting, .retryExhausted] {
+    let start = state(phase, failureCount: 2)
+    let (next, effects) = policy.reduce(start, .sessionProvedStable)
+    #expect(next == start, "\(phase) took a stability signal")
+    #expect(effects.isEmpty)
+  }
 }
 
 @Test func exhaustedRetriesRearmOnASlowCadence() {
@@ -247,7 +311,10 @@ private let policy = SessionPolicy(maximumFailureCount: 3)
 }
 
 @Test func successResetsTheFailureCount() {
-  let (next, _) = policy.reduce(state(.verifying, failureCount: 2), .verificationSucceeded)
+  // Success is a session that proved itself, not one that merely verified.
+  let (ready, _) = policy.reduce(state(.verifying, failureCount: 2), .verificationSucceeded)
+  #expect(ready.phase == .ready)
+  let (next, _) = policy.reduce(ready, .sessionProvedStable)
   #expect(next.phase == .ready)
   #expect(next.failureCount == 0)
 }
@@ -629,6 +696,7 @@ private let policy = SessionPolicy(maximumFailureCount: 3)
     .verificationFailedTransient, .controlContended(attempt), .sessionFault(.bufferOverflowed),
     .graceExpired, .backoffExpired, .bluetoothDisconnected,
     .willSleep, .didWake(deviceA), .didWake(nil), .manualRetry, .manualRelease,
+    .sessionProvedStable,
   ]
 
   for phase in phases {

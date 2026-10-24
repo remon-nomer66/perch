@@ -535,15 +535,15 @@ public actor SessionCoordinator {
         // task without moving the epoch, and the partial result of the interrupted
         // cycle would erase fields the session still holds.
         guard !Task.isCancelled else { return }
-        // The task inherits the coordinator's isolation, so the store is a plain
-        // same-actor call; the reads above are where the suspensions happen.
-        self.store(readings, from: admittedEpoch)
+        // The task inherits the coordinator's isolation, so the store is a same-actor
+        // call; the reads above are where the suspensions happen.
+        await self.store(readings, from: admittedEpoch)
         try? await Task.sleep(for: interval)
       }
     }
   }
 
-  private func store(_ readings: DeviceReadings, from readEpoch: SessionEpoch) {
+  private func store(_ readings: DeviceReadings, from readEpoch: SessionEpoch) async {
     // A read can outlive the session it was started for: `FeatureReader` swallows
     // per-request failures, so a read interrupted by an invalidation still returns a
     // partial result afterwards. Storing that would resurrect the previous device's
@@ -551,6 +551,9 @@ public actor SessionCoordinator {
     // the previous device's inquiry and field count.
     guard readEpoch == epoch else { return }
     latestReadings = readings
+    // A cycle that reached here survived every request it made, which is the proof of
+    // a working session the policy waits for before restoring a spent budget.
+    if state.failureCount > 0 { await handle(.sessionProvedStable) }
   }
 
   /// The raw read-only capability exchanges for a support report, gathered over the
@@ -1085,6 +1088,9 @@ public actor SessionCoordinator {
   /// Whether the request currently on the wire has been acknowledged. Exposed for
   /// tests: acknowledgement handling has no other observable surface.
   var inFlightAcknowledged: Bool? { inFlight?.lifecycle.isAcknowledged }
+  /// The failure budget spent so far. Exposed for tests: until it runs out, the
+  /// budget has no other observable surface.
+  var failureCount: Int { state.failureCount }
 
   private func scheduleResponseTimeout(_ id: OperationID) async {
     Task { [timeouts] in

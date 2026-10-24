@@ -33,6 +33,10 @@ public enum SessionEvent: Equatable, Sendable {
   case verificationSucceeded
   case verificationRejected
   case verificationFailedTransient
+  /// The live session completed its first full read of the device. Verifying only
+  /// shows the handshake answers; this shows the device answers what the session
+  /// keeps asking it, which is what restores the failure budget.
+  case sessionProvedStable
   /// Another host most likely holds the device's single control channel. Fired when
   /// an open times out against a device that is provably reachable — the transport
   /// verified the baseband connection before opening, and this hardware answers a
@@ -341,15 +345,23 @@ public struct SessionPolicy: Sendable {
     case (.connecting, .defaultOutputChanged(nil)):
       return (.released, [.cancelOpen, .closeChannel])
 
+    // Neither verdict restores the failure budget: a session that verifies and then
+    // faults on its first poll would otherwise reconnect forever, wiping on every
+    // pass the count it had just spent. `sessionProvedStable` restores it instead.
     case (.verifying, .verificationSucceeded):
-      return (state.moved(to: .ready, failureCount: 0), [])
+      return (state.moved(to: .ready), [])
 
-    // The channel stays open. Only writing is refused. Connecting to an unverified
-    // device is still a successful connection, so the failure budget starts over: a
-    // headset that drops the channel on every wearing change would otherwise spend
-    // the whole budget across hours of normal use and stick at exhausted.
+    // The channel stays open. Only writing is refused.
     case (.verifying, .verificationRejected):
-      return (state.moved(to: .unverified, failureCount: 0), [])
+      return (state.moved(to: .unverified), [])
+
+    // A session that completed a read is a successful connection, verified or not, so
+    // the failure budget starts over: a headset that drops the channel on every
+    // wearing change would otherwise spend the whole budget across hours of normal
+    // use and stick at exhausted.
+    case (.ready, .sessionProvedStable), (.unverified, .sessionProvedStable),
+      (.suspended, .sessionProvedStable):
+      return (state.moved(to: state.phase, failureCount: 0), [])
 
     case (.verifying, .verificationFailedTransient):
       return failed(state)
