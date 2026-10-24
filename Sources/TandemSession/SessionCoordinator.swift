@@ -463,11 +463,14 @@ public actor SessionCoordinator {
         let outcome = try await self.verifier.verify(over: Requester(coordinator: self))
         await self.verificationFinished(outcome, from: admittedEpoch)
       } catch {
-        // Reaching the device failed, which is not the same as the device being
-        // unsupported: one is worth retrying, the other never is. The task inherits
+        // Failing to reach the device is worth retrying; an answer that does not
+        // parse is not, because asking again gets the same answer. The task inherits
         // the coordinator's isolation, so the epoch read is a plain same-actor call.
         guard self.epoch == admittedEpoch else { return }
-        await self.handle(.verificationFailedTransient)
+        switch VerificationFailureKind(error) {
+        case .transient: await self.handle(.verificationFailedTransient)
+        case .deterministic: await self.handle(.verificationFailedPermanently)
+        }
       }
     }
   }

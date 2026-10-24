@@ -36,6 +36,9 @@ public enum SessionEvent: Equatable, Sendable {
   case verificationSucceeded
   case verificationRejected
   case verificationFailedTransient
+  /// The device answered the verification, and the answer cannot be interpreted.
+  /// Unlike a transient failure, asking again only gets the same answer.
+  case verificationFailedPermanently
   /// The live session completed its first full read of the device. Verifying only
   /// shows the handshake answers; this shows the device answers what the session
   /// keeps asking it, which is what restores the failure budget.
@@ -89,6 +92,7 @@ public struct SessionState: Equatable, Sendable {
       case unverified
       case retryExhausted
       case contended
+      case incompatible
     }
   }
 
@@ -109,6 +113,12 @@ public struct SessionState: Equatable, Sendable {
     case retryWaiting
     /// Transient failures reached the limit. Recoverable by hand.
     case retryExhausted
+    /// The device answered verification with something this application cannot
+    /// interpret. Retrying would only repeat the answer, so nothing reconnects until
+    /// the user asks or the output moves to another device, and the control channel
+    /// is closed so that another host can have it. The target is kept, so that a
+    /// different device still connects.
+    case incompatible
     /// Connected and usable, but this model has never been verified against the
     /// encodings this application sends.
     ///
@@ -269,6 +279,7 @@ public struct SessionPolicy: Sendable {
     case .unverified: .blocked(.unverified)
     case .retryExhausted: .blocked(.retryExhausted)
     case .contended: .blocked(.contended)
+    case .incompatible: .blocked(.incompatible)
     default: .reconnect
     }
   }
@@ -304,6 +315,7 @@ public struct SessionPolicy: Sendable {
         case .unverified: .unverified
         case .retryExhausted: .retryExhausted
         case .contended: .contended
+        case .incompatible: .incompatible
         }
       // The output is unknown until the audio system reports one, so the refusal
       // comes back without permission to reconnect. Each refusal re-arms its
@@ -313,7 +325,7 @@ public struct SessionPolicy: Sendable {
         switch blocked {
         case .retryExhausted: [.scheduleBackoff(attempt: max(state.failureCount, 1))]
         case .contended: [.scheduleContentionRetry]
-        case .unverified: []
+        case .unverified, .incompatible: []
         }
       return (state.moved(to: restored, isTargetDefaultOutput: device != nil), effects)
     }
@@ -379,6 +391,14 @@ public struct SessionPolicy: Sendable {
 
     case (.verifying, .verificationFailedTransient):
       return failed(state)
+
+    // Not on the retry budget: every retry would get the same unreadable answer
+    // while holding the channel away from the hosts that can use it.
+    case (.verifying, .verificationFailedPermanently):
+      return (
+        state.moved(to: .incompatible),
+        [.closeChannel, .invalidateSession, .failPendingRequests]
+      )
 
     // An unfinished session must not survive into `suspended`: resuming from there
     // would reach `ready` without completing verification or recovery.
@@ -471,10 +491,13 @@ public struct SessionPolicy: Sendable {
     case (.retryWaiting, .defaultOutputChanged(nil)):
       return (state.releasing(), [.cancelBackoff])
 
-    case (.contended, .defaultOutputChanged(nil)), (.retryExhausted, .defaultOutputChanged(nil)):
+    case (.contended, .defaultOutputChanged(nil)), (.retryExhausted, .defaultOutputChanged(nil)),
+      (.incompatible, .defaultOutputChanged(nil)):
       return (state.releasing(), teardown(from: state))
 
-    case (.contended, .manualRetry), (.retryExhausted, .manualRetry):
+    // Incompatibility takes a manual retry too: the button is on screen, and a
+    // firmware update is the one thing that changes the answer.
+    case (.contended, .manualRetry), (.retryExhausted, .manualRetry), (.incompatible, .manualRetry):
       // Seizing the session for a device the user is not listening to would take
       // control away from whichever host actually is.
       guard let target = state.target, state.isTargetDefaultOutput else { return (state, []) }
@@ -546,7 +569,8 @@ public struct SessionPolicy: Sendable {
   /// Releases whatever the phase currently owns, and nothing else.
   private func teardown(from state: SessionState) -> [SessionEffect] {
     switch state.phase {
-    case .released, .sleeping:
+    case .released, .sleeping, .incompatible:
+      // Incompatibility closed its channel on the way in and owns no timer.
       return []
     case .retryExhausted, .contended:
       // Both refusals own a slow-cadence retry timer.

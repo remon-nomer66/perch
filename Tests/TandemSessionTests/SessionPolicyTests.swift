@@ -332,6 +332,59 @@ private let policy = SessionPolicy(maximumFailureCount: 3)
   #expect(effects == [.cancelBackoff])
 }
 
+// MARK: - Failures retrying cannot fix
+
+@Test func aVerificationTheDeviceAnswersUnreadablyStopsRetrying() {
+  // The device answered the handshake with something that does not parse. Asking
+  // again gets the same answer, so it was a reconnect loop on the retry budget, then
+  // the slow cadence forever — each pass holding the single control channel.
+  let (incompatible, effects) = policy.reduce(
+    state(.verifying, failureCount: 1),
+    .verificationFailedPermanently
+  )
+  #expect(incompatible.phase == .incompatible)
+  #expect(incompatible.target == deviceA, "the refusal must remember which device it is about")
+  #expect(effects == [.closeChannel, .invalidateSession, .failPendingRequests])
+  #expect(!incompatible.acceptsWrites)
+
+  for event: SessionEvent in [.backoffExpired, .defaultOutputChanged(deviceA), .graceExpired] {
+    let (still, stillEffects) = policy.reduce(incompatible, event)
+    #expect(still.phase == .incompatible, "\(event) retried a failure that cannot change")
+    #expect(stillEffects.isEmpty)
+  }
+}
+
+@Test func anIncompatibleDeviceIsRetriedOnlyByHandOrByAnotherDevice() {
+  let (retrying, effects) = policy.reduce(state(.incompatible), .manualRetry)
+  #expect(retrying.phase == .connecting)
+  #expect(effects == [.openChannel(deviceA, retrying.attempt)])
+
+  let (refused, refusedEffects) = policy.reduce(
+    state(.incompatible, isDefaultOutput: false), .manualRetry
+  )
+  #expect(refused.phase == .incompatible, "a retry connected to a device that is not the output")
+  #expect(refusedEffects.isEmpty)
+
+  let (other, otherEffects) = policy.reduce(state(.incompatible), .defaultOutputChanged(deviceB))
+  #expect(other.phase == .connecting)
+  #expect(other.target == deviceB)
+  #expect(otherEffects == [.openChannel(deviceB, other.attempt)])
+
+  let (released, releaseEffects) = policy.reduce(state(.incompatible), .defaultOutputChanged(nil))
+  #expect(released.phase == .released)
+  #expect(releaseEffects.isEmpty)
+}
+
+@Test func sleepDoesNotLaunderIncompatibility() {
+  let (asleep, sleepEffects) = policy.reduce(state(.incompatible), .willSleep)
+  #expect(asleep.phase == .sleeping(resume: .blocked(.incompatible)))
+  #expect(sleepEffects.isEmpty, "the channel was already closed")
+
+  let (awake, effects) = policy.reduce(asleep, .didWake(deviceA))
+  #expect(awake.phase == .incompatible)
+  #expect(effects.isEmpty)
+}
+
 // MARK: - Close completions
 
 @Test func aCloseWeAskedForDoesNotUndoThePhaseThatRequestedIt() {
@@ -729,6 +782,9 @@ private let policy = SessionPolicy(maximumFailureCount: 3)
     (state(.verifying), .verificationSucceeded, .ready),
     (state(.verifying), .verificationRejected, .unverified),
     (state(.verifying), .verificationFailedTransient, .retryWaiting),
+    (state(.verifying), .verificationFailedPermanently, .incompatible),
+    (state(.incompatible), .manualRetry, .connecting),
+    (state(.incompatible), .defaultOutputChanged(nil), .released),
     (state(.verifying), .defaultOutputChanged(nil), .released),
     (state(.verifying), .controlContended(ConnectionAttempt(0)), .contended),
     (state(.ready), .defaultOutputChanged(nil), .suspended(resume: .ready)),
@@ -769,13 +825,14 @@ private let policy = SessionPolicy(maximumFailureCount: 3)
     .released, .connecting, .verifying, .ready, .contended,
     .suspended(resume: .ready), .retryWaiting, .retryExhausted,
     .unverified, .sleeping(resume: .reconnect), .sleeping(resume: .blocked(.unverified)),
-    .recovering,
+    .recovering, .incompatible, .sleeping(resume: .blocked(.incompatible)),
   ]
   let events: [SessionEvent] = [
     .defaultOutputChanged(deviceA), .defaultOutputChanged(deviceB), .defaultOutputChanged(nil),
     .channelOpened(attempt), .channelFailed(attempt), .channelClosedUnexpectedly(attempt),
     .channelClosedByUs, .verificationSucceeded, .verificationRejected,
-    .verificationFailedTransient, .controlContended(attempt), .sessionFault(.bufferOverflowed),
+    .verificationFailedTransient, .verificationFailedPermanently,
+    .controlContended(attempt), .sessionFault(.bufferOverflowed),
     .graceExpired, .backoffExpired, .bluetoothDisconnected,
     .willSleep, .didWake(deviceA), .didWake(nil), .manualRetry, .manualRelease,
     .sessionProvedStable,
