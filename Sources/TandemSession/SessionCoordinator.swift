@@ -69,32 +69,6 @@ public enum SessionRequestFailure: Error, Equatable, Sendable {
 /// actors, an invalidation could land after a request had already been admitted
 /// against the state it invalidated.
 public actor SessionCoordinator {
-  public struct Timeouts: Sendable {
-    public var response: Duration
-    public var grace: Duration
-    public var backoffUnit: Duration
-    /// Overrides the dialect-derived readings poll interval. Internal and test-only:
-    /// production always derives the cadence from the dialect, so nothing here can
-    /// bake in a model-specific value.
-    var readingIntervalOverride: Duration?
-
-    // An acknowledgement timeout used to live here, but nothing ever armed it: the
-    // response timeout is the one deadline a request needs, and a reply arriving
-    // without its acknowledgement is recorded on the request rather than timed.
-    public init(
-      response: Duration = .seconds(5),
-      grace: Duration = .seconds(60),
-      // Half a second before the first retry: a headset that drops its channel on a
-      // wearing change is back about a second later, which should feel immediate.
-      // Doubling still spaces persistent failures out to sixteen seconds.
-      backoffUnit: Duration = .milliseconds(500)
-    ) {
-      self.response = response
-      self.grace = grace
-      self.backoffUnit = backoffUnit
-    }
-  }
-
   private let policy: SessionPolicy
   private let opener: any TandemChannelOpening
   private let verifier: any DeviceVerifying
@@ -130,6 +104,8 @@ public actor SessionCoordinator {
   private var unverifiedWritesPermitted = false
   /// Alternates 0 and 1 across everything we send on a channel.
   private var outgoingSequence: UInt8 = 0
+  /// Every write on the channel, in the order the session made them.
+  private var writeChain = ChannelWriteChain()
   private var notifications: AsyncStream<TandemFrame>.Continuation?
   private var closeWasRequested = false
   /// Touch-panel gesture names heard over the session, added to the support report.
@@ -293,6 +269,7 @@ public actor SessionCoordinator {
     rejection = nil
     unverifiedWritesPermitted = false
     outgoingSequence = 0
+    writeChain = ChannelWriteChain()
     // The gestures heard belong to the device that announced them. Carrying the log
     // across an invalidation would mix the previous device's touch vocabulary into
     // the next device's support report.
@@ -375,8 +352,11 @@ public actor SessionCoordinator {
     }
 
     let routed = router.route(parsed.frames)
+    // Queued, not awaited: a stalled write here would stop inbound processing, and
+    // with it the answer every waiting request depends on. Queueing still puts each
+    // acknowledgement ahead of any request the answers below go on to unblock.
     for ack in routed.acknowledgements {
-      try? await channel?.write(ack.encoded())
+      if let channel { _ = enqueueWrite(ack.encoded(), on: channel) }
     }
     for event in routed.events {
       deliver(event)
@@ -969,11 +949,33 @@ public actor SessionCoordinator {
     }
     outgoingSequence ^= 1
 
-    do {
-      try await channel.write(frame.encoded())
-    } catch let failure as ChannelFailure {
+    // Bounded by the chain: with nothing to answer it, this write had no deadline at
+    // all, and a stalled one stopped the drag and every write behind it for good.
+    if case .failure(let failure) = await enqueueWrite(frame.encoded(), on: channel).value {
       throw SessionRequestFailure.channel(failure)
     }
+  }
+
+  /// Queues a write on the session's chain. A write that overruns its bound means the
+  /// remote stopped granting flow control, which does not clear by itself — and every
+  /// later write would queue behind it — so the session it belonged to is rebuilt.
+  private func enqueueWrite(
+    _ data: Data,
+    on channel: any TandemChannel
+  ) -> ChannelWriteChain.Outcome {
+    let (chain, outcome) = writeChain.appending(data, to: channel, within: timeouts.write)
+    writeChain = chain
+    let admittedEpoch = epoch
+    Task {
+      guard case .failure(.writeTimedOut) = await outcome.value else { return }
+      await self.writeStalled(in: admittedEpoch)
+    }
+    return outcome
+  }
+
+  private func writeStalled(in admittedEpoch: SessionEpoch) async {
+    guard admittedEpoch == epoch else { return }
+    await handle(.sessionFault(.writeStalled))
   }
 
   /// Internal rather than fileprivate so the serialization and attribution can be
@@ -1072,17 +1074,14 @@ public actor SessionCoordinator {
         continuation: continuation,
         faultsOnTimeout: faultsOnTimeout
       )
+      // Armed before the write, not after it: a write held by flow control never
+      // returns, and a deadline that waits for it left the request — and every one
+      // queued behind it — in flight for good.
+      scheduleResponseTimeout(id)
+      let written = enqueueWrite(frame.encoded(), on: channel)
       Task {
-        do {
-          try await channel.write(frame.encoded())
-        } catch let failure as ChannelFailure {
-          await self.finish(id, with: .channel(failure))
-          return
-        } catch {
-          await self.finish(id, with: .channel(.closed))
-          return
-        }
-        await self.scheduleResponseTimeout(id)
+        guard case .failure(let failure) = await written.value else { return }
+        await self.finish(id, with: .channel(failure))
       }
     }
   }
@@ -1094,7 +1093,7 @@ public actor SessionCoordinator {
   /// budget has no other observable surface.
   var failureCount: Int { state.failureCount }
 
-  private func scheduleResponseTimeout(_ id: OperationID) async {
+  private func scheduleResponseTimeout(_ id: OperationID) {
     Task { [timeouts] in
       try? await Task.sleep(for: timeouts.response)
       await self.responseTimedOut(id)

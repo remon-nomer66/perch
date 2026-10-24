@@ -10,6 +10,9 @@ public enum ChannelFailure: Error, Equatable, Sendable {
   case openRejected(Int32)
   case openTimedOut
   case writeRejected(Int32)
+  /// The write did not reach the channel within its bound. Whether the bytes went out
+  /// later is unknown, so the stream can no longer be trusted.
+  case writeTimedOut
   case frameExceedsTransmissionUnit(bytes: Int, limit: Int)
   case closed
 }

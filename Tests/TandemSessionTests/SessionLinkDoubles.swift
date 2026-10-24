@@ -187,6 +187,13 @@ func syntheticDevice(declaring codes: [UInt8]) -> TandemDeviceFingerprint {
   )
 }
 
+/// Set once by a task the test cannot await without risking a hang, so a test can
+/// poll whether that task got somewhere.
+actor Latch {
+  private(set) var isSet = false
+  func set() { isSet = true }
+}
+
 /// Polls `condition` until it holds or `timeout` passes.
 func waitFor(
   within timeout: Duration = .seconds(10),

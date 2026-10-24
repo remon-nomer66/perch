@@ -19,6 +19,9 @@ public enum SessionFault: Equatable, Sendable {
   case responseTimedOut
   case bufferOverflowed
   case responseUnattributable
+  /// A write did not reach the channel within its bound: the remote stopped granting
+  /// flow control, and every later write would queue behind the stalled one.
+  case writeStalled
 }
 
 public enum SessionEvent: Equatable, Sendable {
