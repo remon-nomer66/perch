@@ -17,7 +17,8 @@ import os
 /// correlates to a BMAP control service, so the two never fight for a device.
 ///
 /// It runs its own loop rather than doing work inside `AppModel.refresh`, so opening a
-/// channel (seconds) never stalls the 500 ms Sony refresh. Blocking IOBluetooth SDP
+/// channel (seconds) never stalls the 500 ms Sony refresh. The loop polls, and a switch of
+/// the default output to another device wakes it early. Blocking IOBluetooth SDP
 /// enumeration is kept off the main actor; only the resulting values touch it.
 @MainActor
 final class BoseDeviceController: ObservableObject {
@@ -69,6 +70,12 @@ final class BoseDeviceController: ObservableObject {
   private var modeList: [BoseAudioMode] = []
 
   private var loopTask: Task<Void, Never>?
+  /// Listens for default-output changes, so a switch is acted on when it is reported.
+  private var outputTask: Task<Void, Never>?
+  /// The wait between two ticks while it runs; cancelled to wake the loop early.
+  private var pauseTask: Task<Void, Never>?
+  /// A switch reported mid-tick: the pause after it is skipped rather than slept through.
+  private var wakePending = false
 
   private static let log = Logger(subsystem: "dev.perch.mac", category: "bose")
 
@@ -86,10 +93,19 @@ final class BoseDeviceController: ObservableObject {
 
   func start() {
     guard loopTask == nil else { return }
+    // Taken before `start()`, which publishes the current output to whoever is listening.
+    let changes = audio.changes
+    audio.start()
+    outputTask = Task { [weak self] in
+      for await output in changes {
+        self?.outputChanged(to: output)
+      }
+    }
     loopTask = Task { [weak self] in
       while !Task.isCancelled {
-        await self?.tick()
-        try? await Task.sleep(for: self?.refreshInterval ?? .seconds(4))
+        guard let self else { return }
+        await self.tick()
+        await self.pause()
       }
     }
   }
@@ -97,6 +113,7 @@ final class BoseDeviceController: ObservableObject {
   func stop() async {
     loopTask?.cancel()
     loopTask = nil
+    stopWatchingOutput()
     await teardown()
   }
 
@@ -106,6 +123,7 @@ final class BoseDeviceController: ObservableObject {
   func detachForTermination() -> BoseSession? {
     loopTask?.cancel()
     loopTask = nil
+    stopWatchingOutput()
     let live = session
     session = nil
     activeAddress = nil
@@ -135,6 +153,47 @@ final class BoseDeviceController: ObservableObject {
     } else if let target {
       await connect(to: target)
     }
+  }
+
+  /// Waits out the refresh interval between two ticks — or less, when a switch is
+  /// reported meanwhile (`outputChanged`).
+  private func pause() async {
+    guard !wakePending else {
+      wakePending = false
+      return
+    }
+    let pause = Task<Void, Never> { [refreshInterval] in
+      try? await Task.sleep(for: refreshInterval)
+    }
+    pauseTask = pause
+    // The loop's own cancellation must end the wait too: `pause` is not its child.
+    await withTaskCancellationHandler {
+      await pause.value
+    } onCancel: {
+      pause.cancel()
+    }
+    pauseTask = nil
+  }
+
+  /// A reported change of the default output.
+  ///
+  /// The poll alone re-correlates a switch only when it next comes round, and until then
+  /// the panel keeps driving the device that stopped playing — a gesture in that window
+  /// writes to headphones nobody is listening to. So a switch to another device wakes the
+  /// loop now: the pause in progress is cut short, or, mid-tick, the next one is skipped.
+  private func outputChanged(to output: AudioOutput) {
+    guard Self.isSwitch(to: output, awayFrom: correlatedOutput) else { return }
+    if let pauseTask {
+      pauseTask.cancel()
+    } else {
+      wakePending = true
+    }
+  }
+
+  private func stopWatchingOutput() {
+    outputTask?.cancel()
+    outputTask = nil
+    audio.stop()
   }
 
   /// The BMAP control address for the current audio output, or `nil` when the output is
@@ -183,14 +242,25 @@ final class BoseDeviceController: ObservableObject {
     addressOctets(of: address).joined(separator: ":")
   }
 
-  /// The current default audio output's device identifier, or `nil` when it is not
-  /// Bluetooth. The raw string, so two Bose devices are told apart — never logged.
   private func currentOutputIdentifier() -> String? {
-    switch audio.current() {
+    Self.identifier(of: audio.current())
+  }
+
+  /// The device identifier of an audio output, or `nil` when it is not Bluetooth. The
+  /// raw string, so two Bose devices are told apart — never logged.
+  nonisolated static func identifier(of output: AudioOutput) -> String? {
+    switch output {
     case .identified(let device): return device.rawValue
     case .unidentifiedBluetooth(let uid): return uid
     case .other: return nil
     }
+  }
+
+  /// Whether a reported output names a device other than the one the session was
+  /// correlated from — the only change worth waking the loop for. Core Audio reports the
+  /// same output again too, and each wake costs a synchronous SDP scan or a reopen.
+  nonisolated static func isSwitch(to output: AudioOutput, awayFrom correlated: String?) -> Bool {
+    identifier(of: output) != correlated
   }
 
   // MARK: - Session lifecycle
