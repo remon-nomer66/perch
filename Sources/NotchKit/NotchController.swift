@@ -235,7 +235,7 @@ public final class NotchController: ObservableObject {
     let window: NotchWindow
     if let existing = self.window {
       window = existing
-      window.setFrame(strip, display: false)
+      window.place(strip, display: false)
     } else {
       window = NotchWindow(screenFrame: strip)
       // The hosting view is created once and kept for the window's whole life:
@@ -367,13 +367,14 @@ public final class NotchController: ObservableObject {
     // build time; grown past it the panel would be cut at the window's bottom edge —
     // while the hit test, which reads the appearance live, kept honouring the
     // invisible remainder. Following it here keeps the two in step, and the check is
-    // two rect compares on the pointer's cadence.
+    // two rect compares on the pointer's cadence — against the last request, since a
+    // fractional height never reads back as asked.
     if let window, let screenFrame {
       let strip = Self.stripRect(
         screenFrame: screenFrame,
         expandedHeight: appearance().expandedHeight
       )
-      if window.frame != strip { window.setFrame(strip, display: true) }
+      window.place(strip, display: true)
     }
     // The bar is drawn even while closed, but the strip must never intercept a click
     // meant for the menu bar behind it; only the catcher, over the bar alone, does.

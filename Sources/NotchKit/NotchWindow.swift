@@ -9,6 +9,8 @@ public final class NotchWindow: NSPanel {
   /// Above the menu bar and its status items, which the panel has to cover.
   static let overlayLevel: NSWindow.Level = .statusBar + 1
 
+  private var frameRequest = FrameRequest()
+
   public init(screenFrame: CGRect) {
     super.init(
       contentRect: screenFrame,
@@ -16,11 +18,17 @@ public final class NotchWindow: NSPanel {
       backing: .buffered,
       defer: false
     )
+    frameRequest.record(asked: screenFrame, settled: frame)
     configureAsNotchOverlay(level: Self.overlayLevel)
     // Nothing is interactive until the panel is open, so clicks pass through to the
     // menu bar and status items underneath. A press on the closed bar is taken by the
     // click catcher instead, which covers the bar and nothing else.
     ignoresMouseEvents = true
+  }
+
+  /// Moves the strip to `frame` unless that is where it was last asked to be.
+  func place(_ frame: CGRect, display: Bool) {
+    place(frame, display: display, request: &frameRequest)
   }
 
   /// Only while open. The panel takes the keyboard when a control in it is clicked —
@@ -69,5 +77,13 @@ extension NSPanel {
       .stationary,
       .ignoresCycle,
     ]
+  }
+
+  /// Sets `frame` only when `request` says it is not already in place; see
+  /// `FrameRequest` for why the window's own `frame` cannot be the comparison.
+  func place(_ frame: CGRect, display: Bool, request: inout FrameRequest) {
+    guard request.needsPlacing(frame, current: self.frame) else { return }
+    setFrame(frame, display: display)
+    request.record(asked: frame, settled: self.frame)
   }
 }

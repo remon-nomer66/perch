@@ -15,6 +15,8 @@ import AppKit
 /// it: a handler here as well would see the same press twice, opening the panel and
 /// closing it again on a single click.
 final class NotchClickCatcher: NSPanel {
+  private var frameRequest = FrameRequest()
+
   init() {
     super.init(
       contentRect: .zero,
@@ -48,7 +50,7 @@ final class NotchClickCatcher: NSPanel {
       if !ignoresMouseEvents { ignoresMouseEvents = true }
       return
     }
-    if self.frame != frame { setFrame(frame, display: false) }
+    place(frame, display: false, request: &frameRequest)
     if ignoresMouseEvents { ignoresMouseEvents = false }
   }
 }
