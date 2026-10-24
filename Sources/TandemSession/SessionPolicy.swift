@@ -439,6 +439,13 @@ public struct SessionPolicy: Sendable {
     case (.suspended, .channelClosedUnexpectedly):
       return (state.releasing(), [.cancelGrace, .invalidateSession, .failPendingRequests])
 
+    // The grace exists to resume onto a working channel. One that faulted — a write
+    // that stalled, an answer that never came — would be resumed broken, so it is
+    // let go like a channel that closed; the device reconnects when it is the output
+    // again, the same way it does after the grace runs out.
+    case (.suspended, .sessionFault):
+      return (state.releasing(), teardown(from: state))
+
     case (.connecting, .controlContended):
       // The open hung until its timeout against a device the transport had already
       // confirmed as connected, while it was still the default output. On this

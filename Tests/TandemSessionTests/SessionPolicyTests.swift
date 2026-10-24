@@ -200,6 +200,20 @@ private let policy = SessionPolicy(maximumFailureCount: 3)
   #expect(effects == [.cancelGrace])
 }
 
+@Test func aFaultWhileSuspendedReleasesRatherThanResumingOnABrokenStream() {
+  // The grace holds the channel, and acknowledgements still go out on it. A fault
+  // there — a stalled write above all — used to be ignored, so returning to the
+  // device resumed onto a channel that could no longer carry anything, and the first
+  // request after it waited out its whole timeout before anything was rebuilt.
+  for fault: SessionFault in [.writeStalled, .responseTimedOut, .bufferOverflowed] {
+    let (next, effects) = policy.reduce(state(.suspended(resume: .ready)), .sessionFault(fault))
+    #expect(next.phase == .released, "\(fault) was ignored while suspended")
+    #expect(effects.contains(.cancelGrace))
+    #expect(effects.contains(.closeChannel))
+    #expect(effects.contains(.failPendingRequests))
+  }
+}
+
 @Test func disconnectingWhileSuspendedReleasesRatherThanResuming() {
   let suspended = state(.suspended(resume: .ready))
   let (closed, _) = policy.reduce(suspended, .channelClosedUnexpectedly(suspended.attempt))
