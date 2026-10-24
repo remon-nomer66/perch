@@ -143,6 +143,11 @@ public enum BmapAudioMode {
   /// Unverified: a *user-created* mode whose voice prompt is 0. The captured device had no
   /// custom mode to check, and such a slot would be missed here. Worth re-capturing once
   /// one exists.
+  ///
+  /// Also unverified: what [4] means at all. It stays in the OR as the conservative side —
+  /// the OR can only err towards listing an empty slot. Were [4] a mere "slot exists" flag
+  /// on another model, empty slots would join the list; that is the lesser failure next to
+  /// dropping configured modes, which is what reading [4] alone did.
   public static func parseConfig(_ frame: BmapFrame) throws -> BmapModeConfig {
     guard frame.address == configAddress else {
       throw BmapAudioModeError.unexpectedAddress(fblock: frame.fblock, function: frame.function)
