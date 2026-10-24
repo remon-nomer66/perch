@@ -4,7 +4,8 @@ import Testing
 
 @testable import TandemSession
 
-/// Synthetic, in the documentation range of no real vendor. It must never surface.
+/// Synthetic and locally administered (the 0x02 bit), so it belongs to no real
+/// device — the same stand-in the other tests use. It must never surface in a log.
 private let address = "02:00:00:00:00:01"
 private let device = DeviceIdentity(address)
 

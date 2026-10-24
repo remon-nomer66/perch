@@ -318,9 +318,10 @@ public struct SessionPolicy: Sendable {
         case .incompatible: .incompatible
         }
       // The output is unknown until the audio system reports one, so the refusal
-      // comes back without permission to reconnect. Each refusal re-arms its
-      // slow-cadence timer, because nothing else ever advances it; a tick that finds
-      // the device still not the output simply re-arms.
+      // comes back without permission to reconnect. Exhaustion and contention re-arm
+      // their slow-cadence timers, because nothing else ever advances them, and a
+      // tick that finds the device still not the output simply re-arms.
+      // Incompatibility owns no timer: it waits for the user.
       let effects: [SessionEffect] =
         switch blocked {
         case .retryExhausted: [.scheduleBackoff(attempt: max(state.failureCount, 1))]
