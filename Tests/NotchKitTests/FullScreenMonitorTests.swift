@@ -49,7 +49,8 @@ private func readThrough26(
     safeAreaTop: 37,
     primaryFrame: primaryFrame,
     ownPID: ownPID,
-    witness: .statusItems
+    witness: .statusItems,
+    hasSeenDesktop: false
   )
 }
 
@@ -169,7 +170,7 @@ private func readThrough26(
     windowRow(layer: 0, bounds: CGRect(x: 0, y: 37, width: 1512, height: 945)),
   ]
 
-  #expect(readThrough26(windows) == FullScreenReading(reason: .menuBarWithoutStatusItems))
+  #expect(readThrough26(windows).reason == .menuBarWithoutStatusItems)
   #expect(readThrough26(windows).isTaken)
 }
 
@@ -296,15 +297,20 @@ private func housingRowFill27() -> [String: Any] {
   )
 }
 
-/// Reads as macOS 27 does, where the desktop under the bar proves it visible.
-private func read27(_ windows: [[String: Any]]) -> FullScreenReading {
+/// Reads as macOS 27 does, where the desktop under the bar proves it visible — by
+/// default on a screen whose desktop has been seen before, so its absence means
+/// something.
+private func read27(
+  _ windows: [[String: Any]], hasSeenDesktop: Bool = true
+) -> FullScreenReading {
   FullScreenRule.read(
     windows: windows,
     screenFrame: builtIn16,
     safeAreaTop: builtIn16SafeTop,
     primaryFrame: builtIn16,
     ownPID: ownPID,
-    witness: .desktop
+    witness: .desktop,
+    hasSeenDesktop: hasSeenDesktop
   )
 }
 
@@ -319,7 +325,7 @@ private func read27(_ windows: [[String: Any]]) -> FullScreenReading {
     wallpaper27(),
   ]
 
-  #expect(read27(windows) == FullScreenReading(reason: .menuBarOverTheDesktop))
+  #expect(read27(windows).reason == .menuBarOverTheDesktop)
   #expect(!read27(windows).isTaken)
 }
 
@@ -340,7 +346,7 @@ private func read27(_ windows: [[String: Any]]) -> FullScreenReading {
     windowRow(layer: desktopLevel - 3, bounds: builtIn16, pid: windowServerPID),
   ]
 
-  #expect(read27(windows) == FullScreenReading(reason: .menuBarWithoutDesktop))
+  #expect(read27(windows).reason == .menuBarWithoutDesktop)
   #expect(read27(windows).isTaken)
 }
 
@@ -358,7 +364,7 @@ private func read27(_ windows: [[String: Any]]) -> FullScreenReading {
     wallpaper27(),
   ]
 
-  #expect(read27(windows) == FullScreenReading(reason: .menuBarGone))
+  #expect(read27(windows).reason == .menuBarGone)
   #expect(read27(windows).isTaken)
 }
 
@@ -436,6 +442,120 @@ private func read27(_ windows: [[String: Any]]) -> FullScreenReading {
   ]
 
   #expect(read27(windows).isTaken)
+}
+
+// MARK: - Remembering the desktop
+
+@Test func withNoDesktopEverSeenItsAbsenceProvesNothing() {
+  // Finder's desktop switched off, or Finder not running: this Mac lists no desktop
+  // windows at all, so their absence is its ordinary state, not a full-screen space.
+  let windows = [
+    menuBar27(),
+    maximized27(),
+    wallpaper27(),
+  ]
+
+  #expect(read27(windows, hasSeenDesktop: false).reason == .desktopNeverSeen)
+  #expect(!read27(windows, hasSeenDesktop: false).isTaken)
+}
+
+@Test func onceTheDesktopHasBeenSeenItsAbsenceIsAFullScreenSpace() {
+  let windows = [
+    menuBar27(),
+    maximized27(pid: fullScreenPID),
+    wallpaper27(),
+  ]
+
+  #expect(read27(windows, hasSeenDesktop: true).reason == .menuBarWithoutDesktop)
+  #expect(read27(windows, hasSeenDesktop: true).isTaken)
+}
+
+@Test func theDesktopIsReportedWhateverTheVerdict() {
+  // The record of a seen desktop has to start somewhere: an empty desktop with nothing
+  // reaching the top band shows it as plainly as one under a maximized window.
+  let emptyDesktop = [menuBar27(), finderDesktop27(), wallpaper27()]
+  let game = [windowRow(layer: 0, bounds: builtIn16, pid: fullScreenPID), finderDesktop27()]
+  let fullScreenSpace = [menuBar27(), maximized27(pid: fullScreenPID), wallpaper27()]
+
+  #expect(read27(emptyDesktop, hasSeenDesktop: false).reason == .nothingAtTheTop)
+  #expect(read27(emptyDesktop, hasSeenDesktop: false).showsDesktop)
+  #expect(read27(game).showsDesktop)
+  #expect(!read27(fullScreenSpace).showsDesktop)
+}
+
+/// Hands the reader one prepared look at the screen per reading.
+@MainActor
+private final class LookScript {
+  private var remaining: [NotchScreenReader.Look]
+
+  init(_ looks: [NotchScreenReader.Look]) {
+    remaining = looks
+  }
+
+  func next() -> NotchScreenReader.Look? {
+    remaining.isEmpty ? nil : remaining.removeFirst()
+  }
+}
+
+private func look27(
+  _ windows: [[String: Any]], screenFrame: CGRect = builtIn16
+) -> NotchScreenReader.Look {
+  NotchScreenReader.Look(
+    windows: windows,
+    screenFrame: screenFrame,
+    safeAreaTop: builtIn16SafeTop,
+    primaryFrame: screenFrame
+  )
+}
+
+private func desktopLook27() -> NotchScreenReader.Look {
+  look27([menuBar27(), maximized27(), finderDesktop27(), wallpaper27()])
+}
+
+private func fullScreenLook27() -> NotchScreenReader.Look {
+  look27([menuBar27(), maximized27(pid: fullScreenPID), wallpaper27()])
+}
+
+@MainActor
+@Test func theReaderTrustsTheDesktopsAbsenceOnlyAfterSeeingIt() {
+  // Launched straight into a full-screen space, the reader cannot yet tell it from a
+  // Mac without desktop windows; one glimpse of the desktop settles which this is.
+  let script = LookScript([fullScreenLook27(), desktopLook27(), fullScreenLook27()])
+  let reader = NotchScreenReader(look: script.next, ownPID: ownPID, witness: .desktop)
+
+  #expect(reader.read().reason == .desktopNeverSeen)
+  #expect(reader.read().reason == .menuBarOverTheDesktop)
+  #expect(reader.read().reason == .menuBarWithoutDesktop)
+}
+
+@MainActor
+@Test func anotherScreenFrameDiscardsTheSeenDesktop() {
+  // A changed frame is another screen — or the same one rearranged — whose desktop is
+  // yet to be seen.
+  let otherFrame = CGRect(x: 0, y: 0, width: 1512, height: 982)
+  let fullScreenThere = look27(
+    [
+      windowRow(layer: menuBarLevel, bounds: CGRect(x: 0, y: 0, width: 1512, height: 39)),
+      windowRow(
+        layer: 0, bounds: CGRect(x: 0, y: 39, width: 1512, height: 943), pid: fullScreenPID
+      ),
+    ],
+    screenFrame: otherFrame
+  )
+  let script = LookScript([desktopLook27(), fullScreenThere, fullScreenLook27()])
+  let reader = NotchScreenReader(look: script.next, ownPID: ownPID, witness: .desktop)
+
+  #expect(reader.read().reason == .menuBarOverTheDesktop)
+  #expect(reader.read().reason == .desktopNeverSeen)
+  // Back on the first frame, the earlier sighting is gone with the change.
+  #expect(reader.read().reason == .desktopNeverSeen)
+}
+
+@MainActor
+@Test func theReaderHasNothingToReadWithoutANotchScreen() {
+  let reader = NotchScreenReader(look: { nil }, ownPID: ownPID, witness: .desktop)
+
+  #expect(reader.read().reason == .nothingToRead)
 }
 
 // MARK: - Reporting

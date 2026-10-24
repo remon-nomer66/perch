@@ -33,10 +33,8 @@ public final class FullScreenMonitor {
   private var followUp: Timer?
 
   public convenience init() {
-    self.init(
-      read: FullScreenMonitor.readNotchScreen,
-      now: { ProcessInfo.processInfo.systemUptime }
-    )
+    let reader = NotchScreenReader()
+    self.init(read: reader.read, now: { ProcessInfo.processInfo.systemUptime })
   }
 
   /// Takes the reading and the time from elsewhere, so the timing can be exercised
@@ -125,20 +123,5 @@ public final class FullScreenMonitor {
     }
     RunLoop.main.add(followUp, forMode: .common)
     self.followUp = followUp
-  }
-
-  private static func readNotchScreen() -> FullScreenReading {
-    guard let screen = NSScreen.withNotch, let primary = NSScreen.screens.first,
-      let windows = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID)
-        as? [[String: Any]]
-    else { return FullScreenReading(reason: .nothingToRead) }
-    return FullScreenRule.read(
-      windows: windows,
-      screenFrame: screen.frame,
-      safeAreaTop: screen.safeAreaInsets.top,
-      primaryFrame: primary.frame,
-      ownPID: ProcessInfo.processInfo.processIdentifier,
-      witness: .running
-    )
   }
 }

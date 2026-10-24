@@ -20,20 +20,34 @@ struct FullScreenReading: Equatable, Sendable {
     /// From macOS 27: the menu bar is listed over the desktop, which no full-screen space
     /// shows.
     case menuBarOverTheDesktop
-    /// From macOS 27: the menu bar's window is listed with no desktop under it — again
-    /// the shape of a full-screen space.
+    /// From macOS 27: the menu bar's window is listed with no desktop under it, on a
+    /// screen whose desktop has been seen before — again the shape of a full-screen space.
     case menuBarWithoutDesktop
+    /// From macOS 27: the same shape, but no desktop has ever been seen on this screen.
+    /// A Mac whose desktop lists no windows at all — Finder's desktop switched off, or
+    /// Finder not running — always looks like this, so here it proves nothing.
+    case desktopNeverSeen
     /// A window reaches the top band and the menu bar's window is gone with it.
     case menuBarGone
   }
 
   let reason: Reason
+  /// The desktop's own windows were listed under this screen's top band, whatever the
+  /// verdict. Seeing them once is what lets their absence count later (see
+  /// `DesktopSighting`).
+  let showsDesktop: Bool
+
+  init(reason: Reason, showsDesktop: Bool = false) {
+    self.reason = reason
+    self.showsDesktop = showsDesktop
+  }
 
   var isTaken: Bool {
     switch reason {
     case .menuBarWithoutStatusItems, .menuBarWithoutDesktop, .menuBarGone:
       true
-    case .nothingToRead, .nothingAtTheTop, .menuBarWithStatusItems, .menuBarOverTheDesktop:
+    case .nothingToRead, .nothingAtTheTop, .menuBarWithStatusItems, .menuBarOverTheDesktop,
+      .desktopNeverSeen:
       false
     }
   }

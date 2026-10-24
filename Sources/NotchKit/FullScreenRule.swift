@@ -26,13 +26,17 @@ enum FullScreenRule {
   /// The frames arrive in AppKit coordinates; the window list speaks in top-left-origin
   /// global coordinates. The primary screen anchors both systems, so the screen's top
   /// edge flips through the primary's maxY.
+  ///
+  /// `hasSeenDesktop` says whether an earlier reading saw this screen's desktop; only
+  /// the desktop witness consults it (see `DesktopSighting`).
   static func read(
     windows: [[String: Any]],
     screenFrame: CGRect,
     safeAreaTop: CGFloat,
     primaryFrame: CGRect,
     ownPID: pid_t,
-    witness: MenuBarWitness
+    witness: MenuBarWitness,
+    hasSeenDesktop: Bool
   ) -> FullScreenReading {
     // Full screen on a notched display is letterboxed below the camera housing, so the
     // window that owns the screen tops out at the safe-area line, never at the screen's
@@ -51,13 +55,25 @@ enum FullScreenRule {
     // Half the screen keeps stray palettes and status items out while still catching
     // the narrower pane of a Split View pair through its wider partner.
     let wide = atTop.filter { $0.bounds.width >= screenFrame.width / 2 }
-
-    guard wide.contains(where: { $0.layer == normalLevel }) else {
-      return FullScreenReading(reason: .nothingAtTheTop)
+    // The desktop spans the screen and runs on below the band; the fill laid over the
+    // housing row while the bar is hidden sits at a desktop level too, but never does.
+    // Looked for whatever the verdict, so an empty desktop counts as seen too.
+    let showsDesktop = wide.contains {
+      desktopLevels.contains($0.layer) && $0.bounds.maxY > topStrip.maxY
     }
-    return readMenuBar(
-      atTop: atTop, wide: wide, screenFrame: screenFrame, topStrip: topStrip, witness: witness
-    )
+
+    let reason =
+      wide.contains(where: { $0.layer == normalLevel })
+      ? menuBarReason(
+        atTop: atTop,
+        wide: wide,
+        screenFrame: screenFrame,
+        showsDesktop: showsDesktop,
+        witness: witness,
+        hasSeenDesktop: hasSeenDesktop
+      )
+      : .nothingAtTheTop
+    return FullScreenReading(reason: reason, showsDesktop: showsDesktop)
   }
 
   /// The menu bar showing at this screen's top is the strongest sign the screen was
@@ -82,34 +98,34 @@ enum FullScreenRule {
   /// status items, and a desktop window lingering there would silently end detection.
   /// On macOS 27, anything at the status level belongs to a third party and may follow
   /// the user into a full-screen space, so it proves nothing about the bar.
-  private static func readMenuBar(
+  ///
+  /// The desktop's absence, in turn, counts only on a screen where it has been seen. A
+  /// Mac whose desktop lists no windows at all — Finder's desktop switched off, or
+  /// Finder not running — looks like a full-screen space all the time, and reading it
+  /// so would hide the notch for good: the very failure this witness exists to end.
+  private static func menuBarReason(
     atTop: [ListedWindow],
     wide: [ListedWindow],
     screenFrame: CGRect,
-    topStrip: CGRect,
-    witness: MenuBarWitness
-  ) -> FullScreenReading {
+    showsDesktop: Bool,
+    witness: MenuBarWitness,
+    hasSeenDesktop: Bool
+  ) -> FullScreenReading.Reason {
     // A strip, not a sheet: overlays that cover the whole screen at this level stay
     // listed through every state, and a narrow one at the same level cannot pose as the
     // full-width bar either.
     let menuBarListed = wide.contains {
       $0.layer == menuBarLevel && $0.bounds.height < screenFrame.height / 2
     }
-    guard menuBarListed else { return FullScreenReading(reason: .menuBarGone) }
+    guard menuBarListed else { return .menuBarGone }
 
     switch witness {
     case .statusItems:
       let listed = atTop.contains { $0.layer == statusItemLevel }
-      return FullScreenReading(
-        reason: listed ? .menuBarWithStatusItems : .menuBarWithoutStatusItems
-      )
+      return listed ? .menuBarWithStatusItems : .menuBarWithoutStatusItems
     case .desktop:
-      // The desktop spans the screen and runs on below the band; the fill laid over the
-      // housing row while the bar is hidden sits at a desktop level too, but never does.
-      let listed = wide.contains {
-        desktopLevels.contains($0.layer) && $0.bounds.maxY > topStrip.maxY
-      }
-      return FullScreenReading(reason: listed ? .menuBarOverTheDesktop : .menuBarWithoutDesktop)
+      if showsDesktop { return .menuBarOverTheDesktop }
+      return hasSeenDesktop ? .menuBarWithoutDesktop : .desktopNeverSeen
     }
   }
 
