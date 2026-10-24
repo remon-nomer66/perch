@@ -85,6 +85,7 @@ public actor SessionCoordinator {
   private var fingerprint: TandemDeviceFingerprint?
   private var rejection: TandemDeviceVerificationFailure?
   private var latestReadings = DeviceReadings()
+  private var settingRevisions = SettingRevisions()
   private var readingTask: Task<Void, Never>?
   private let reader = FeatureReader()
 
@@ -392,50 +393,20 @@ public actor SessionCoordinator {
     }
   }
 
-  /// A setting changed on the device itself — a touch on the headset, or a change made
-  /// from the phone app — is announced over the channel as an unsolicited frame, not as
-  /// a reply to a request. The periodic read folds such a change in eventually, but only
-  /// on its slow keepalive cadence (up to a reading interval later), which is why a
-  /// noise-control change made by touch took many seconds to reach the panel. Parsing
-  /// the notification here updates the reading at once, so the panel reflects a physical
-  /// change within a refresh tick.
-  ///
-  /// Only a noise-control parameter — what a headphone touch actually changes — is
-  /// handled; every other unsolicited frame is left untouched for the notification
-  /// stream and the gesture log. The reading's shape (modes, field count, wind kind) is
-  /// carried over from what was read, since the notification alone does not restate it.
+  /// A noise-control change made on the device itself is announced unsolicited;
+  /// folding it in at once is what lets a touch on the headset reach the panel within
+  /// a refresh tick (see `NoiseControlReading.applying(unsolicited:)`).
   private func applyUnsolicited(_ frame: TandemFrame) {
-    guard let reading = latestReadings.noiseControl else { return }
-    let bytes = [UInt8](frame.payload)
-    guard bytes.count >= 2, bytes[1] == reading.inquiry else { return }
-    // The device announces a noise-control change with either the return (0x67) or the
-    // notify (0x69) command — the same two the write's read-back listens for.
-    let state: TandemNoiseControlState
-    switch bytes[0] {
-    case 0x67:
-      guard
-        let parsed = try? TandemNoiseControlProtocol.parseParameterResponse(
-          frame, inquiry: reading.inquiry)
-      else { return }
-      state = parsed
-    case 0x69:
-      guard
-        let parsed = try? TandemNoiseControlProtocol.parseParameterNotification(
-          frame, inquiry: reading.inquiry)
-      else { return }
-      state = parsed
-    default:
-      return
-    }
-    guard state != reading.state else { return }
-    latestReadings.noiseControl = NoiseControlReading(
-      inquiry: reading.inquiry,
-      modes: reading.modes,
-      state: state,
-      valueFieldCount: max(bytes.count - 2, reading.valueFieldCount),
-      legacyWindKind: reading.inquiry == TandemNoiseControlProtocol.legacyInquiry && bytes.count > 3
-        ? bytes[3] : reading.legacyWindKind
-    )
+    guard let updated = latestReadings.noiseControl?.applying(unsolicited: frame) else { return }
+    settle(.noiseControl) { $0.noiseControl = updated }
+  }
+
+  /// Stores a setting that changed outside the poll — a write's read-back or the
+  /// device's own announcement — and marks it, so that a poll cycle already under way
+  /// does not put back the value it read before the change.
+  private func settle(_ setting: DeviceReadings.Setting, _ update: (inout DeviceReadings) -> Void) {
+    update(&latestReadings)
+    settingRevisions = settingRevisions.bumping(setting)
   }
 
   private func failPending(with failure: RequestFailure) {
@@ -517,6 +488,7 @@ public actor SessionCoordinator {
     let admittedEpoch = epoch
     readingTask = Task { [reader] in
       while !Task.isCancelled {
+        let started = self.settingRevisions
         let readings = await reader.read(
           declaring: functions,
           dialect: dialect,
@@ -528,20 +500,28 @@ public actor SessionCoordinator {
         guard !Task.isCancelled else { return }
         // The task inherits the coordinator's isolation, so the store is a same-actor
         // call; the reads above are where the suspensions happen.
-        await self.store(readings, from: admittedEpoch)
+        await self.store(readings, from: admittedEpoch, startedAt: started)
         try? await Task.sleep(for: interval)
       }
     }
   }
 
-  private func store(_ readings: DeviceReadings, from readEpoch: SessionEpoch) async {
+  private func store(
+    _ readings: DeviceReadings,
+    from readEpoch: SessionEpoch,
+    startedAt started: SettingRevisions
+  ) async {
     // A read can outlive the session it was started for: `FeatureReader` swallows
     // per-request failures, so a read interrupted by an invalidation still returns a
     // partial result afterwards. Storing that would resurrect the previous device's
     // values — and let a write against the next device pass `apply`'s guards with
     // the previous device's inquiry and field count.
     guard readEpoch == epoch else { return }
-    latestReadings = readings
+    // A setting written or announced while the cycle ran is newer than what it read.
+    latestReadings = readings.keeping(
+      settingRevisions.settingsChanged(since: started),
+      from: latestReadings
+    )
     // A cycle that reached here survived every request it made, which is the proof of
     // a working session the policy waits for before restoring a spent budget.
     if state.failureCount > 0 { await handle(.sessionProvedStable) }
@@ -643,7 +623,7 @@ public actor SessionCoordinator {
     }
 
     let confirmed = try await readNoiseControlNow(inquiry)
-    latestReadings.noiseControl = confirmed
+    settle(.noiseControl) { $0.noiseControl = confirmed }
     guard confirmed.state == target else {
       throw WriteFailure.notApplied(confirmed.state)
     }
@@ -678,7 +658,7 @@ public actor SessionCoordinator {
     }
 
     let confirmed = try await readListeningNow(features: reading.features)
-    latestReadings.listeningMode = confirmed
+    settle(.listeningMode) { $0.listeningMode = confirmed }
     guard confirmed.selection == target else {
       throw WriteFailure.notAppliedListening(confirmed.selection)
     }
@@ -744,7 +724,7 @@ public actor SessionCoordinator {
     guard isFinal else { return }
 
     let confirmed = try await readEqualizerParameterNow(reading)
-    latestReadings.equalizer = confirmed
+    settle(.equalizer) { $0.equalizer = confirmed }
     // A preset selection is judged on the preset; a band write on the bands. The
     // preset byte of a legacy band write is an addressing detail ("the current
     // preset"), so the bands are the requested value there.
@@ -776,7 +756,7 @@ public actor SessionCoordinator {
       )
     }
     let confirmed = try await readSpeakToChatNow(reading)
-    latestReadings.speakToChat = confirmed
+    settle(.speakToChat) { $0.speakToChat = confirmed }
     guard confirmed.isEnabled == isEnabled else {
       throw WriteFailure.notAppliedSpeakToChat(confirmed)
     }
@@ -797,7 +777,7 @@ public actor SessionCoordinator {
       )
     }
     let confirmed = try await readSpeakToChatNow(reading)
-    latestReadings.speakToChat = confirmed
+    settle(.speakToChat) { $0.speakToChat = confirmed }
     guard confirmed.sensitivity == sensitivity, confirmed.timeout == timeout else {
       throw WriteFailure.notAppliedSpeakToChat(confirmed)
     }
@@ -821,7 +801,7 @@ public actor SessionCoordinator {
       )
     }
     let confirmed = try await readSidetoneNow(reading)
-    latestReadings.sidetone = confirmed
+    settle(.sidetone) { $0.sidetone = confirmed }
     guard confirmed.isEnabled == isEnabled else {
       throw WriteFailure.notAppliedSidetone(confirmed)
     }
