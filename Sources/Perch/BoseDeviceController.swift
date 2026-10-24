@@ -29,6 +29,7 @@ final class BoseDeviceController: ObservableObject {
   }
 
   /// The closed-bar / header summary, or `nil` when no Bose device is the audio output.
+  /// `.ready` only while `panelModel` is live: every teardown clears it.
   @Published private(set) var readout: Readout?
   /// The live controls view-model, present exactly while a Bose device is connected.
   @Published private(set) var panelModel: BosePanelModel?
@@ -36,6 +37,7 @@ final class BoseDeviceController: ObservableObject {
   var isActive: Bool { panelModel != nil }
 
   private let audio: any AudioOutputObserving
+  private let devices: any BmapDeviceAccess
   private let openTimeout: Duration
   private let refreshInterval: Duration
   /// The connected model's config, resolved from the product id it announces over SDP at
@@ -72,10 +74,12 @@ final class BoseDeviceController: ObservableObject {
 
   init(
     audio: any AudioOutputObserving = AudioOutputObserver(),
+    devices: any BmapDeviceAccess = LiveBmapDeviceAccess(),
     openTimeout: Duration = .seconds(12),
     refreshInterval: Duration = .seconds(4)
   ) {
     self.audio = audio
+    self.devices = devices
     self.openTimeout = openTimeout
     self.refreshInterval = refreshInterval
   }
@@ -113,7 +117,9 @@ final class BoseDeviceController: ObservableObject {
 
   // MARK: - Loop
 
-  private func tick() async {
+  /// One pass of the loop. Internal rather than private so a test can step the loop
+  /// itself instead of racing its timer.
+  func tick() async {
     let target = currentBoseControlAddress()
 
     if target != activeAddress {
@@ -156,7 +162,7 @@ final class BoseDeviceController: ObservableObject {
       failedAddressesOutput = output
     }
 
-    let candidates = bmapDeviceAddresses()
+    let candidates = devices.candidateAddresses()
     var chosen = Self.correlate(
       output: output,
       candidates: candidates.filter { !failedAddresses.contains(Self.normalized($0)) }
@@ -226,7 +232,7 @@ final class BoseDeviceController: ObservableObject {
       // init, reports a one-byte battery, and has no block 31 — so the config is resolved
       // from the announced product id *before* the session starts. An id the catalog does
       // not know keeps the provisional Ultra 2 profile, which is what it is there for.
-      let (resolved, productId) = bmapDeviceConfig(forAddress: address)
+      let (resolved, productId) = devices.config(forAddress: address)
       config = resolved
       Self.log.notice(
         """
@@ -235,7 +241,7 @@ final class BoseDeviceController: ObservableObject {
         supported=\(productId.map(BoseCatalog.isSupported(productId:)) ?? false, privacy: .public)
         """
       )
-      let opened = try await BmapRFCOMMChannelOpener(openTimeout: openTimeout).open(address: address)
+      let opened = try await devices.open(address: address, timeout: openTimeout)
       let session = await BoseSession.start(opened: opened, config: config)
       try await session.connect()
       self.session = session
@@ -287,12 +293,21 @@ final class BoseDeviceController: ObservableObject {
     publishReadout(status: .ready)
   }
 
+  /// Closes the session and drops everything read from it — the readout included.
+  ///
+  /// The readout is what `AppModel.refresh` folds in as the panel's device whenever Sony
+  /// has none, so it must not outlive the session it describes. Left in place, the last
+  /// `.ready` (name, battery) kept a device on screen after it had left the audio output,
+  /// and with no panel model behind it the settings window drew Sony's controls under
+  /// Bose ownership. A caller that has something to say about the address it keeps —
+  /// that it is unreachable — publishes that afterwards.
   private func teardown(keepingAddress: Bool = false) async {
     if let session {
       await session.close()
     }
     session = nil
     panelModel = nil
+    readout = nil
     firmwareVersion = nil
     snapshot = BoseDeviceSnapshot()
     modeList = []
