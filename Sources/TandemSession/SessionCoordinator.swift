@@ -177,13 +177,14 @@ public actor SessionCoordinator {
   // MARK: - Events
 
   public func handle(_ event: SessionEvent) async {
-    let previous = state.phase
+    let previous = state
     let (next, effects) = policy.reduce(state, event)
+    SessionLog.transition(from: previous, to: next, on: event)
     state = next
     for effect in effects {
       await run(effect)
     }
-    reconcilePolling(from: previous)
+    reconcilePolling(from: previous.phase)
   }
 
   /// The suspended grace holds the channel but must not keep talking on it: the
@@ -304,6 +305,7 @@ public actor SessionCoordinator {
         // stays on the ordinary retry path.
         await self.handle(.controlContended(attempt))
       } catch {
+        SessionLog.openFailed(error)
         await self.handle(.channelFailed(attempt))
       }
     }
@@ -315,6 +317,7 @@ public actor SessionCoordinator {
     // verifying it; the phase alone cannot say so, because a stale completion leaves
     // the phase where it was — `verifying`, when the live attempt already landed.
     let (next, effects) = policy.reduce(state, .channelOpened(attempt))
+    SessionLog.transition(from: state, to: next, on: .channelOpened(attempt))
     guard effects.contains(.startVerification) else {
       state = next
       await opened.channel.close()
@@ -438,7 +441,9 @@ public actor SessionCoordinator {
         // parse is not, because asking again gets the same answer. The task inherits
         // the coordinator's isolation, so the epoch read is a plain same-actor call.
         guard self.epoch == admittedEpoch else { return }
-        switch VerificationFailureKind(error) {
+        let kind = VerificationFailureKind(error)
+        SessionLog.verificationFailed(error, kind: kind)
+        switch kind {
         case .transient: await self.handle(.verificationFailedTransient)
         case .deterministic: await self.handle(.verificationFailedPermanently)
         }
@@ -547,24 +552,6 @@ public actor SessionCoordinator {
   }
 
   // MARK: - Writing
-
-  public enum WriteFailure: Error, Equatable, Sendable {
-    case notPermitted
-    case unsupported
-    /// The device answered, but with something other than what was asked for. The
-    /// value in hand is what it actually holds.
-    case notApplied(TandemNoiseControlState)
-    case notAppliedListening(TandemListeningSelection)
-    /// The equaliser read-back did not hold the requested preset or bands. The values
-    /// carried are what the device actually holds.
-    case notAppliedEqualizer(selectedPreset: UInt8?, bandSteps: [Int])
-    /// The speak-to-chat read-back did not hold the requested values.
-    case notAppliedSpeakToChat(SpeakToChatReading)
-    /// The sidetone read-back did not hold the requested value. What is carried is
-    /// what the device actually holds.
-    case notAppliedSidetone(SidetoneReading)
-    case failed(SessionRequestFailure)
-  }
 
   /// Sends a noise-control change and reads it back.
   ///
@@ -964,6 +951,7 @@ public actor SessionCoordinator {
 
   private func writeStalled(in admittedEpoch: SessionEpoch) async {
     guard admittedEpoch == epoch else { return }
+    SessionLog.writeStalled()
     await handle(.sessionFault(.writeStalled))
   }
 
@@ -1061,7 +1049,8 @@ public actor SessionCoordinator {
         epoch: admittedEpoch,
         matches: matching,
         continuation: continuation,
-        faultsOnTimeout: faultsOnTimeout
+        faultsOnTimeout: faultsOnTimeout,
+        label: SessionLog.label(ofRequest: frame.payload)
       )
       // Armed before the write, not after it: a write held by flow control never
       // returns, and a deadline that waits for it left the request — and every one
@@ -1101,7 +1090,9 @@ public actor SessionCoordinator {
     // expects some functions to go unanswered and must not tear down a working
     // session to discover that. Only the session the request was sent on is at
     // fault; a request that outlived its session must not fault the next one.
-    guard request.faultsOnTimeout, request.epoch == epoch else { return }
+    let faultsSession = request.faultsOnTimeout && request.epoch == epoch
+    SessionLog.unanswered(request.label, faultsSession: faultsSession)
+    guard faultsSession else { return }
     await handle(.sessionFault(.responseTimedOut))
   }
 
@@ -1120,6 +1111,8 @@ public actor SessionCoordinator {
     /// False for a probe, whose timeout fails only itself; true for a request, whose
     /// timeout rebuilds the session.
     let faultsOnTimeout: Bool
+    /// Command and inquiry, for the log when the request goes unanswered.
+    let label: String
 
     func matches(_ frame: TandemFrame) -> Bool { matches(frame) }
   }
