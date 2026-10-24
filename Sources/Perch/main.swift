@@ -81,7 +81,7 @@ final class AppModel: ObservableObject {
     deviceWrites.enqueue { [weak self] in
       let session = await service.session
       try? await session.apply(listeningSelection: target)
-      await self?.refresh(from: service)
+      await self?.refresh(from: service, cause: .deviceWrite)
       self?.listeningAdjustment.end(token)
     }
   }
@@ -92,7 +92,7 @@ final class AppModel: ObservableObject {
     deviceWrites.enqueue { [weak self] in
       let session = await service.session
       try? await session.apply(noiseControl: target)
-      await self?.refresh(from: service)
+      await self?.refresh(from: service, cause: .deviceWrite)
     }
   }
 
@@ -142,7 +142,7 @@ final class AppModel: ObservableObject {
       let session = await service.session
       try? await session.apply(noiseControl: target, isFinal: isFinal)
       guard isFinal else { return }
-      await self.refresh(from: service)
+      await self.refresh(from: service, cause: .deviceWrite)
       self.levelAdjustment.end(token)
     }
   }
@@ -168,7 +168,7 @@ final class AppModel: ObservableObject {
     deviceWrites.enqueue { [weak self] in
       let session = await service.session
       try? await session.apply(equalizerPreset: identifier, bandSteps: bandSteps)
-      await self?.refresh(from: service)
+      await self?.refresh(from: service, cause: .deviceWrite)
       self?.equalizerAdjustment.end(token)
     }
   }
@@ -202,7 +202,7 @@ final class AppModel: ObservableObject {
       let session = await service.session
       try? await session.apply(equalizerPreset: preset, bandSteps: bands, isFinal: isFinal)
       guard isFinal else { return }
-      await self.refresh(from: service)
+      await self.refresh(from: service, cause: .deviceWrite)
       self.equalizerAdjustment.end(token)
     }
   }
@@ -237,12 +237,16 @@ final class AppModel: ObservableObject {
   private var hadContent = false
   private var arrivalAnnounceUntil: ContinuousClock.Instant?
 
-  /// Pulls what the session knows into the shape the panel draws.
-  func refresh(from service: SessionService) async {
+  /// Pulls what the session knows into the shape the panel draws. Only the periodic
+  /// refresh asks the players; a write's read-back passes `.deviceWrite` and keeps the
+  /// track shown — see `PanelRefreshCause`.
+  func refresh(from service: SessionService, cause: PanelRefreshCause) async {
     // Asked first: the Apple Events answer can take up to its deadline, and the
     // guarded panel fields below must be read and published without that wait
     // sitting between them.
-    let nowPlaying = playerQueriesAllowed ? await nowPlayingService.read() : nil
+    let nowPlaying = await cause.nowPlaying(queriesAllowed: playerQueriesAllowed) {
+      await nowPlayingService.read()
+    }
     let session = await service.session
     // One consistent hop: read piecemeal, an invalidation could land mid-read and show
     // a ready phase with no model name for a frame — which device-scoped rules read as
@@ -271,14 +275,7 @@ final class AppModel: ObservableObject {
     // it mid-gesture.
     next.noiseControl = levelAdjustment.isHolding() ? panel.noiseControl : readings.noiseControl
     next.battery = Self.batteryLayout(for: fingerprint, readings: readings)
-    next.nowPlaying = nowPlaying.map {
-      PanelModel.NowPlaying(
-        title: $0.title,
-        artist: $0.artist,
-        isPlaying: $0.isPlaying,
-        artworkURL: $0.artworkURL
-      )
-    }
+    next.nowPlaying = nowPlaying.resolved(current: panel.nowPlaying)
     // A device that went away takes the editor preview with it: there is nothing left
     // to put back, and stale values must not land on the next device.
     if !next.summary.isControllable {
@@ -387,7 +384,7 @@ final class AppModel: ObservableObject {
     deviceWrites.enqueue { [weak self] in
       let session = await service.session
       try? await session.apply(speakToChatEnabled: enabled)
-      await self?.refresh(from: service)
+      await self?.refresh(from: service, cause: .deviceWrite)
       self?.speakToChatAdjustment.end(token)
     }
   }
@@ -403,7 +400,7 @@ final class AppModel: ObservableObject {
     deviceWrites.enqueue { [weak self] in
       let session = await service.session
       try? await session.apply(speakToChatSensitivity: sensitivity, timeout: timeout)
-      await self?.refresh(from: service)
+      await self?.refresh(from: service, cause: .deviceWrite)
       self?.speakToChatAdjustment.end(token)
     }
   }
@@ -442,7 +439,7 @@ final class AppModel: ObservableObject {
     deviceWrites.enqueue { [weak self] in
       let session = await service.session
       try? await session.apply(sidetoneEnabled: enabled)
-      await self?.refresh(from: service)
+      await self?.refresh(from: service, cause: .deviceWrite)
       self?.sidetoneAdjustment.end(token)
     }
   }
@@ -929,7 +926,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     Task {
       await service.start()
       while !Task.isCancelled {
-        await model.refresh(from: service)
+        await model.refresh(from: service, cause: .periodic)
         try? await Task.sleep(for: .milliseconds(500))
       }
     }
