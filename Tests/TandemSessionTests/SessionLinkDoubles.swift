@@ -78,15 +78,25 @@ final class LinkOpener: TandemChannelOpening, @unchecked Sendable {
   private let lock = NSLock()
   private let script: [[UInt8]: [UInt8]]
   private var opened: [LinkDouble] = []
+  private var remainingTimeouts: Int
 
-  init(script: [[UInt8]: [UInt8]] = [:]) {
+  /// `timingOutFirst` opens fail the way an open against a contended device does:
+  /// the open hangs until the transport's deadline.
+  init(script: [[UInt8]: [UInt8]] = [:], timingOutFirst timeouts: Int = 0) {
     self.script = script
+    remainingTimeouts = timeouts
   }
 
   var links: [LinkDouble] { lock.withLock { opened } }
   var latest: LinkDouble? { links.last }
 
   func open(_ device: DeviceIdentity) async throws -> OpenedChannel {
+    let timesOut = lock.withLock { () -> Bool in
+      guard remainingTimeouts > 0 else { return false }
+      remainingTimeouts -= 1
+      return true
+    }
+    guard !timesOut else { throw ChannelFailure.openTimedOut }
     let (stream, continuation) = AsyncStream<Data>.makeStream()
     let link = LinkDouble(inbound: continuation, script: script)
     lock.withLock { opened.append(link) }

@@ -4,6 +4,32 @@ import Testing
 
 @testable import TandemSession
 
+// MARK: - Contention
+
+@Test func aContendedSessionComesBackOnItsOwnOnceTheChannelIsFree() async throws {
+  // The first open hangs to its deadline the way it does while another host holds the
+  // control channel. Contention used to wait for the user; it now tries again slowly
+  // and connects as soon as the channel is free.
+  let opener = LinkOpener(timingOutFirst: 1)
+  let coordinator = SessionCoordinator(
+    opener: opener,
+    verifier: FixedOutcomeVerifier(outcome: try verifiedOutcome(declaring: [])),
+    timeouts: SessionCoordinator.Timeouts(
+      response: .seconds(60),
+      backoffUnit: .seconds(60),
+      contentionRetry: .milliseconds(100)
+    )
+  )
+
+  await coordinator.handle(.defaultOutputChanged(linkTarget))
+  #expect(await waitFor { await coordinator.phase == .contended })
+  #expect(
+    await waitFor(within: .seconds(3)) { await coordinator.phase == .ready },
+    "contention never retried on its own"
+  )
+  await coordinator.handle(.manualRelease)
+}
+
 // MARK: - The failure budget across reconnects
 
 @Test func aSessionThatFaultsOnItsFirstPollStopsReconnecting() async throws {

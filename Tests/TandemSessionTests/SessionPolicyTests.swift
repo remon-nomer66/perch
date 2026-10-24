@@ -379,15 +379,55 @@ private let policy = SessionPolicy(maximumFailureCount: 3)
 
 // MARK: - Contention
 
-@Test func contentionDoesNotReconnectOnItsOwn() {
-  let (contended, _) = policy.reduce(
+@Test func anOutputNotificationDoesNotReconnectAContendedSession() {
+  // Only the slow-cadence timer and the user move contention along; the same device
+  // being announced as the output again is not news.
+  let (contended, effects) = policy.reduce(
     state(.ready), .controlContended(ConnectionAttempt(0))
   )
   #expect(contended.phase == .contended)
+  #expect(effects.contains(.scheduleContentionRetry))
 
-  let (unchanged, effects) = policy.reduce(contended, .defaultOutputChanged(deviceA))
+  let (unchanged, outputEffects) = policy.reduce(contended, .defaultOutputChanged(deviceA))
   #expect(unchanged.phase == .contended)
-  #expect(effects.isEmpty)
+  #expect(outputEffects.isEmpty)
+}
+
+@Test func contentionRetriesOnASlowCadence() {
+  // An open timeout is read as contention, but nothing proves it: the async open has
+  // been seen never calling back at all. Waiting for the user alone left a session
+  // that was merely unlucky stuck until someone pressed retry, so contention tries
+  // again on its own, slowly — each try can hang for the full open timeout.
+  let (retrying, effects) = policy.reduce(state(.contended), .backoffExpired)
+  #expect(retrying.phase == .connecting)
+  #expect(retrying.failureCount == 0)
+  #expect(effects.contains(.openChannel(deviceA, retrying.attempt)))
+
+  // Timing out again goes straight back with the next tick armed.
+  let (again, againEffects) = policy.reduce(retrying, .controlContended(retrying.attempt))
+  #expect(again.phase == .contended)
+  #expect(againEffects == [.cancelOpen, .scheduleContentionRetry])
+}
+
+@Test func aContentionTickWhileTheDeviceIsNotTheOutputRearms() {
+  // Seizing the session for a device nobody is listening to would take control
+  // away from the host that is; the tick waits for the next one instead.
+  let (still, effects) = policy.reduce(
+    state(.contended, isDefaultOutput: false),
+    .backoffExpired
+  )
+  #expect(still.phase == .contended)
+  #expect(effects == [.scheduleContentionRetry])
+}
+
+@Test func leavingContentionCancelsItsTimer() {
+  let (released, releaseEffects) = policy.reduce(state(.contended), .defaultOutputChanged(nil))
+  #expect(released.phase == .released)
+  #expect(releaseEffects.contains(.cancelBackoff), "the released phase inherited a live retry timer")
+
+  let (switched, switchEffects) = policy.reduce(state(.contended), .defaultOutputChanged(deviceB))
+  #expect(switched.target == deviceB)
+  #expect(switchEffects.contains(.cancelBackoff))
 }
 
 @Test func anOpenTimeoutAgainstAReachableOutputDeviceIsReadAsContention() {
@@ -401,7 +441,7 @@ private let policy = SessionPolicy(maximumFailureCount: 3)
     connecting, .controlContended(ConnectionAttempt(4))
   )
   #expect(contended.phase == .contended)
-  #expect(effects == [.cancelOpen])
+  #expect(effects == [.cancelOpen, .scheduleContentionRetry])
 
   // The reconnect button lives: a manual retry from here opens a fresh channel.
   let (retrying, retryEffects) = policy.reduce(contended, .manualRetry)
@@ -479,14 +519,14 @@ private let policy = SessionPolicy(maximumFailureCount: 3)
       !effects.contains { if case .openChannel = $0 { return true } else { return false } },
       "sleep let \(label) reconnect"
     )
+    // Both refusals re-arm their slow-cadence timers on waking: sleep cancelled them
+    // with the rest of the teardown, and nothing else ever advances either.
     if phase == .retryExhausted {
-      // Exhaustion re-arms its slow-cadence timer on waking; nothing else ever
-      // advances it. The other refusals wait for the user or for contention to end.
       #expect(
         effects.contains { if case .scheduleBackoff = $0 { return true } else { return false } }
       )
     } else {
-      #expect(effects.isEmpty)
+      #expect(effects == [.scheduleContentionRetry])
     }
   }
 }

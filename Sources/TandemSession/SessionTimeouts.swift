@@ -9,6 +9,10 @@ extension SessionCoordinator {
     /// milliseconds; one held this long means the remote has stopped granting flow
     /// control, and waiting on it would stall every write queued behind it.
     public var write: Duration
+    /// How long `contended` waits before trying the channel again. Slow on purpose:
+    /// while another host really holds the channel, every try hangs for the whole
+    /// open timeout.
+    public var contentionRetry: Duration
     /// Overrides the dialect-derived readings poll interval. Internal and test-only:
     /// production always derives the cadence from the dialect, so nothing here can
     /// bake in a model-specific value.
@@ -24,12 +28,14 @@ extension SessionCoordinator {
       // wearing change is back about a second later, which should feel immediate.
       // Doubling still spaces persistent failures out to sixteen seconds.
       backoffUnit: Duration = .milliseconds(500),
-      write: Duration = .seconds(5)
+      write: Duration = .seconds(5),
+      contentionRetry: Duration = .seconds(30)
     ) {
       self.response = response
       self.grace = grace
       self.backoffUnit = backoffUnit
       self.write = write
+      self.contentionRetry = contentionRetry
     }
   }
 }

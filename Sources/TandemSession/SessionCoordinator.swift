@@ -239,17 +239,23 @@ public actor SessionCoordinator {
       graceTask = nil
 
     case .scheduleBackoff(let attempt):
-      backoffTask?.cancel()
-      let delay = timeouts.backoffUnit * Double(1 << min(attempt - 1, 5))
-      backoffTask = Task {
-        try? await Task.sleep(for: delay)
-        guard !Task.isCancelled else { return }
-        await self.handle(.backoffExpired)
-      }
+      armBackoff(after: timeouts.backoffUnit * Double(1 << min(attempt - 1, 5)))
+
+    case .scheduleContentionRetry:
+      armBackoff(after: timeouts.contentionRetry)
 
     case .cancelBackoff:
       backoffTask?.cancel()
       backoffTask = nil
+    }
+  }
+
+  private func armBackoff(after delay: Duration) {
+    backoffTask?.cancel()
+    backoffTask = Task {
+      try? await Task.sleep(for: delay)
+      guard !Task.isCancelled else { return }
+      await self.handle(.backoffExpired)
     }
   }
 

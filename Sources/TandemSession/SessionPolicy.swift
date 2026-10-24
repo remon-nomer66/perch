@@ -69,6 +69,9 @@ public enum SessionEffect: Equatable, Sendable {
   case startGrace
   case cancelGrace
   case scheduleBackoff(attempt: Int)
+  /// Arms the slow timer contention retries on. It shares the backoff's slot, so
+  /// `cancelBackoff` cancels it and it fires as `backoffExpired`.
+  case scheduleContentionRetry
   case cancelBackoff
 }
 
@@ -94,6 +97,9 @@ public struct SessionState: Equatable, Sendable {
     case connecting
     case verifying
     case ready
+    /// Another host most likely holds the control channel. Nothing proves it — an
+    /// open that never calls back looks the same — so besides waiting for the user,
+    /// the channel is tried again on a slow timer while the device is the output.
     case contended
     /// The device stopped being the default output. The channel is held for a grace
     /// period so a brief switch away does not cost a reconnect, but nothing may talk
@@ -300,12 +306,15 @@ public struct SessionPolicy: Sendable {
         case .contended: .contended
         }
       // The output is unknown until the audio system reports one, so the refusal
-      // comes back without permission to reconnect. Exhaustion alone re-arms its
-      // slow-cadence timer, because nothing else ever advances it.
+      // comes back without permission to reconnect. Each refusal re-arms its
+      // slow-cadence timer, because nothing else ever advances it; a tick that finds
+      // the device still not the output simply re-arms.
       let effects: [SessionEffect] =
-        blocked == .retryExhausted
-        ? [.scheduleBackoff(attempt: max(state.failureCount, 1))]
-        : []
+        switch blocked {
+        case .retryExhausted: [.scheduleBackoff(attempt: max(state.failureCount, 1))]
+        case .contended: [.scheduleContentionRetry]
+        case .unverified: []
+        }
       return (state.moved(to: restored, isTargetDefaultOutput: device != nil), effects)
     }
 
@@ -410,15 +419,30 @@ public struct SessionPolicy: Sendable {
       // control channel (docs/rfcomm-transport-notes.md §7), so that combination is
       // read as contention rather than burned as retry budget: the retry path would
       // hang for the full timeout on every attempt, while `contended` says what is
-      // actually happening and waits for the user or for the output to move.
+      // actually happening. A hang is not proof, though — the async open has been
+      // seen never calling back at all — so contention retries on its own slow
+      // timer as well as waiting for the user or for the output to move.
       // A connecting state whose device stopped being the output has released
       // already, so the guard is only for states constructed by hand.
       guard state.isTargetDefaultOutput else { return failed(state) }
-      return (state.moved(to: .contended), [.cancelOpen])
+      return (state.moved(to: .contended), [.cancelOpen, .scheduleContentionRetry])
 
     case (.ready, .controlContended), (.verifying, .controlContended),
       (.recovering, .controlContended), (.unverified, .controlContended):
-      return (state.moved(to: .contended), [.closeChannel, .invalidateSession])
+      return (
+        state.moved(to: .contended),
+        [.closeChannel, .invalidateSession, .scheduleContentionRetry]
+      )
+
+    case (.contended, .backoffExpired):
+      // A fresh budget, like a manual retry: contention is not a failure, and an open
+      // that times out again comes straight back here with the next tick armed.
+      // Seizing the session for a device nobody is listening to would take control
+      // away from the host that is, so a tick without the output only re-arms.
+      guard let target = state.target, state.isTargetDefaultOutput else {
+        return (state, [.scheduleContentionRetry])
+      }
+      return start(connectingTo: target, from: state)
 
     case (.ready, .channelClosedUnexpectedly), (.verifying, .channelClosedUnexpectedly),
       (.recovering, .channelClosedUnexpectedly), (.unverified, .channelClosedUnexpectedly):
@@ -522,10 +546,10 @@ public struct SessionPolicy: Sendable {
   /// Releases whatever the phase currently owns, and nothing else.
   private func teardown(from state: SessionState) -> [SessionEffect] {
     switch state.phase {
-    case .released, .sleeping, .contended:
+    case .released, .sleeping:
       return []
-    case .retryExhausted:
-      // Exhaustion owns its slow-cadence retry timer.
+    case .retryExhausted, .contended:
+      // Both refusals own a slow-cadence retry timer.
       return [.cancelBackoff]
     case .connecting:
       return [.cancelOpen, .closeChannel]
