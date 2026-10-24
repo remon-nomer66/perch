@@ -278,11 +278,16 @@ func stalledTapThatStaysSilentIsRevoked() async {
 }
 
 @MainActor
-@Test("作り直したタップが許可ありと答えるなら、相手が黙っているだけ: オンのまま、作り直しは1回きり")
+@Test("実音を聞いた後で、作り直したタップが許可ありと答えるなら、相手が黙っているだけ: オンのまま")
 func silentSourceWithAVouchedTapStaysOn() async {
-  let harness = Harness(permissions: [[.granted]])
+  let harness = Harness(permissions: [[.granted]], flowing: true)
   harness.controller.setEnabled(true)
   await harness.settle()
+  let first = harness.engines.built[0]
+  await harness.drain { first.reads >= 3 }
+  // 音が止まり、相手は黙ったまま出力を開いている。
+  first.flowing = false
+  harness.engines.flowing = false
   harness.engines.othersPlaying = true
   await harness.drain { harness.engines.built.count == 2 }
   let rebuilt = harness.engines.built[1]
@@ -291,6 +296,21 @@ func silentSourceWithAVouchedTapStaysOn() async {
   #expect(harness.controller.isEnabled)
   #expect(harness.engines.built.count == 2)
   #expect(!rebuilt.stopped)
+}
+
+@MainActor
+@Test("実音を一度も聞いていなければ、許可ありの答えだけでは居座らない: 作り直して取り消す")
+func unprovenGrantDoesNotKeepTheMacSilent() async {
+  let harness = Harness(permissions: [[.granted]])
+  harness.controller.setEnabled(true)
+  await harness.settle()
+  #expect(harness.controller.isEnabled)
+  harness.engines.othersPlaying = true
+  await harness.drain { !harness.controller.isEnabled }
+
+  #expect(harness.controller.revocation == .captureLost)
+  #expect(harness.engines.built.count == 2)
+  #expect(harness.engines.allStopped)
 }
 
 @MainActor

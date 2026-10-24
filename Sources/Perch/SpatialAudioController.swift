@@ -339,8 +339,8 @@ extension CaptureSupervisor.Revocation {
       )
     case .captureLost:
       L(
-        "再生中の音声を取り込めなくなったため、空間オーディオをオフにしました。続く場合は、システムオーディオ録音の許可を確認してください。",
-        "Spatial Audio turned off because the playing audio could no longer be captured. If this keeps happening, check the system audio recording permission."
+        "再生中の音声を取り込めなかったため、空間オーディオをオフにしました。続く場合は、システムオーディオ録音の許可を確認してください。",
+        "Spatial Audio turned off because the playing audio could not be captured. If this keeps happening, check the system audio recording permission."
       )
     }
   }

@@ -14,10 +14,28 @@ import Testing
 //    （許可が無いとは決めつけない）
 //  - 原音はミュートされているので、許可ありと確認できない限り無音のまま居座らない
 //  - オンの間、何も再生していない無音は正常。他が再生中なのに黙ったタップは1回作り直し、
-//    それでも黙っていれば取り消して理由を出す。ただし作り直したタップが許可ありと答える
-//    なら、その無音は相手の音（黙ったまま出力を開いているアプリ）なのでオンのまま
+//    それでも黙っていれば取り消して理由を出す。ただし、オンにしてから実際の音を一度でも
+//    聞いていて、作り直したタップが許可ありと答えるなら、その無音は相手の音（黙ったまま
+//    出力を開いているアプリ）なのでオンのまま
+//  - 不変条件: 実際の音で裏付けられていない「許可あり」だけでは、他が再生中の無音に
+//    居座らない（許可ありの答えそのものが誤っている環境でも、Mac の音を必ず戻す）
 
 private typealias Decision = CaptureSupervisor.Decision
+
+/// 1回の観測を supervisor に見せる。表の行もそれ以外のテストも、ここを通して流す。
+private func look(
+  _ supervisor: inout CaptureSupervisor,
+  signal: Bool,
+  othersPlaying: () -> Bool? = { false },
+  permission: () -> SystemAudioPermission
+) -> Decision {
+  supervisor.observe(
+    hasSignal: signal,
+    after: supervisor.pollInterval,
+    othersPlaying: othersPlaying,
+    permission: permission
+  )
+}
 
 /// 1回の観測で supervisor に見せるもの。
 private struct Look: Sendable {
@@ -35,6 +53,10 @@ private struct Scenario: Sendable, CustomTestStringConvertible {
   let looks: [Look]
   let decisions: [Decision]
   var testDescription: String { name }
+}
+
+private func holds(_ count: Int) -> [Decision] {
+  Array(repeating: .hold, count: count)
 }
 
 /// 期限（15回目）の直前まで待ち、期限で `last` が下る判断の列。
@@ -94,6 +116,17 @@ private let scenarios: [Scenario] = [
     decisions: [.hold, .commit]
   ),
   Scenario(
+    name: "期限ちょうど（15回目）に許可ありが来れば、期限より許可ありが勝つ（作り直してから）",
+    looks: Array(repeating: .silentDenied, count: 14) + [.silentGranted, .silentGranted],
+    decisions: holds(14) + [.rebuild, .commit]
+  ),
+  Scenario(
+    name: "作り直した後の期限ちょうど（15回目）の許可ありは、そのままオン",
+    looks: [.silentDenied, .silentGranted] + Array(repeating: .silentDenied, count: 14)
+      + [.silentGranted],
+    decisions: [.hold, .rebuild] + holds(14) + [.commit]
+  ),
+  Scenario(
     name: "一度でも許可なしと言われ、期限で判定できないなら、理由は許可なし",
     looks: [.silentDenied] + Array(repeating: .silentUnknown, count: 14),
     decisions: holdsUntilDeadline(then: .revoke(.permissionDenied))
@@ -103,13 +136,8 @@ private let scenarios: [Scenario] = [
 @Test("オンにするまでの判断", arguments: scenarios)
 private func confirmingDecisions(scenario: Scenario) {
   var supervisor = CaptureSupervisor()
-  let decisions = scenario.looks.map { look in
-    supervisor.observe(
-      hasSignal: look.signal,
-      after: supervisor.pollInterval,
-      othersPlaying: { false },
-      permission: { look.permission }
-    )
+  let decisions = scenario.looks.map { row in
+    look(&supervisor, signal: row.signal, permission: { row.permission })
   }
   #expect(decisions == scenario.decisions)
 }
@@ -118,15 +146,10 @@ private func confirmingDecisions(scenario: Scenario) {
 func signalNeedsNoPermissionProbe() {
   var supervisor = CaptureSupervisor()
   var probes = 0
-  let decision = supervisor.observe(
-    hasSignal: true,
-    after: supervisor.pollInterval,
-    othersPlaying: { false },
-    permission: {
-      probes += 1
-      return .granted
-    }
-  )
+  let decision = look(&supervisor, signal: true) {
+    probes += 1
+    return .granted
+  }
   #expect(decision == .commit)
   #expect(probes == 0)
 }
@@ -136,10 +159,7 @@ func commitMovesToRunning() {
   var supervisor = CaptureSupervisor()
   #expect(!supervisor.isRunning)
   #expect(supervisor.pollInterval == supervisor.timing.confirmInterval)
-  _ = supervisor.observe(
-    hasSignal: false, after: supervisor.pollInterval,
-    othersPlaying: { false }, permission: { .granted }
-  )
+  _ = look(&supervisor, signal: false) { .granted }
   #expect(supervisor.isRunning)
   #expect(supervisor.pollInterval == supervisor.timing.watchInterval)
 }
@@ -171,10 +191,6 @@ private struct WatchScenario: Sendable, CustomTestStringConvertible {
 /// 他が再生中の無音が期限（5回目）に達するまでの観測。
 private func stall(_ count: Int = 5, _ look: WatchLook = .stalled) -> [WatchLook] {
   Array(repeating: look, count: count)
-}
-
-private func holds(_ count: Int) -> [Decision] {
-  Array(repeating: .hold, count: count)
 }
 
 private let watchScenarios: [WatchScenario] = [
@@ -209,24 +225,47 @@ private let watchScenarios: [WatchScenario] = [
     decisions: holds(4) + [.rebuild] + holds(4) + [.revoke(.captureLost)]
   ),
   WatchScenario(
-    name: "作り直したタップが許可ありと答えるなら、無音は相手の音: オンのまま、作り直しもしない",
-    looks: stall() + stall() + stall(15),
-    decisions: holds(4) + [.rebuild] + holds(5) + holds(15)
+    name: "実音を聞いた後で、作り直したタップが許可ありと答えるなら、無音は相手の音: オンのまま",
+    looks: [.flowing] + stall() + stall() + stall(15),
+    decisions: [.hold] + holds(4) + [.rebuild] + holds(5) + holds(15)
+  ),
+  WatchScenario(
+    name: "実音を一度も聞いていなければ、作り直したタップが許可ありと答えても取り消す",
+    looks: stall() + stall(),
+    decisions: holds(4) + [.rebuild] + holds(4) + [.revoke(.captureLost)]
+  ),
+  WatchScenario(
+    name: "作り直したタップの答えが揺れても、期限で効くのはその時の答え: 判定できなければ取り消す",
+    looks: [.flowing] + stall()
+      + [.stalled, .stalledUnknown, .stalled, .stalled, .stalledUnknown],
+    decisions: [.hold] + holds(4) + [.rebuild] + holds(4) + [.revoke(.captureLost)]
+  ),
+  WatchScenario(
+    name: "作り直したタップの答えが揺れても、期限で許可ありなら（実音を聞いた後は）オンのまま",
+    looks: [.flowing] + stall()
+      + [.stalledUnknown, .stalled, .stalledUnknown, .stalledUnknown, .stalled] + stall(5),
+    decisions: [.hold] + holds(4) + [.rebuild] + holds(5) + holds(5)
+  ),
+  WatchScenario(
+    name: "作り直したタップの答えに許可なしが混じれば、その場で取り消す",
+    looks: [.flowing] + stall() + [.stalled, .stalledUnknown, .stalledDenied],
+    decisions: [.hold] + holds(4) + [.rebuild, .hold, .hold, .revoke(.permissionDenied)]
   ),
   WatchScenario(
     name: "相手が黙って出力を開いている間も、ときどき許可を問い直し、取り消されていれば取り消す",
-    looks: stall() + stall() + stall(4) + [.stalledDenied],
-    decisions: holds(4) + [.rebuild] + holds(5) + holds(4) + [.revoke(.permissionDenied)]
+    looks: [.flowing] + stall() + stall() + stall(4) + [.stalledDenied],
+    decisions: [.hold] + holds(4) + [.rebuild] + holds(5) + holds(4)
+      + [.revoke(.permissionDenied)]
   ),
   WatchScenario(
     name: "問い直しで判定できなくなれば、無音のまま居座らずに取り消す",
-    looks: stall() + stall() + stall(4) + [.stalledUnknown],
-    decisions: holds(4) + [.rebuild] + holds(5) + holds(4) + [.revoke(.captureLost)]
+    looks: [.flowing] + stall() + stall() + stall(4) + [.stalledUnknown],
+    decisions: [.hold] + holds(4) + [.rebuild] + holds(5) + holds(4) + [.revoke(.captureLost)]
   ),
   WatchScenario(
     name: "相手が鳴らし止めれば、次に黙ったときは改めて1回作り直せる",
-    looks: stall() + stall() + [.quiet] + stall(),
-    decisions: holds(4) + [.rebuild] + holds(5) + [.hold] + holds(4) + [.rebuild]
+    looks: [.flowing] + stall() + stall() + [.quiet] + stall(),
+    decisions: [.hold] + holds(4) + [.rebuild] + holds(5) + [.hold] + holds(4) + [.rebuild]
   ),
   WatchScenario(
     name: "作り直した後に許可なしと分かれば、期限を待たずに許可なしで取り消す",
@@ -245,13 +284,10 @@ private let watchScenarios: [WatchScenario] = [
   ),
 ]
 
-/// 許可ありで（無音のまま）オンにした直後の supervisor。
+/// 許可ありで（無音のまま、つまり実音の裏付けなしに）オンにした直後の supervisor。
 private func runningSupervisor() -> CaptureSupervisor {
   var supervisor = CaptureSupervisor()
-  let decision = supervisor.observe(
-    hasSignal: false, after: supervisor.pollInterval,
-    othersPlaying: { false }, permission: { .granted }
-  )
+  let decision = look(&supervisor, signal: false) { .granted }
   precondition(decision == .commit)
   return supervisor
 }
@@ -259,15 +295,42 @@ private func runningSupervisor() -> CaptureSupervisor {
 @Test("オンの間の判断", arguments: watchScenarios)
 private func watchDecisions(scenario: WatchScenario) {
   var supervisor = runningSupervisor()
-  let decisions = scenario.looks.map { look in
-    supervisor.observe(
-      hasSignal: look.signal,
-      after: supervisor.pollInterval,
-      othersPlaying: { look.othersPlaying },
-      permission: { look.permission }
+  let decisions = scenario.looks.map { row in
+    look(
+      &supervisor, signal: row.signal,
+      othersPlaying: { row.othersPlaying }, permission: { row.permission }
     )
   }
   #expect(decisions == scenario.decisions)
+}
+
+@Test(
+  "不変条件: 実音で裏付けのない許可ありでは居座らない。他が再生中の無音は、答えがどうであれ10回以内に取り消す",
+  arguments: [
+    [SystemAudioPermission.granted],
+    [.unknown],
+    [.granted, .unknown],
+    [.unknown, .granted],
+  ]
+)
+func unprovenGrantNeverHoldsASilentMac(answers: [SystemAudioPermission]) {
+  var supervisor = runningSupervisor()
+  var asked = 0
+  var revokedAt: Int?
+  var reason: CaptureSupervisor.Revocation?
+  for index in 0..<60 {
+    let decision = look(&supervisor, signal: false, othersPlaying: { true }) {
+      defer { asked += 1 }
+      return answers[asked % answers.count]
+    }
+    if case .revoke(let why) = decision {
+      revokedAt = index
+      reason = why
+      break
+    }
+  }
+  #expect(reason == .captureLost)
+  #expect((revokedAt ?? .max) < 10)
 }
 
 @Test("見張りは、作り直すまでタップに許可を問い合わせない（音の流れているタップを揺らさない）")
@@ -279,39 +342,32 @@ func watchProbesOnlyAfterRebuilding() {
     return .granted
   }
   for _ in 0..<4 {
-    _ = supervisor.observe(
-      hasSignal: false, after: supervisor.pollInterval, othersPlaying: { true }, permission: probe
-    )
+    _ = look(&supervisor, signal: false, othersPlaying: { true }, permission: probe)
   }
   #expect(probes == 0)
-  let decision = supervisor.observe(
-    hasSignal: false, after: supervisor.pollInterval, othersPlaying: { true }, permission: probe
-  )
+  let decision = look(&supervisor, signal: false, othersPlaying: { true }, permission: probe)
   #expect(decision == .rebuild)
   #expect(probes == 0)
-  _ = supervisor.observe(
-    hasSignal: false, after: supervisor.pollInterval, othersPlaying: { true }, permission: probe
-  )
+  _ = look(&supervisor, signal: false, othersPlaying: { true }, permission: probe)
   #expect(probes == 1)
 }
 
 @Test("許可ありと確かめた後の問い直しは、期限ごとに1回だけ（タップを揺らし続けない）")
 func vouchedTapIsAskedOncePerTimeout() {
   var supervisor = runningSupervisor()
+  _ = look(&supervisor, signal: true) { .granted }  // 実音を聞いた後
   var probes = 0
   let probe = { () -> SystemAudioPermission in
     probes += 1
     return .granted
   }
-  func look() -> Decision {
-    supervisor.observe(
-      hasSignal: false, after: supervisor.pollInterval, othersPlaying: { true }, permission: probe
-    )
+  func stalledLook() -> Decision {
+    look(&supervisor, signal: false, othersPlaying: { true }, permission: probe)
   }
-  for _ in 0..<5 { _ = look() }  // 期限 → 作り直し（問い合わせない）
-  for _ in 0..<5 { _ = look() }  // 作り直したタップには毎回問い合わせる
+  for _ in 0..<5 { _ = stalledLook() }  // 期限 → 作り直し（問い合わせない）
+  for _ in 0..<5 { _ = stalledLook() }  // 作り直したタップには毎回問い合わせる
   #expect(probes == 5)
-  for _ in 0..<10 { #expect(look() == .hold) }  // 以後は期限ごとに1回
+  for _ in 0..<10 { #expect(stalledLook() == .hold) }  // 以後は期限ごとに1回
   #expect(probes == 7)
 }
 
@@ -319,9 +375,8 @@ func vouchedTapIsAskedOncePerTimeout() {
 func flowingAudioNeedsNoProcessScan() {
   var supervisor = runningSupervisor()
   var scans = 0
-  _ = supervisor.observe(
-    hasSignal: true,
-    after: supervisor.pollInterval,
+  _ = look(
+    &supervisor, signal: true,
     othersPlaying: {
       scans += 1
       return true

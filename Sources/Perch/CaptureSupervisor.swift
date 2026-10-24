@@ -19,7 +19,10 @@ import SpatialAudioKit
 /// refusal, or no answer, gives up and says why. A fresh tap that is allowed to record
 /// and still hears silence means the silence is the other app's own — browsers keep
 /// WebAudio output running while quiet, calls sit silent between speakers — so spatial
-/// audio stays on, asking the tap again once per timeout in case the grant goes.
+/// audio stays on, asking the tap again once per timeout in case the grant goes. But
+/// only once real audio has been heard since turning on: the tap's "allowed" is itself
+/// an unproven answer, so on its own it never keeps a silent Mac — wrong answers, or a
+/// tap that is allowed but cannot capture, still give the sound back.
 struct CaptureSupervisor: Equatable {
   struct Timing: Equatable {
     /// How often the capture is looked at while turning on.
@@ -50,8 +53,9 @@ struct CaptureSupervisor: Equatable {
     case permissionDenied
     /// The grant could not be read and no audio arrived — most likely nothing was playing.
     case noAudioDetected
-    /// While on, the tap went silent with another process playing, a rebuild did not
-    /// bring the audio back, and the tap could not say whether it may record.
+    /// While on, the tap went silent with another process playing and a rebuild did not
+    /// bring the audio back — and neither the tap's answer nor audio heard earlier
+    /// vouches for the capture.
     case captureLost
   }
 
@@ -60,7 +64,9 @@ struct CaptureSupervisor: Equatable {
     /// rebuild this attempt allows has been used.
     case confirming(elapsed: Duration, sawDenial: Bool, rebuilt: Bool)
     /// `silent`: how long the tap has been silent while another process plays.
-    case running(silent: Duration, recovery: Recovery)
+    /// `heardSignal`: real audio has arrived at least once since turning on — the only
+    /// proof that capture works, which an answer from the tap is not.
+    case running(silent: Duration, recovery: Recovery, heardSignal: Bool)
   }
 
   /// How far one stretch of silence-while-others-play has been handled.
@@ -112,11 +118,12 @@ struct CaptureSupervisor: Equatable {
         rebuilt: rebuilt,
         permission: permission
       )
-    case let .running(silent, recovery):
+    case let .running(silent, recovery, heardSignal):
       return watch(
         hasSignal: hasSignal,
         silentFor: silent + elapsed,
         recovery: recovery,
+        heardSignal: heardSignal,
         othersPlaying: othersPlaying,
         permission: permission
       )
@@ -132,7 +139,7 @@ struct CaptureSupervisor: Equatable {
   ) -> Decision {
     // Real audio is proof whatever the tap says about the grant.
     if hasSignal {
-      phase = .running(silent: .zero, recovery: .none)
+      phase = .running(silent: .zero, recovery: .none, heardSignal: true)
       return .commit
     }
     let answer = permission()
@@ -143,7 +150,7 @@ struct CaptureSupervisor: Equatable {
       phase = .confirming(elapsed: .zero, sawDenial: false, rebuilt: true)
       return .rebuild
     case .granted:
-      phase = .running(silent: .zero, recovery: .none)
+      phase = .running(silent: .zero, recovery: .none, heardSignal: false)
       return .commit
     case .denied, .unknown:
       let refused = sawDenial || answer == .denied
@@ -159,41 +166,48 @@ struct CaptureSupervisor: Equatable {
     hasSignal: Bool,
     silentFor: Duration,
     recovery: Recovery,
+    heardSignal: Bool,
     othersPlaying: () -> Bool?,
     permission: () -> SystemAudioPermission
   ) -> Decision {
+    let heard = heardSignal || hasSignal
     guard !hasSignal, othersPlaying() == true else {
       // Audio flows, or nothing else is playing (or that cannot be read) — silence is
       // then what there is to hear. Either way the capture is fine, and a later silence
       // is a new stretch with a rebuild of its own.
-      phase = .running(silent: .zero, recovery: .none)
+      phase = .running(silent: .zero, recovery: .none, heardSignal: heard)
       return .hold
     }
     let timedOut = silentFor >= timing.stallTimeout
     switch recovery {
     case .none:
-      guard timedOut else { return keepWatching(silentFor, .none) }
-      phase = .running(silent: .zero, recovery: .rebuilt)
+      guard timedOut else { return keepWatching(silentFor, .none, heard) }
+      phase = .running(silent: .zero, recovery: .rebuilt, heardSignal: heard)
       return .rebuild
     case .rebuilt:
       // The whole Mac is muted meanwhile: a refusal from the fresh tap ends it at once.
       let answer = permission()
       if answer == .denied { return .revoke(.permissionDenied) }
-      guard timedOut else { return keepWatching(silentFor, .rebuilt) }
-      guard answer == .granted else { return .revoke(.captureLost) }
-      return keepWatching(.zero, .vouched)
+      guard timedOut else { return keepWatching(silentFor, .rebuilt, heard) }
+      // "Allowed" is only believed once real audio has borne capture out. Without that,
+      // a wrong answer — or a tap that may record but cannot — would keep the original
+      // muted for good.
+      guard answer == .granted, heard else { return .revoke(.captureLost) }
+      return keepWatching(.zero, .vouched, heard)
     case .vouched:
-      guard timedOut else { return keepWatching(silentFor, .vouched) }
+      guard timedOut else { return keepWatching(silentFor, .vouched, heard) }
       switch permission() {
-      case .granted: return keepWatching(.zero, .vouched)
+      case .granted: return keepWatching(.zero, .vouched, heard)
       case .denied: return .revoke(.permissionDenied)
       case .unknown: return .revoke(.captureLost)
       }
     }
   }
 
-  private mutating func keepWatching(_ silent: Duration, _ recovery: Recovery) -> Decision {
-    phase = .running(silent: silent, recovery: recovery)
+  private mutating func keepWatching(
+    _ silent: Duration, _ recovery: Recovery, _ heardSignal: Bool
+  ) -> Decision {
+    phase = .running(silent: silent, recovery: recovery, heardSignal: heardSignal)
     return .hold
   }
 }
