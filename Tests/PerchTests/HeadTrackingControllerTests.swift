@@ -6,28 +6,7 @@ import Testing
 
 // コントローラの状態遷移を、実カメラ無しのフェイクプロバイダで検証する。
 // 許可 → 較正 → 追跡 → 見失い/失敗/停止 の各辺と、recenter のガード。
-
-/// テストから手で観測を流し込めるプロバイダ。
-private final class FakeHeadPoseProvider: HeadPoseProvider, @unchecked Sendable {
-  let samples: AsyncStream<HeadPoseSample>
-  let continuation: AsyncStream<HeadPoseSample>.Continuation
-  private(set) var started = false
-  private(set) var stopped = false
-
-  init() {
-    // 実物は最新値のみ保持だが、テストは流した観測を全部処理してほしいので無制限。
-    (samples, continuation) = AsyncStream.makeStream(of: HeadPoseSample.self)
-  }
-
-  func start() async throws {
-    started = true
-  }
-
-  func stop() {
-    stopped = true
-    continuation.finish()
-  }
-}
+// カメラの選択と抜き差しは HeadTrackingCameraTests にある。
 
 @MainActor
 private struct Harness {
@@ -48,14 +27,17 @@ private struct Harness {
     let provider = self.provider
     let defaults = UserDefaults(suiteName: "HeadTrackingControllerTests-\(UUID().uuidString)")!
     controller = HeadTrackingController(
-      providerFactory: { provider },
+      providerFactory: { _ in provider },
+      cameraCatalog: FakeCameraCatalog([TestCameras.builtIn]),
       authorization: { authorization },
       requestAccess: { false },
       defaults: defaults,
       calibrationSamples: 3,
       calibrationMissLimit: 5,
       stallTimeout: stallTimeout,
-      watchdogInterval: watchdogInterval
+      watchdogInterval: watchdogInterval,
+      // 止まったカメラが「外されただけ」か見極める猶予。ここでは待たせない。
+      disconnectGrace: .milliseconds(20)
     )
     let delivered = self.delivered
     controller.applyPose = { orientation, ratio in
