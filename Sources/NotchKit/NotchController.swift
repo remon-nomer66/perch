@@ -73,8 +73,10 @@ public final class NotchController: ObservableObject {
   public var onUsableNotchChanged: ((Bool) -> Void)?
   /// Asked whether the closed bar is currently drawn at its widened size. Left unset,
   /// the bar is assumed always visible. When it answers false the hover target
-  /// shrinks to the bare cutout: a host that keeps the notch bare until looked at
-  /// must not have the invisible side reaches of the hidden bar react to the pointer.
+  /// shrinks to what is drawn instead — the bare cutout, or a virtual notch's sliver: a
+  /// host that keeps the notch bare until looked at must not have the invisible side
+  /// reaches of the hidden bar react to the pointer. It must be the very answer the
+  /// hosted view widens the bar by, or the target and the drawing part ways.
   public var isBarVisible: (() -> Bool)?
 
   private let pointer = PointerMonitor()
@@ -256,30 +258,22 @@ public final class NotchController: ObservableObject {
     apply()
   }
 
-  /// A little slack: demanding pixel accuracy makes the target feel smaller than it
-  /// looks.
   private func isOverNotch(_ location: CGPoint) -> Bool {
-    guard let geometry else { return false }
-    return Self.hoverTarget(
+    currentNotchTarget?.contains(location) ?? false
+  }
+
+  /// What the pointer must reach right now, slack included: the bar exactly as the view
+  /// draws it in the current state. An invisible target that reacts anyway reads as a
+  /// haunted patch of menu bar, and a drawn one that does not reads as a dead click.
+  private var currentNotchTarget: CGRect? {
+    guard let geometry else { return nil }
+    return Self.notchTarget(
       barVisible: isBarVisible?() ?? true,
+      presentation: presenter.presentation,
       notch: geometry.rect,
       isVirtual: geometry.isVirtual,
       appearance: appearance()
     )
-    .insetBy(dx: -4, dy: -4)
-    .contains(location)
-  }
-
-  /// What the pointer must reach to count as "over the notch", in global screen
-  /// coordinates. A virtual notch rests as a thin sliver, so that sliver is its whole
-  /// target regardless of the bar flag. A real notch's target is the widened bar while
-  /// it is drawn, but only the bare cutout while the host reports the bar hidden — an
-  /// invisible target that reacts anyway reads as a haunted patch of menu bar.
-  nonisolated static func hoverTarget(
-    barVisible: Bool, notch: CGRect, isVirtual: Bool, appearance: NotchAppearance
-  ) -> CGRect {
-    if isVirtual { return appearance.restingSliver(in: notch) }
-    return barVisible ? appearance.closedRect(around: notch) : notch
   }
 
   private var expandedRect: CGRect {
