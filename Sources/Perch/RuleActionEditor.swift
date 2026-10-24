@@ -5,7 +5,7 @@ import TandemSession
 /// a blank space. Shared by the site/app editor and the music editor so both screens give
 /// the same reason.
 struct RuleEditorUnavailableNotice: View {
-  enum Reason {
+  enum Reason: Equatable {
     /// Nothing controllable is connected.
     case noDevice
     /// The connected device's brand has no rule support. A rule's actions are the Sony

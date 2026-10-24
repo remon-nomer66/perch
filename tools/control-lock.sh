@@ -63,17 +63,21 @@ log() { echo "$(now) $*" >> "$LOG"; }
 
 # Takes the lock, runs one probe to completion, releases. Shared by every probe so a
 # new one can never quietly bypass the lock — which is how bose-probe came to open a
-# control channel outside it. Arguments: binary label owner outfile [probe args...]
+# control channel outside it. Arguments: binary label owner outfile note [probe args...]
+# (an empty note is fine; a given one is recorded with the label, as `acquire` would).
 run_probe() {
-  local binary="$1" label="$2" owner="$3" out="$4"
-  shift 4
+  local binary="$1" label="$2" owner="$3" out="$4" note="${5:-}"
+  shift 5
 
   if [ ! -x "$binary" ]; then
     echo "MISSING: $binary is not built (swift build --product $label)" >&2
     return 1
   fi
 
-  acquire "$owner" "probe" "$label"
+  # Callers run this under `set +e` to collect the probe's exit code, so a refused
+  # acquire must stop here explicitly — before the trap, which would release a lock that
+  # is not ours. Under `set +e` alone, BUSY was printed and the probe ran anyway.
+  acquire "$owner" "probe" "$label${note:+: $note}" || return 1
   # Release on any exit, including SIGINT/SIGTERM. Bash delivers the trap only after
   # the foreground probe finishes, so the lock is never released while the probe still
   # holds the channel. Ctrl-C also reaches the probe itself (same process group), which
@@ -206,7 +210,7 @@ case "$cmd" in
 
   probe)
     set +e
-    run_probe "$PROBE" "perch-probe" "${2:?owner}" "${4:?output file}" "${3:?bluetooth address}"
+    run_probe "$PROBE" "perch-probe" "${2:?owner}" "${4:?output file}" "${5:-}" "${3:?bluetooth address}"
     rc=$?
     set -e
     exit $rc
@@ -215,7 +219,7 @@ case "$cmd" in
   bose-probe)
     # Everything past the outfile is bose-probe's own (all optional: [ultra2|qc35] [address]).
     set +e
-    run_probe "$BOSE_PROBE" "bose-probe" "${2:?owner}" "${3:?output file}" "${@:4}"
+    run_probe "$BOSE_PROBE" "bose-probe" "${2:?owner}" "${3:?output file}" "" "${@:4}"
     rc=$?
     set -e
     exit $rc

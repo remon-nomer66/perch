@@ -158,22 +158,14 @@ public struct BmapRFCOMMChannelOpener: Sendable {
 }
 
 /// The addresses of every paired device that advertises the BMAP control service, most
-/// promising first (a currently-connected one, then the rest). Selection is by the BMAP
-/// marker in cached SDP, *not* by `isConnected()`: a TWS earbud's BMAP records can sit on
-/// an address that is not the one currently carrying audio, so requiring "connected"
-/// would skip the very device that answers BMAP. Addresses are only used to open a
-/// channel and are never printed, so they stay out of any log.
+/// promising first (a currently-connected one, then the rest) — `bmapDeviceCandidates()`
+/// without the link facts. Selection is by the BMAP marker in cached SDP, *not* by
+/// `isConnected()`: a TWS earbud's BMAP records can sit on an address that is not the
+/// one currently carrying audio, so requiring "connected" would skip the very device that
+/// answers BMAP. Addresses are only used to open a channel and are never printed, so they
+/// stay out of any log.
 public func bmapDeviceAddresses() -> [String] {
-  let paired = IOBluetoothDevice.pairedDevices() as? [IOBluetoothDevice] ?? []
-  let advertising = paired.filter { BmapServiceDiscovery.advertisesBmap($0) }
-  // Stable-sort connected devices ahead of the rest.
-  let ordered = advertising.enumerated().sorted { lhs, rhs in
-    if lhs.element.isConnected() != rhs.element.isConnected() {
-      return lhs.element.isConnected()
-    }
-    return lhs.offset < rhs.offset
-  }
-  return ordered.compactMap { $0.element.addressString }
+  bmapDeviceCandidates().map(\.address)
 }
 
 /// The address of a connected, paired device that advertises the BMAP control service,
