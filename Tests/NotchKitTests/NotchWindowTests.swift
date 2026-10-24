@@ -9,7 +9,7 @@ private let bar = CGRect(x: 722, y: 1127, width: 356, height: 42)
 
 // MARK: - Catcher
 
-@Test func theCatcherFillIsFaintYetClearOfTheTransparencyThreshold() {
+@Test @MainActor func theCatcherFillIsFaintYetClearOfTheTransparencyThreshold() {
   // A pixel with no alpha lets a press through wherever the window server decides by
   // alpha. One percent rounds to 3 of 255 — close enough to nothing to risk it — while
   // the fill must stay invisible over the few points of slack beside the bar.
