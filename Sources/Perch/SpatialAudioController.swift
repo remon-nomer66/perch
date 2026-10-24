@@ -189,6 +189,7 @@ final class SpatialAudioController: ObservableObject {
     let othersPlaying = self.othersPlaying
     let decision = await supervisor.observe(
       hasSignal: hasSignal,
+      outputRunning: engine.isOutputRunning,
       after: elapsed,
       othersPlaying: { await self.playbackGate.run(othersPlaying) ?? nil },
       permission: { await self.askPermission(probe) }
@@ -233,9 +234,7 @@ final class SpatialAudioController: ObservableObject {
       // From here on the same loop watches the running capture.
       return true
     case .rebuild:
-      Self.log.notice(
-        "\(self.isEnabled ? "tap silent while other audio plays" : "grant arrived while confirming", privacy: .public); rebuilding the tap"
-      )
+      Self.log.notice("\(self.rebuildReason, privacy: .public); rebuilding the engine")
       do {
         try buildEngine()
         restoreListenerPose()
@@ -255,6 +254,13 @@ final class SpatialAudioController: ObservableObject {
       errorMessage = reason.message
       return false
     }
+  }
+
+  /// What the supervisor's rebuild is about, for the log.
+  private var rebuildReason: String {
+    guard isEnabled else { return "grant arrived while confirming" }
+    guard engine?.isOutputRunning ?? true else { return "spatialised output stopped" }
+    return "capture silent while other audio may be playing"
   }
 
   private func clearError() {
@@ -375,6 +381,11 @@ extension CaptureSupervisor.Revocation {
       L(
         "音声を検出できませんでした。何か再生してからお試しください。",
         "No audio detected. Play something, then try again."
+      )
+    case .outputStopped:
+      L(
+        "空間オーディオの出力が止まったため、オフにしました。もう一度オンにしてください。",
+        "Spatial Audio turned off because its output stopped. Turn it on again."
       )
     case .captureLost:
       L(

@@ -9,6 +9,9 @@ protocol SpatialCaptureEngine: AnyObject {
   /// Blocks with a non-silent sample captured since this engine started. A count that
   /// grew between two looks means audio arrived in between.
   var audibleBlockCount: Int { get }
+  /// Whether the spatialised output (the audio engine) is playing. The tap mutes the
+  /// original either way, so a stopped output means a silent Mac.
+  var isOutputRunning: Bool { get }
   /// How to ask the running tap for the system-audio recording grant. The question is a
   /// blocking round trip to coreaudiod, so the caller runs it off the main actor. nil
   /// while there is no tap to ask.

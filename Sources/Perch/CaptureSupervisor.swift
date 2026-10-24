@@ -24,6 +24,10 @@ import SpatialAudioKit
 /// turning on: the tap's "allowed" is itself an unproven answer, so on its own it never
 /// keeps a silent Mac — wrong answers, or a tap that is allowed but cannot capture,
 /// still give the sound back.
+///
+/// The other half of a running feature is the spatialised output. When it stops for
+/// longer than a configuration change takes to be rebuilt, the original is still muted
+/// and nothing replaces it: it is rebuilt once, and given up on if it stops again.
 struct CaptureSupervisor: Equatable {
   struct Timing: Equatable {
     /// How often the capture is looked at while turning on.
@@ -39,6 +43,9 @@ struct CaptureSupervisor: Equatable {
     /// How long nothing else must play before a stretch of silence, and what was done
     /// about it, is forgotten.
     var quietReset: Duration = .seconds(3)
+    /// How long the spatialised output may be stopped before the watch steps in. A
+    /// configuration change stops it too, and its own handler rebuilds within a moment.
+    var outputGrace: Duration = .seconds(2)
   }
 
   enum Decision: Equatable, Sendable {
@@ -61,6 +68,8 @@ struct CaptureSupervisor: Equatable {
     /// bring the audio back — and neither the tap's answer nor audio heard earlier
     /// vouches for the capture.
     case captureLost
+    /// The spatialised output stopped, and stopped again after a rebuild.
+    case outputStopped
   }
 
   private enum Phase: Equatable {
@@ -90,6 +99,19 @@ struct CaptureSupervisor: Equatable {
     /// How long nothing else has been playing, without audio either.
     var quiet: Duration = .zero
     var recovery = Recovery.none
+    var output = OutputWatch()
+  }
+
+  /// The spatialised output, watched apart from the capture: audio arriving says
+  /// nothing about whether it is being played back.
+  private struct OutputWatch: Equatable {
+    /// How long the output has been found stopped.
+    var down: Duration = .zero
+    /// How long it has run since the rebuild it cost.
+    var up: Duration = .zero
+    /// A rebuild has been spent on it, and it has not yet run long enough to earn
+    /// another.
+    var rebuilt = false
   }
 
   /// How far one stretch of silence-while-others-play has been handled.
@@ -124,6 +146,7 @@ struct CaptureSupervisor: Equatable {
   /// passed, questions included, not the nominal interval.
   /// - Parameters:
   ///   - hasSignal: a non-silent block arrived since the previous look.
+  ///   - outputRunning: the spatialised output is playing. Watched once on.
   ///   - othersPlaying: whether a process other than Perch is outputting audio; nil when
   ///     that cannot be read. Asked only when the answer matters.
   ///   - permission: asks the tap for the grant. Asked only when the answer matters.
@@ -132,6 +155,7 @@ struct CaptureSupervisor: Equatable {
   /// decision itself is pure, and runs wherever it is called from.
   nonisolated(nonsending) mutating func observe(
     hasSignal: Bool,
+    outputRunning: Bool,
     after elapsed: Duration,
     othersPlaying: () async -> Bool?,
     permission: () async -> SystemAudioPermission
@@ -143,6 +167,7 @@ struct CaptureSupervisor: Equatable {
     case .running(let watch):
       return await self.watch(
         hasSignal: hasSignal,
+        outputRunning: outputRunning,
         elapsed: elapsed,
         watch,
         othersPlaying: othersPlaying,
@@ -186,16 +211,33 @@ struct CaptureSupervisor: Equatable {
 
   private nonisolated(nonsending) mutating func watch(
     hasSignal: Bool,
+    outputRunning: Bool,
     elapsed: Duration,
     _ watch: Watch,
     othersPlaying: () async -> Bool?,
     permission: () async -> SystemAudioPermission
   ) async -> Decision {
     var next = watch
+    next.heardSignal = watch.heardSignal || hasSignal
+    guard outputRunning else {
+      next.output.up = .zero
+      next.output.down += elapsed
+      guard next.output.down >= timing.outputGrace else { return keepWatching(next) }
+      // The spatialised copy is gone while the original stays muted.
+      if watch.output.rebuilt { return .revoke(.outputStopped) }
+      next.output = OutputWatch(rebuilt: true)
+      phase = .running(next)
+      return .rebuild
+    }
+    next.output.down = .zero
+    if next.output.rebuilt {
+      next.output.up += elapsed
+      if next.output.up >= timing.stallTimeout { next.output = OutputWatch() }
+    }
     if hasSignal {
       // Audio flows: the capture is fine, and a later silence is a new stretch with a
       // rebuild of its own.
-      phase = .running(Watch(heardSignal: true))
+      phase = .running(Watch(heardSignal: true, output: next.output))
       return .hold
     }
     // Unreadable counts as "may be playing": that is the side where a muted Mac gets
@@ -206,7 +248,7 @@ struct CaptureSupervisor: Equatable {
       // not throw away a vouched tap and cost another rebuild.
       next.quiet += elapsed
       if next.quiet >= timing.quietReset {
-        next = Watch(heardSignal: watch.heardSignal)
+        next = Watch(heardSignal: next.heardSignal, output: next.output)
       }
       return keepWatching(next)
     }
@@ -228,7 +270,7 @@ struct CaptureSupervisor: Equatable {
       // "Allowed" is only believed once real audio has borne capture out. Without that,
       // a wrong answer — or a tap that may record but cannot — would keep the original
       // muted for good.
-      guard answer == .granted, watch.heardSignal else { return .revoke(.captureLost) }
+      guard answer == .granted, next.heardSignal else { return .revoke(.captureLost) }
       next.silent = .zero
       next.recovery = .vouched
       return keepWatching(next)

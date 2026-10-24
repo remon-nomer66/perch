@@ -244,6 +244,9 @@ public final class MultibandSpatializer: @unchecked Sendable {
     tap?.streamFormat ?? AudioStreamBasicDescription()
   }
 
+  /// 空間化した音を出すエンジンが動いているか。止まっていても、タップは原音を消し続ける。
+  public var isOutputRunning: Bool { graph.isRunning }
+
   /// システムオーディオ録音の許可を、取り込み中のタップに問い合わせる手立て
   /// （`SystemAudioTap.permissionProbe`）。取り込んでいなければ nil。問い合わせは同期の
   /// 往復なので、メインスレッドの外で `run()` すること。

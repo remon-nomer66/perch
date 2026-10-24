@@ -21,6 +21,8 @@ import Testing
 //    出力を開いているアプリ）なのでオンのまま
 //  - 不変条件: 実際の音で裏付けられていない「許可あり」だけでは、他が再生中の無音に
 //    居座らない（許可ありの答えそのものが誤っている環境でも、Mac の音を必ず戻す）
+//  - 空間化した音の出力（AVAudioEngine）が止まれば、構成変更の作り直しを待つ猶予
+//    （2秒）の後で1回作り直し、それでも止まるなら取り消す
 
 private typealias Decision = CaptureSupervisor.Decision
 
@@ -29,11 +31,13 @@ private typealias Decision = CaptureSupervisor.Decision
 private func look(
   _ supervisor: inout CaptureSupervisor,
   signal: Bool,
+  outputRunning: Bool = true,
   othersPlaying: () -> Bool? = { false },
   permission: () -> SystemAudioPermission
 ) async -> Decision {
   await supervisor.observe(
     hasSignal: signal,
+    outputRunning: outputRunning,
     after: supervisor.pollInterval,
     othersPlaying: { othersPlaying() },
     permission: { permission() }
@@ -181,6 +185,8 @@ private struct WatchLook: Sendable {
   /// 他のプロセスが音を出しているか。nil は読めなかった。
   let othersPlaying: Bool?
   var permission = SystemAudioPermission.granted
+  /// 空間化した音の出力が動いているか。
+  var outputRunning = true
 
   static let flowing = WatchLook(signal: true, othersPlaying: true)
   static let quiet = WatchLook(signal: false, othersPlaying: false)
@@ -188,6 +194,8 @@ private struct WatchLook: Sendable {
   static let stalled = WatchLook(signal: false, othersPlaying: true)
   static let stalledDenied = WatchLook(signal: false, othersPlaying: true, permission: .denied)
   static let stalledUnknown = WatchLook(signal: false, othersPlaying: true, permission: .unknown)
+  /// 取り込みは届いているが、空間化した音を出す側が止まっている。
+  static let deadOutput = WatchLook(signal: true, othersPlaying: true, outputRunning: false)
 }
 
 private struct WatchScenario: Sendable, CustomTestStringConvertible {
@@ -303,6 +311,32 @@ private let watchScenarios: [WatchScenario] = [
     decisions: holds(4) + holds(3) + holds(4) + [.rebuild]
   ),
   WatchScenario(
+    name: "出力が一瞬止まっただけ（構成変更の作り直しで戻る）なら、何もしない",
+    looks: [.deadOutput, .flowing, .deadOutput, .flowing],
+    decisions: holds(4)
+  ),
+  WatchScenario(
+    name: "出力が猶予を超えて止まれば、1回作り直す",
+    looks: [.deadOutput, .deadOutput],
+    decisions: [.hold, .rebuild]
+  ),
+  WatchScenario(
+    name: "作り直しても出力が止まったままなら取り消す",
+    looks: [.deadOutput, .deadOutput, .deadOutput, .deadOutput],
+    decisions: [.hold, .rebuild, .hold, .revoke(.outputStopped)]
+  ),
+  WatchScenario(
+    name: "作り直して出力が戻っても、すぐまた止まるなら取り消す（作り直しを繰り返さない）",
+    looks: [.deadOutput, .deadOutput, .flowing, .flowing, .deadOutput, .deadOutput],
+    decisions: [.hold, .rebuild, .hold, .hold, .hold, .revoke(.outputStopped)]
+  ),
+  WatchScenario(
+    name: "作り直した出力がしばらく続けば、次に止まったときも改めて1回作り直せる",
+    looks: [.deadOutput, .deadOutput] + Array(repeating: .flowing, count: 5)
+      + [.deadOutput, .deadOutput],
+    decisions: [.hold, .rebuild] + holds(5) + [.hold, .rebuild]
+  ),
+  WatchScenario(
     name: "音が戻った後なら、次に黙ったときにも改めて1回作り直せる",
     looks: stall() + [.flowing] + stall(),
     decisions: holds(4) + [.rebuild, .hold] + holds(4) + [.rebuild]
@@ -324,7 +358,7 @@ private func watchDecisions(scenario: WatchScenario) async {
   for row in scenario.looks {
     decisions.append(
       await look(
-        &supervisor, signal: row.signal,
+        &supervisor, signal: row.signal, outputRunning: row.outputRunning,
         othersPlaying: { row.othersPlaying }, permission: { row.permission }
       )
     )

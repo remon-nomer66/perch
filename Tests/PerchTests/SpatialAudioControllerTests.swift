@@ -56,10 +56,13 @@ private final class FakeEngine: SpatialCaptureEngine {
   private(set) var reads = 0
   private(set) var listener: ListenerOrientation?
   let estimatedBPM: Double? = nil
+  /// 空間化した音を出す側（AVAudioEngine）が動いているか。
+  var isOutputRunning: Bool
 
-  init(script: PermissionScript, flowing: Bool) {
+  init(script: PermissionScript, flowing: Bool, outputRunning: Bool) {
     self.script = script
     self.flowing = flowing
+    isOutputRunning = outputRunning
   }
 
   var audibleBlockCount: Int {
@@ -109,6 +112,8 @@ private struct Harness {
     var probeDelay: TimeInterval = 0
     /// 新しく作るエンジンで音が流れているか。
     var flowing: Bool
+    /// 新しく作るエンジンの出力が動いているか。
+    var outputRunning = true
     var failToStart = false
     /// 他のプロセスが音を出しているか（AudibleProcesses の代わり）。MainActor の外から
     /// 読まれるので、ロックの中に持つ。
@@ -149,7 +154,9 @@ private struct Harness {
         if engines.failToStart { throw StartFailure() }
         let answers = engines.scripts[min(engines.built.count, engines.scripts.count - 1)]
         let engine = FakeEngine(
-          script: PermissionScript(answers, delay: engines.probeDelay), flowing: engines.flowing
+          script: PermissionScript(answers, delay: engines.probeDelay),
+          flowing: engines.flowing,
+          outputRunning: engines.outputRunning
         )
         engines.built.append(engine)
         return engine
@@ -168,7 +175,8 @@ private struct Harness {
     confirmDeadline: .milliseconds(15),
     watchInterval: .milliseconds(1),
     stallTimeout: .milliseconds(5),
-    quietReset: .milliseconds(3)
+    quietReset: .milliseconds(3),
+    outputGrace: .milliseconds(2)
   )
 
   /// 監視タスク（MainActor 上の別タスク）に回す。条件が満ちるまで譲る。
@@ -395,6 +403,37 @@ func revokedGrantIsReportedAsPermission() async {
   #expect(harness.engines.allStopped)
 }
 
+@MainActor
+@Test("空間化した音の出力が止まれば作り直し、戻ればそのままオン")
+func stoppedOutputIsRebuilt() async {
+  let harness = Harness(permissions: [[.granted]], flowing: true)
+  harness.controller.setEnabled(true)
+  await harness.settle()
+  harness.engines.built[0].isOutputRunning = false
+  await harness.drain { harness.engines.built.count == 2 }
+  let rebuilt = harness.engines.built[1]
+  await harness.drain { rebuilt.reads >= 30 }
+
+  #expect(harness.controller.isEnabled)
+  #expect(harness.engines.built.count == 2)
+  #expect(harness.engines.built[0].stopped)
+}
+
+@MainActor
+@Test("作り直しても出力が止まったままなら取り消し、エンジンを止める（元の音を戻す）")
+func outputThatStaysStoppedIsRevoked() async {
+  let harness = Harness(permissions: [[.granted]], flowing: true)
+  harness.controller.setEnabled(true)
+  await harness.settle()
+  harness.engines.outputRunning = false
+  harness.engines.built[0].isOutputRunning = false
+  await harness.drain { !harness.controller.isEnabled }
+
+  #expect(harness.controller.revocation == .outputStopped)
+  #expect(harness.engines.built.count == 2)
+  #expect(harness.engines.allStopped)
+}
+
 // MARK: - 問い合わせの置き場所と時間
 
 @MainActor
@@ -474,6 +513,15 @@ func captureLostMessageSaysWhatHappened() {
   let message = CaptureSupervisor.Revocation.captureLost.message
   #expect(!message.isEmpty)
   #expect(message != CaptureSupervisor.Revocation.noAudioDetected.message)
+}
+
+@Test("出力が止まったときの文言は、取り込みや許可の話と取り違えない")
+func outputStoppedMessageIsItsOwn() {
+  let message = CaptureSupervisor.Revocation.outputStopped.message
+  #expect(!message.isEmpty)
+  #expect(message != CaptureSupervisor.Revocation.captureLost.message)
+  #expect(!message.contains("許可"))
+  #expect(!message.lowercased().contains("permission"))
 }
 
 @Test("音声を検出できないときの文言は、許可が無いと決めつけない")
