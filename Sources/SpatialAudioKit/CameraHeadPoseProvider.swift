@@ -1,5 +1,6 @@
 import AVFoundation
 import Vision
+import os
 
 /// カメラ + Vision による頭部姿勢プロバイダ。
 ///
@@ -17,6 +18,9 @@ import Vision
 ///   （iPhone）が黙って立ち上がる事故を防ぐ。見つからなければ `cameraNotFound`。
 /// - カメラが外部要因で死んだら（他プロセスに取られた・切断・ランタイムエラー）、
 ///   ストリームを終える。呼び出し側はストリームの終端を「カメラが止まった」と読む。
+/// - 顔が見つからないフレームでだけ体の姿勢を推定し、後ろを向いた人が写っているかを
+///   `HeadPoseSample.presence` で伝える（判定は `FacingAwayClassifier`）。顔が取れた
+///   フレームでは走らせない — 体の姿勢は顔の矩形より重く、顔があれば答えは出ている。
 public final class CameraHeadPoseProvider: NSObject, HeadPoseProvider, @unchecked Sendable {
   public enum ProviderError: Error, Equatable {
     case notAuthorized
@@ -29,12 +33,14 @@ public final class CameraHeadPoseProvider: NSObject, HeadPoseProvider, @unchecke
   private static let sessionQueue = DispatchQueue(
     label: "SpatialAudioKit.CameraHeadPose", qos: .userInitiated
   )
+  private static let log = Logger(subsystem: "dev.perch.mac", category: "HeadTracking")
 
   private let session = AVCaptureSession()
   private let output = AVCaptureVideoDataOutput()
   /// 開くカメラの `AVCaptureDevice.uniqueID`。
   private let cameraID: String
   private let conversion: VisionPoseConversion
+  private let facingAway: FacingAwayClassifier
   private let continuation: AsyncStream<HeadPoseSample>.Continuation
   public let samples: AsyncStream<HeadPoseSample>
 
@@ -46,9 +52,14 @@ public final class CameraHeadPoseProvider: NSObject, HeadPoseProvider, @unchecke
   /// 15fps で約3秒 — 通りすがりの顔へ即座に飛ばないための猶予。
   private let reacquireAfterMisses = 45
 
-  public init(cameraID: String, conversion: VisionPoseConversion = .assumed) {
+  public init(
+    cameraID: String,
+    conversion: VisionPoseConversion = .assumed,
+    facingAway: FacingAwayClassifier = FacingAwayClassifier()
+  ) {
     self.cameraID = cameraID
     self.conversion = conversion
+    self.facingAway = facingAway
     (samples, continuation) = AsyncStream.makeStream(
       of: HeadPoseSample.self, bufferingPolicy: .bufferingNewest(1)
     )
@@ -173,6 +184,7 @@ extension CameraHeadPoseProvider: AVCaptureVideoDataOutputSampleBufferDelegate {
     guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
     let time = CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds
     let imageWidth = Double(CVPixelBufferGetWidth(pixelBuffer))
+    let imageHeight = Double(CVPixelBufferGetHeight(pixelBuffer))
 
     let faceRequest = VNDetectFaceRectanglesRequest()
     faceRequest.revision = VNDetectFaceRectanglesRequestRevision3
@@ -186,7 +198,11 @@ extension CameraHeadPoseProvider: AVCaptureVideoDataOutputSampleBufferDelegate {
       if missCount >= reacquireAfterMisses {
         trackedBox = nil
       }
-      continuation.yield(HeadPoseSample(time: time, rotation: nil, pixelIPD: nil, faceWidth: nil))
+      // 顔が無い理由が「誰もいない」か「後ろを向いている」かで、音場の倒し先が変わる。
+      let presence = bodyPresence(handler: handler, imageAspect: imageWidth / imageHeight)
+      continuation.yield(
+        HeadPoseSample(time: time, rotation: nil, pixelIPD: nil, faceWidth: nil, presence: presence)
+      )
       return
     }
     missCount = 0
@@ -206,9 +222,28 @@ extension CameraHeadPoseProvider: AVCaptureVideoDataOutputSampleBufferDelegate {
         time: time,
         rotation: rotation,
         pixelIPD: pupilDistance(of: face, handler: handler, pixelBuffer: pixelBuffer),
-        faceWidth: face.boundingBox.width * imageWidth
+        faceWidth: face.boundingBox.width * imageWidth,
+        // 姿勢角が欠けても顔は見えている — 後ろ向きではない。
+        presence: .faceVisible
       )
     )
+  }
+
+  /// 顔の見つからないフレームで、写っている人の向きを体の姿勢から決める。
+  /// 推定に失敗したら判定しない（従来どおり正面へ戻る側に倒す）。
+  private func bodyPresence(handler: VNImageRequestHandler, imageAspect: Double) -> HeadPresence {
+    let request = VNDetectHumanBodyPoseRequest()
+    do {
+      try handler.perform([request])
+    } catch {
+      // 毎フレーム起こりうるので debug に留める。エラーの説明は画像の内容を含まない。
+      Self.log.debug(
+        "Body pose estimation failed: \(String(describing: error), privacy: .public)"
+      )
+      return .undetermined
+    }
+    let bodies = (request.results ?? []).map(BodyKeypoints.init(observation:))
+    return facingAway.classify(bodies, imageAspect: imageAspect)
   }
 
   /// 選んだ顔1つに絞ってランドマークを掛け、両瞳のピクセル距離を測る。
@@ -230,5 +265,41 @@ extension CameraHeadPoseProvider: AVCaptureVideoDataOutputSampleBufferDelegate {
       let right = landmarks.rightPupil?.pointsInImage(imageSize: size).first
     else { return nil }
     return Double(hypot(left.x - right.x, left.y - right.y))
+  }
+}
+
+extension BodyKeypoints {
+  /// Vision の観測から、判定に使う点だけを写す。見つからなかった点は入れない
+  /// （信頼度 0 と同じ扱いになる）。
+  fileprivate init(observation: VNHumanBodyPoseObservation) {
+    let recognized = (try? observation.recognizedPoints(.all)) ?? [:]
+    let points = Joint.allCases.compactMap { joint -> (Joint, Point)? in
+      guard let point = recognized[joint.visionName] else { return nil }
+      return (
+        joint,
+        Point(
+          x: Double(point.location.x), y: Double(point.location.y),
+          confidence: Double(point.confidence)
+        )
+      )
+    }
+    self.init(Dictionary(uniqueKeysWithValues: points))
+  }
+}
+
+extension BodyKeypoints.Joint {
+  fileprivate var visionName: VNHumanBodyPoseObservation.JointName {
+    switch self {
+    case .nose: .nose
+    case .leftEye: .leftEye
+    case .rightEye: .rightEye
+    case .leftEar: .leftEar
+    case .rightEar: .rightEar
+    case .neck: .neck
+    case .leftShoulder: .leftShoulder
+    case .rightShoulder: .rightShoulder
+    case .leftWrist: .leftWrist
+    case .rightWrist: .rightWrist
+    }
   }
 }
