@@ -78,3 +78,57 @@ private let control = "00-11-22-33-44-56"
   #expect(controller.readout == nil)
   #expect(controller.panelModel == nil)
 }
+
+// MARK: - Candidate rotation
+
+/// Two BMAP addresses answer for one output (seen on hardware: one product published two,
+/// and only the second worked). The first one opens but answers nothing. That is as much
+/// a failure as a refused open and must hand the next tick the other candidate — it used
+/// to be retried every tick for good, while only a refused open joined the rotation.
+@MainActor
+@Test func aCandidateThatOpensButAnswersNothingIsSetAside() async {
+  let silent = "00-11-22-33-44-56"
+  let answering = "00-11-22-33-44-57"
+  let audio = ScriptedAudioOutput(bluetooth: output)
+  let devices = ScriptedBmapDevices([silent: .opensSilently, answering: .readsBack])
+  let controller = BoseDeviceController(audio: audio, devices: devices)
+
+  await controller.tick()
+  #expect(devices.opened == [silent])
+  #expect(controller.readout?.status == .unreachable)
+
+  await controller.tick()
+  #expect(devices.opened == [silent, answering])
+  #expect(controller.readout?.status == .ready)
+  #expect(controller.readoutAgreesWithPanel)
+}
+
+/// The refused open has always rotated; it must keep doing so.
+@MainActor
+@Test func aCandidateThatRefusesToOpenIsSetAside() async {
+  let refusing = "00-11-22-33-44-56"
+  let answering = "00-11-22-33-44-57"
+  let audio = ScriptedAudioOutput(bluetooth: output)
+  let devices = ScriptedBmapDevices([refusing: .refusesToOpen, answering: .readsBack])
+  let controller = BoseDeviceController(audio: audio, devices: devices)
+
+  await controller.tick()
+  await controller.tick()
+  #expect(devices.opened == [refusing, answering])
+  #expect(controller.readout?.status == .ready)
+}
+
+/// Setting a silent candidate aside never silences the loop: with nothing else to try,
+/// the rotation starts over and the same address is tried again — a bud that was in its
+/// case may be out now.
+@MainActor
+@Test func aLoneSilentCandidateIsStillRetried() async {
+  let audio = ScriptedAudioOutput(bluetooth: output)
+  let devices = ScriptedBmapDevices([control: .opensSilently])
+  let controller = BoseDeviceController(audio: audio, devices: devices)
+
+  await controller.tick()
+  await controller.tick()
+  #expect(devices.opened == [control, control])
+  #expect(controller.readout?.status == .unreachable)
+}

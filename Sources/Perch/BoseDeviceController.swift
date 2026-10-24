@@ -250,11 +250,10 @@ final class BoseDeviceController: ObservableObject {
       snapshot = await readSnapshot(session, includingStable: true)
       // An opened channel that answers nothing is not a connection. Publishing `.ready`
       // here would show an empty panel over a link the next refresh has to tear down
-      // anyway; failing now sends the loop straight back through connect().
+      // anyway, so it fails now — exactly as a refused open does.
       guard snapshot.isControllable else {
         Self.log.notice("bose connected but read nothing back; treating as unreachable")
-        await teardown(keepingAddress: true)
-        readout = Readout(status: .unreachable, modelName: nil, firmwareVersion: nil, battery: .unknown)
+        await abandonConnect(to: address)
         return
       }
       // One config drives both the wire and the panel. The display axes it carries — wind
@@ -267,12 +266,21 @@ final class BoseDeviceController: ObservableObject {
       Self.log.notice("bose connected: controllable")
     } catch {
       Self.log.notice("bose connect failed: \(String(describing: error), privacy: .public)")
-      // Set this address aside so the next tick tries a different BMAP candidate instead
-      // of retrying the one that just refused, over and over.
-      failedAddresses.insert(Self.normalized(address))
-      await teardown(keepingAddress: true)
-      readout = Readout(status: .unreachable, modelName: nil, firmwareVersion: nil, battery: .unknown)
+      await abandonConnect(to: address)
     }
+  }
+
+  /// The one way out of a connect that did not end controllable, whichever step failed.
+  ///
+  /// The address is set aside so the next tick tries a different BMAP candidate instead
+  /// of the one that just failed, over and over. An open that read nothing back used to
+  /// skip this — only a refused open joined the rotation — so a product publishing two
+  /// addresses could hold the loop on the silent one for good, reopening it every tick
+  /// over the one control channel the device has.
+  private func abandonConnect(to address: String) async {
+    failedAddresses.insert(Self.normalized(address))
+    await teardown(keepingAddress: true)
+    readout = Readout(status: .unreachable, modelName: nil, firmwareVersion: nil, battery: .unknown)
   }
 
   private func refreshSnapshot() async {
