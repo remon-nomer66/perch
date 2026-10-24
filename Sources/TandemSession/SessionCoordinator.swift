@@ -1116,11 +1116,12 @@ public actor SessionCoordinator {
     request.lifecycle.handle(.responseTimedOut)
     guard case .failed(let failure) = request.lifecycle.outcome else { return }
     request.continuation.resume(throwing: SessionRequestFailure.failed(failure))
-    guard request.faultsOnTimeout else { return }
     // An unanswered request leaves us unable to attribute anything that arrives
     // later, so the session is rebuilt rather than continued. A probe opts out: it
     // expects some functions to go unanswered and must not tear down a working
-    // session to discover that.
+    // session to discover that. Only the session the request was sent on is at
+    // fault; a request that outlived its session must not fault the next one.
+    guard request.faultsOnTimeout, request.epoch == epoch else { return }
     await handle(.sessionFault(.responseTimedOut))
   }
 

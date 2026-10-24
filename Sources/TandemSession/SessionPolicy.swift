@@ -426,8 +426,14 @@ public struct SessionPolicy: Sendable {
         return (state.moved(to: .unverified, isTargetDefaultOutput: true), [.cancelGrace])
       }
 
+    // Every invalidation also fails what is pending on the session: a request left in
+    // flight holds the wire until its own timeout, which then faults whichever
+    // session is live by then. A suspension can hold one admitted before it began.
     case (.suspended, .graceExpired):
-      return (state.releasing(), [.cancelGrace, .closeChannel, .invalidateSession])
+      return (
+        state.releasing(),
+        [.cancelGrace, .closeChannel, .invalidateSession, .failPendingRequests]
+      )
 
     case (.suspended, .channelClosedUnexpectedly):
       return (state.releasing(), [.cancelGrace, .invalidateSession, .failPendingRequests])
@@ -451,7 +457,7 @@ public struct SessionPolicy: Sendable {
       (.recovering, .controlContended), (.unverified, .controlContended):
       return (
         state.moved(to: .contended),
-        [.closeChannel, .invalidateSession, .scheduleContentionRetry]
+        [.closeChannel, .invalidateSession, .failPendingRequests, .scheduleContentionRetry]
       )
 
     case (.contended, .backoffExpired):

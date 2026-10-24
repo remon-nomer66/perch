@@ -857,6 +857,15 @@ private let policy = SessionPolicy(maximumFailureCount: 3)
         #expect(next.target != nil, "\(phase) + \(event) lost its target")
       }
       #expect(next.failureCount >= 0)
+      // A request left in flight on an invalidated session holds the wire until its
+      // timeout, and that timeout then faults whatever session exists by then.
+      let (_, effects) = policy.reduce(state(phase, attempt: attempt), event)
+      if effects.contains(.invalidateSession) {
+        #expect(
+          effects.contains(.failPendingRequests),
+          "\(phase) + \(event) invalidated the session but left its requests pending"
+        )
+      }
       // Attempt numbers only ever move forward. Releasing must not rewind them, or
       // an abandoned attempt's completion matches the next one.
       if next.phase == .released {
