@@ -29,6 +29,32 @@ import Testing
   await coordinator.handle(.manualRelease)
 }
 
+@Test func aDeclaredReadTheDeviceNeverAnswersCostsOnlyThatReading() async throws {
+  // The codec is declared but never answered. The battery is, so the session is
+  // demonstrably alive: the silence must leave the codec empty and the session up,
+  // not tear it down and reconnect on every poll.
+  let opener = LinkOpener(script: [singleBatteryQuery: singleBatteryAnswer])
+  var timeouts = SessionCoordinator.Timeouts(
+    response: .milliseconds(100),
+    backoffUnit: .milliseconds(20)
+  )
+  timeouts.readingIntervalOverride = .milliseconds(50)
+  let coordinator = SessionCoordinator(
+    opener: opener,
+    verifier: FixedOutcomeVerifier(outcome: try verifiedOutcome(declaring: [0x20, 0x12])),
+    timeouts: timeouts
+  )
+
+  await coordinator.handle(.defaultOutputChanged(linkTarget))
+  #expect(await waitFor { await coordinator.readings.singleBattery == 50 })
+  // Several poll cycles, each with an unanswered codec query.
+  try await Task.sleep(for: .milliseconds(600))
+  #expect(await coordinator.phase == .ready)
+  #expect(opener.links.count == 1, "an unanswered optional read rebuilt the session")
+  #expect(await coordinator.readings.codec == nil)
+  await coordinator.handle(.manualRelease)
+}
+
 @Test func aSessionThatProvedItselfSurvivesRepeatedDrops() async throws {
   // The other half of the contract: a session whose first poll completed has proved
   // itself, so a later drop — a wearing change — starts the budget over. With a

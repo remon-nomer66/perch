@@ -223,31 +223,58 @@ public struct FeatureReader: Sendable {
     let declared = Set(functions.map(\.code))
     var readings = DeviceReadings()
 
+    // The primary battery is the one read that may fault the session: it is what
+    // lets a cycle notice a device that stopped answering altogether.
     if let query = Self.batteryQuery(declared: declared) {
       await readBattery(query, into: &readings, over: requests)
     }
-    await readCaseBattery(declared: declared, into: &readings, over: requests)
+    // Everything else is an optional facet of the device. Declared or not, one of
+    // these going unanswered must cost only its own reading: as requests, a single
+    // silent function tore the session down on every cycle and reconnected forever.
+    let optional = OptionalReads(base: requests)
+    await readCaseBattery(declared: declared, into: &readings, over: optional)
     if declared.contains(Self.codecFunction) {
-      readings.codec = try? await readCodec(over: requests)
+      readings.codec = try? await readCodec(over: optional)
     }
     if declared.contains(Self.equalizerFunction) {
-      readings.equalizer = try? await readEqualizer(over: requests)
+      readings.equalizer = try? await readEqualizer(over: optional)
     }
     if let inquiry = TandemNoiseControlType.inquiry(forDeclared: declared) {
-      readings.noiseControl = try? await readNoiseControl(inquiry, over: requests)
+      readings.noiseControl = try? await readNoiseControl(inquiry, over: optional)
     }
     let listeningFeatures = TandemListeningCatalog.features(forDeclared: declared)
     if !listeningFeatures.isEmpty {
-      readings.listeningMode = await readListening(listeningFeatures, over: requests)
+      readings.listeningMode = await readListening(listeningFeatures, over: optional)
     }
     if let inquiry = TandemSpeakToChatProtocol.inquiry(forDeclared: declared) {
-      readings.speakToChat = try? await readSpeakToChat(inquiry, over: requests)
+      readings.speakToChat = try? await readSpeakToChat(inquiry, over: optional)
     }
     let generalSlots = TandemGeneralSettingSlot.allCases.filter { declared.contains($0.rawValue) }
     if !generalSlots.isEmpty {
-      readings.sidetone = await readSidetone(declaredSlots: generalSlots, over: requests)
+      readings.sidetone = await readSidetone(declaredSlots: generalSlots, over: optional)
     }
     return readings
+  }
+
+  /// Sends every request on the probe path, whose timeout fails only the call. The
+  /// sub-readers keep saying `request`, so which path a read takes is decided once,
+  /// here, by what it is passed rather than at each call site.
+  private struct OptionalReads: SessionRequesting {
+    let base: SessionRequesting
+
+    func request(
+      _ build: @Sendable (UInt8) throws -> TandemFrame,
+      matching: @Sendable @escaping (TandemFrame) -> Bool
+    ) async throws -> TandemFrame {
+      try await base.probe(build, matching: matching)
+    }
+
+    func probe(
+      _ build: @Sendable (UInt8) throws -> TandemFrame,
+      matching: @Sendable @escaping (TandemFrame) -> Bool
+    ) async throws -> TandemFrame {
+      try await base.probe(build, matching: matching)
+    }
   }
 
   // MARK: - The older generation
@@ -415,10 +442,9 @@ public struct FeatureReader: Sendable {
   ///
   /// The capability inquiry is a probe, not a request: a slot's capability is an
   /// optional facet of the declaration, and a model that declares the slot but leaves
-  /// the label query unanswered must not tear down a working session over it. A slot
-  /// that did answer its capability demonstrably serves this conversation, so its
-  /// status and parameter reads follow the declared-feature rule and use plain
-  /// requests.
+  /// the label query unanswered must not tear down a working session over it. The
+  /// poll passes the probe path for the status and parameter reads too, so a slot
+  /// that answered its capability and then goes quiet costs only the reading.
   private func readSidetone(
     declaredSlots: [TandemGeneralSettingSlot],
     over requests: SessionRequesting
@@ -594,7 +620,8 @@ public struct FeatureReader: Sendable {
 
   /// `asProbe` sends the query on the probe path, whose timeout fails only itself.
   /// Used where silence is part of the conversation — the legacy battery shape
-  /// detection — and never for a query the declaration promises an answer to.
+  /// detection. The current dialect's optional reads get the probe path from the
+  /// requester they are handed instead.
   private func readBattery(
     _ query: TandemBatteryQuery,
     dialect: TandemDialect = .current,

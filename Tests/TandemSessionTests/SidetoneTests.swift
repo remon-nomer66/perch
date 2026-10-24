@@ -95,10 +95,12 @@ private func declared(_ codes: [UInt8]) -> [TandemSupportFunction] {
   #expect(requester.probedPayloads.contains([0xD0, 0xD2, 0x0B]))
   #expect(!requester.requestedPayloads.contains { $0.first == 0xD0 })
 
-  // The status and parameter of the slot that answered follow the declared-feature
-  // rule and go out as plain requests.
-  #expect(requester.requestedPayloads.contains([0xD2, 0xD2]))
-  #expect(requester.requestedPayloads.contains([0xD6, 0xD2]))
+  // The status and parameter of the slot that answered are probes too: sidetone is
+  // an optional facet of the poll, and a slot that goes quiet must cost only its
+  // own reading, never the session.
+  #expect(requester.probedPayloads.contains([0xD2, 0xD2]))
+  #expect(requester.probedPayloads.contains([0xD6, 0xD2]))
+  #expect(requester.requestedPayloads.isEmpty)
 }
 
 @Test func aSlotThatWillNotDescribeItselfIsSkippedForTheOnesThatDo() async throws {
