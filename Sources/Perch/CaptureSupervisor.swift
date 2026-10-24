@@ -57,6 +57,10 @@ struct CaptureSupervisor: Equatable {
     /// exchange, if the tap's "allowed" was wrong — or the tap went deaf after the audio
     /// that vouched for it — the original stays muted for at most this long.
     var vouchLimit: Duration = .seconds(180)
+    /// How many looks a decision that is due may wait for the tap's answer when the
+    /// question went unanswered (timed out, or an earlier one is still out) — which is
+    /// not the tap answering that it cannot tell, and must not decide like it.
+    var answerDeferrals = 3
 
     /// The longest gap between two looks that still counts as time watched: the interval
     /// overrun by both questions, with slack. Anything longer — the Mac slept, the main
@@ -106,6 +110,8 @@ struct CaptureSupervisor: Equatable {
     var sawNonGrant = false
     /// The one rebuild this attempt allows has been used.
     var rebuilt = false
+    /// Looks the due decision has waited for an answer.
+    var deferred = 0
   }
 
   /// Watching a running capture, so far.
@@ -122,6 +128,8 @@ struct CaptureSupervisor: Equatable {
     /// counting.
     var unheard: Duration = .zero
     var recovery = Recovery.none
+    /// Looks a due decision has waited for the tap's answer.
+    var deferred = 0
     var output = OutputWatch()
   }
 
@@ -174,7 +182,8 @@ struct CaptureSupervisor: Equatable {
   ///   - outputRunning: the spatialised output is playing. Watched once on.
   ///   - othersPlaying: whether a process other than Perch is outputting audio; nil when
   ///     that cannot be read. Asked only when the answer matters.
-  ///   - permission: asks the tap for the grant. Asked only when the answer matters.
+  ///   - permission: asks the tap for the grant; nil when no answer came in time. Asked
+  ///     only when the answer matters.
   ///
   /// The questions are round trips to coreaudiod that the caller runs elsewhere; the
   /// decision itself is pure, and runs wherever it is called from.
@@ -183,7 +192,7 @@ struct CaptureSupervisor: Equatable {
     outputRunning: Bool,
     after elapsed: Duration,
     othersPlaying: () async -> Bool?,
-    permission: () async -> SystemAudioPermission
+    permission: () async -> SystemAudioPermission?
   ) async -> Decision {
     let counted = elapsed <= timing.longestCountedStep(after: pollInterval) ? elapsed : .zero
     switch phase {
@@ -205,7 +214,7 @@ struct CaptureSupervisor: Equatable {
   private nonisolated(nonsending) mutating func confirm(
     hasSignal: Bool,
     _ confirmation: Confirmation,
-    permission: () async -> SystemAudioPermission
+    permission: () async -> SystemAudioPermission?
   ) async -> Decision {
     // Real audio is proof whatever the tap says about the grant.
     if hasSignal {
@@ -214,17 +223,25 @@ struct CaptureSupervisor: Equatable {
     }
     var next = confirmation
     let answer = await permission()
+    let due = next.elapsed >= timing.confirmDeadline
     switch answer {
-    case .granted where confirmation.sawNonGrant && !confirmation.rebuilt:
-      // The grant landed while this tap was live (it said no, or could not tell, before),
-      // and a tap built before the grant can stay silent. A fresh one, with a full window
-      // of its own.
+    case .granted? where confirmation.sawNonGrant && !confirmation.rebuilt:
+      // The grant landed while this tap was live (it said no, could not tell, or did not
+      // answer before), and a tap built before the grant can stay silent. A fresh one,
+      // with a full window of its own.
       phase = .confirming(Confirmation(rebuilt: true))
       return .rebuild
-    case .granted:
+    case .granted?:
       phase = .running(Watch(heardSignal: false))
       return .commit
-    case .denied, .unknown:
+    case nil where due && next.deferred < timing.answerDeferrals:
+      // The decision is due, but the question went unanswered: wait a look for the answer
+      // rather than decide on the lack of one.
+      next.deferred += 1
+      next.sawNonGrant = true
+      phase = .confirming(next)
+      return .hold
+    case .denied?, .unknown?, nil:
       next.sawDenial = next.sawDenial || answer == .denied
       next.sawNonGrant = true
       guard next.elapsed >= timing.confirmDeadline else {
@@ -241,7 +258,7 @@ struct CaptureSupervisor: Equatable {
     elapsed: Duration,
     _ watch: Watch,
     othersPlaying: () async -> Bool?,
-    permission: () async -> SystemAudioPermission
+    permission: () async -> SystemAudioPermission?
   ) async -> Decision {
     var next = watch
     next.heardSignal = watch.heardSignal || hasSignal
@@ -294,11 +311,17 @@ struct CaptureSupervisor: Equatable {
       let answer = await permission()
       if answer == .denied { return .revoke(.permissionDenied) }
       guard timedOut else { return keepWatching(next) }
+      if answer == nil, next.deferred < timing.answerDeferrals {
+        // Due, but unanswered: a healthy tap must not be given up on for a slow reply.
+        next.deferred += 1
+        return keepWatching(next)
+      }
       // "Allowed" is only believed once real audio has borne capture out. Without that,
       // a wrong answer — or a tap that may record but cannot — would keep the original
       // muted for good.
       guard answer == .granted, next.heardSignal else { return .revoke(.captureLost) }
       next.silent = .zero
+      next.deferred = 0
       next.recovery = .vouched
       return keepWatching(next)
     case .vouched:
@@ -306,11 +329,17 @@ struct CaptureSupervisor: Equatable {
       if next.unheard >= timing.vouchLimit { return .revoke(.captureLost) }
       guard timedOut else { return keepWatching(next) }
       switch await permission() {
-      case .granted:
+      case .granted?:
         next.silent = .zero
+        next.deferred = 0
         return keepWatching(next)
-      case .denied: return .revoke(.permissionDenied)
-      case .unknown: return .revoke(.captureLost)
+      case .denied?:
+        return .revoke(.permissionDenied)
+      case nil where next.deferred < timing.answerDeferrals:
+        next.deferred += 1
+        return keepWatching(next)
+      case .unknown?, nil:
+        return .revoke(.captureLost)
       }
     }
   }

@@ -119,7 +119,8 @@ private struct Harness {
     var built: [FakeEngine] = []
     /// n 個目に作るエンジンの許可の台本。尽きたら最後のものを使う。
     var scripts: [[SystemAudioPermission]]
-    /// あれば、作るエンジンの問い合わせはこれが解放されるまで戻らない。
+    /// あれば、次に作るエンジン（その1つだけ）の問い合わせは、これが解放されるまで
+    /// 戻らない。
     var probeHold: DispatchSemaphore?
     /// 新しく作るエンジンで音が流れているか。
     var flowing: Bool
@@ -135,6 +136,11 @@ private struct Harness {
     }
 
     var allStopped: Bool { built.allSatisfy { $0.stopped } }
+
+    func takeProbeHold() -> DispatchSemaphore? {
+      defer { probeHold = nil }
+      return probeHold
+    }
 
     init(scripts: [[SystemAudioPermission]], flowing: Bool) {
       self.scripts = scripts
@@ -165,7 +171,7 @@ private struct Harness {
         if engines.failToStart { throw StartFailure() }
         let answers = engines.scripts[min(engines.built.count, engines.scripts.count - 1)]
         let engine = FakeEngine(
-          script: PermissionScript(answers, hold: engines.probeHold),
+          script: PermissionScript(answers, hold: engines.takeProbeHold()),
           flowing: engines.flowing,
           outputRunning: engines.outputRunning
         )
@@ -507,6 +513,25 @@ func hungProbeCountsAsUnknown() async {
   #expect(harness.controller.revocation == .noAudioDetected)
   #expect(script.asked == 1)
   #expect(script.answered == 0)
+  hold.signal()
+}
+
+@MainActor
+@Test("前の試みの問い合わせが戻らないままでも、オンにし直した試みの問い合わせは塞がれない")
+func hungProbeFromAnEarlierAttemptDoesNotBlockTheNextOne() async {
+  let hold = DispatchSemaphore(value: 0)
+  let harness = Harness(permissions: [[.granted]], probeHold: hold)
+  harness.controller.setEnabled(true)
+  let first = harness.engines.built[0]
+  await harness.drain { first.script.asked >= 1 }
+  harness.controller.setEnabled(false)
+
+  // 1つ目のタップへの問い合わせは戻らないまま。新しい試みのタップには答えがすぐ戻る。
+  harness.controller.setEnabled(true)
+  await harness.settle()
+  #expect(harness.controller.isEnabled)
+  #expect(harness.engines.built.count == 2)
+  #expect(first.script.answered == 0)
   hold.signal()
 }
 

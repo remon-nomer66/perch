@@ -24,6 +24,8 @@ import Testing
 //  - 空間化した音の出力（AVAudioEngine）が止まれば、構成変更の作り直しを待つ猶予
 //    （2秒）の後で1回作り直し、それでも止まるなら取り消す
 //  - スリープ明けなどで観測の間が大きく空いたら、その回はどのタイマーも進めない
+//  - 問い合わせの「答えなし」（打ち切り・前の問い合わせがまだ戻らない）は、タップの
+//    「判定できない」とは別。判断の観測で答えが無ければ、3回まで判断を持ち越す
 //  - 許可ありの答えで居座れるのは、最後の実音から（他が再生中の時間で数えて）3分まで。
 //    無音のまま出力を開いているタブだけなら数秒では取り消さないが、いつまでもは
 //    居座らない
@@ -38,7 +40,7 @@ private func look(
   outputRunning: Bool = true,
   after elapsed: Duration? = nil,
   othersPlaying: () -> Bool? = { false },
-  permission: () -> SystemAudioPermission
+  permission: () -> SystemAudioPermission?
 ) async -> Decision {
   await supervisor.observe(
     hasSignal: signal,
@@ -49,14 +51,15 @@ private func look(
   )
 }
 
-/// 1回の観測で supervisor に見せるもの。
+/// 1回の観測で supervisor に見せるもの。許可の nil は「答えなし」。
 private struct Look: Sendable {
   let signal: Bool
-  let permission: SystemAudioPermission
+  let permission: SystemAudioPermission?
 
   static let silentGranted = Look(signal: false, permission: .granted)
   static let silentDenied = Look(signal: false, permission: .denied)
   static let silentUnknown = Look(signal: false, permission: .unknown)
+  static let silentNoAnswer = Look(signal: false, permission: nil)
   static let audible = Look(signal: true, permission: .unknown)
 }
 
@@ -144,6 +147,29 @@ private let scenarios: [Scenario] = [
     decisions: [.hold, .rebuild] + holds(14) + [.commit]
   ),
   Scenario(
+    name: "期限の観測で答えが無ければ判断を持ち越し、答えが来ればそれで決める",
+    looks: Array(repeating: .silentDenied, count: 14)
+      + [.silentNoAnswer, .silentNoAnswer, .silentGranted, .silentGranted],
+    decisions: holds(14) + [.hold, .hold, .rebuild, .commit]
+  ),
+  Scenario(
+    name: "期限の観測で答えなしが続けば、持ち越しは3回まで（その後は判定できないとして決める）",
+    looks: Array(repeating: .silentUnknown, count: 14)
+      + Array(repeating: .silentNoAnswer, count: 4),
+    decisions: holds(17) + [.revoke(.noAudioDetected)]
+  ),
+  Scenario(
+    name: "許可なしを見ていれば、答えなしの持ち越しの後も理由は許可なし",
+    looks: Array(repeating: .silentDenied, count: 14)
+      + Array(repeating: .silentNoAnswer, count: 4),
+    decisions: holds(17) + [.revoke(.permissionDenied)]
+  ),
+  Scenario(
+    name: "期限前の答えなしは許可あり以外として数える: 後で許可ありが来れば作り直す",
+    looks: [.silentNoAnswer, .silentGranted, .silentGranted],
+    decisions: [.hold, .rebuild, .commit]
+  ),
+  Scenario(
     name: "一度でも許可なしと言われ、期限で判定できないなら、理由は許可なし",
     looks: [.silentDenied] + Array(repeating: .silentUnknown, count: 14),
     decisions: holdsUntilDeadline(then: .revoke(.permissionDenied))
@@ -189,7 +215,8 @@ private struct WatchLook: Sendable {
   let signal: Bool
   /// 他のプロセスが音を出しているか。nil は読めなかった。
   let othersPlaying: Bool?
-  var permission = SystemAudioPermission.granted
+  /// nil は「答えなし」。
+  var permission: SystemAudioPermission? = .granted
   /// 空間化した音の出力が動いているか。
   var outputRunning = true
 
@@ -199,6 +226,7 @@ private struct WatchLook: Sendable {
   static let stalled = WatchLook(signal: false, othersPlaying: true)
   static let stalledDenied = WatchLook(signal: false, othersPlaying: true, permission: .denied)
   static let stalledUnknown = WatchLook(signal: false, othersPlaying: true, permission: .unknown)
+  static let stalledNoAnswer = WatchLook(signal: false, othersPlaying: true, permission: nil)
   /// 取り込みは届いているが、空間化した音を出す側が止まっている。
   static let deadOutput = WatchLook(signal: true, othersPlaying: true, outputRunning: false)
 }
@@ -289,6 +317,21 @@ private let watchScenarios: [WatchScenario] = [
     looks: [.flowing] + stall()
       + [.stalledUnknown, .stalled, .stalledUnknown, .stalledUnknown, .stalled] + stall(5),
     decisions: [.hold] + holds(4) + [.rebuild] + holds(5) + holds(5)
+  ),
+  WatchScenario(
+    name: "作り直したタップの期限の観測で答えが無ければ持ち越し、許可ありが来れば（実音の後なら）オンのまま",
+    looks: [.flowing] + stall() + stall(4) + [.stalledNoAnswer, .stalled] + stall(5),
+    decisions: [.hold] + holds(4) + [.rebuild] + holds(4) + [.hold, .hold] + holds(5)
+  ),
+  WatchScenario(
+    name: "作り直したタップの答えなしが続けば、3回まで持ち越してから取り消す",
+    looks: [.flowing] + stall() + stall(4) + stall(4, .stalledNoAnswer),
+    decisions: [.hold] + holds(4) + [.rebuild] + holds(4) + holds(3) + [.revoke(.captureLost)]
+  ),
+  WatchScenario(
+    name: "許可ありと確かめた後の問い直しで答えが無くても、すぐには取り消さない",
+    looks: [.flowing] + stall() + stall() + stall(4) + [.stalledNoAnswer, .stalled] + stall(3),
+    decisions: [.hold] + holds(4) + [.rebuild] + holds(5) + holds(4) + [.hold, .hold] + holds(3)
   ),
   WatchScenario(
     name: "作り直したタップの答えに許可なしが混じれば、その場で取り消す",
@@ -426,7 +469,7 @@ func unprovenGrantNeverHoldsASilentMac(answers: [SystemAudioPermission]) async {
 func watchProbesOnlyAfterRebuilding() async {
   var supervisor = await runningSupervisor()
   var probes = 0
-  let probe = { () -> SystemAudioPermission in
+  let probe = { () -> SystemAudioPermission? in
     probes += 1
     return .granted
   }
@@ -446,7 +489,7 @@ func vouchedTapIsAskedOncePerTimeout() async {
   var supervisor = await runningSupervisor()
   _ = await look(&supervisor, signal: true) { .granted }  // 実音を聞いた後
   var probes = 0
-  let probe = { () -> SystemAudioPermission in
+  let probe = { () -> SystemAudioPermission? in
     probes += 1
     return .granted
   }
