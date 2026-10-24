@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import os
 
 /// What the hosted view needs to draw the notch in one value: the state it is in,
 /// where the cutout sits, and whether it was synthesised on a screen with none — the
@@ -79,8 +80,17 @@ public final class NotchController: ObservableObject {
   /// hosted view widens the bar by, or the target and the drawing part ways.
   public var isBarVisible: (() -> Bool)?
 
+  private static let log = Logger(subsystem: "dev.perch.mac", category: "notch")
+
   private let pointer = PointerMonitor()
   private var window: NotchWindow?
+  /// Stands over the closed bar so a press on it is ours rather than the menu bar's;
+  /// see `NotchClickCatcher`. Lives and dies with the strip.
+  private var catcher: NotchClickCatcher?
+  /// The last answer to "is the pointer over the notch", kept only so the log records
+  /// when it changes rather than ten times a second.
+  private var lastOverNotch: Bool?
+  private var doubleClicks = DoubleClickFilter()
   /// Whether `start()` is in effect. `refresh()` leans on it so a settings change
   /// cannot rebuild a notch the user has switched off.
   private var isRunning = false
@@ -130,11 +140,12 @@ public final class NotchController: ObservableObject {
     pointer.onPointerMoved = { [weak self] location in
       MainActor.assumeIsolated { self?.pointerMoved(to: location) }
     }
-    pointer.onClick = { [weak self] location in
-      MainActor.assumeIsolated { self?.clicked(at: location) }
+    pointer.onClick = { [weak self] click in
+      MainActor.assumeIsolated { self?.clicked(click) }
     }
     pointer.start()
     isRunning = true
+    Self.log.debug("start: usable notch \(self.hasUsableNotch), virtual \(self.isVirtualNotch)")
   }
 
   /// Re-evaluates which screen hosts the notch without tearing anything down, for the
@@ -154,15 +165,17 @@ public final class NotchController: ObservableObject {
   }
 
   public func stop() {
+    if isRunning { Self.log.debug("stop") }
     isRunning = false
     if let screenObserver { NotificationCenter.default.removeObserver(screenObserver) }
     screenObserver = nil
     pointer.stop()
-    window?.orderOut(nil)
-    window = nil
+    tearDownWindows()
+    lastOverNotch = nil
     // A fresh presenter, so a panel left open does not reappear open when the notch
     // is switched back on later.
     presenter = NotchPresenter()
+    doubleClicks = DoubleClickFilter()
     if presentation != .closed { presentation = .closed }
   }
 
@@ -195,8 +208,7 @@ public final class NotchController: ObservableObject {
     if virtual != isVirtualNotch { isVirtualNotch = virtual }
 
     guard let screen, geometry != nil else {
-      window?.orderOut(nil)
-      window = nil
+      tearDownWindows()
       return
     }
 
@@ -219,7 +231,17 @@ public final class NotchController: ObservableObject {
     }
     window.orderFrontRegardless()
     self.window = window
+    let catcher = self.catcher ?? NotchClickCatcher()
+    catcher.orderFrontRegardless()
+    self.catcher = catcher
     apply()
+  }
+
+  private func tearDownWindows() {
+    window?.orderOut(nil)
+    window = nil
+    catcher?.orderOut(nil)
+    catcher = nil
   }
 
   /// Room kept under the panel so its shadow can fade out inside the window instead
@@ -243,18 +265,39 @@ public final class NotchController: ObservableObject {
 
   private func pointerMoved(to location: CGPoint) {
     guard geometry != nil else { return }
-    presenter.handle(.pointerMoved(isOverNotch: isOverNotch(location)))
+    let overNotch = isOverNotch(location)
+    if overNotch != lastOverNotch {
+      lastOverNotch = overNotch
+      Self.log.debug("pointer over notch: \(overNotch)")
+    }
+    presenter.handle(.pointerMoved(isOverNotch: overNotch))
     apply()
   }
 
-  private func clicked(at location: CGPoint) {
+  private func clicked(_ click: PointerClick) {
     guard geometry != nil else { return }
-    presenter.handle(
-      .clicked(
-        isOverNotch: isOverNotch(location),
-        isInsidePanel: panelTarget.contains(location)
-      )
+    let overNotch = isOverNotch(click.location)
+    let insidePanel = panelTarget.contains(click.location)
+    let catcherNumber = catcher?.windowNumber
+    Self.log.debug(
+      """
+      click via \(click.route.rawValue, privacy: .public) at \
+      (\(Double(click.location.x)), \(Double(click.location.y))), count \
+      \(click.clickCount): over notch \(overNotch), on catcher \
+      \(click.landed(onWindow: catcherNumber)), inside panel \(insidePanel)
+      """
     )
+    let event = Self.presenterEvent(
+      for: click,
+      presentation: presenter.presentation,
+      catcherWindowNumber: catcherNumber,
+      isOverNotch: overNotch,
+      isInsidePanel: insidePanel
+    )
+    guard doubleClicks.pass(event, of: click, to: &presenter) else {
+      Self.log.debug("click held back: repeats the press that just opened or closed")
+      return
+    }
     apply()
   }
 
@@ -285,6 +328,12 @@ public final class NotchController: ObservableObject {
 
   private func apply() {
     if presentation != presenter.presentation {
+      Self.log.debug(
+        """
+        presentation \(String(describing: self.presentation), privacy: .public) -> \
+        \(String(describing: self.presenter.presentation), privacy: .public)
+        """
+      )
       presentation = presenter.presentation
       // One clean frame after the open/close spring settles. On a transparent
       // window the animation's last partial frame can stay on the glass; pointer
@@ -310,9 +359,20 @@ public final class NotchController: ObservableObject {
       )
       if window.frame != strip { window.setFrame(strip, display: true) }
     }
-    // The bar is drawn even while closed, but it must never intercept a click meant
-    // for the menu bar behind it.
+    // The bar is drawn even while closed, but the strip must never intercept a click
+    // meant for the menu bar behind it; only the catcher, over the bar alone, does.
+    // Both follow the state on every call — the pointer's cadence and the poll's — so a
+    // bar that widened or shrank with the pointer still is caught up within a tick.
     window?.setInteractive(presenter.presentation == .opened)
+    catcher?.cover(
+      screenFrame.flatMap { screenFrame in
+        currentNotchTarget.flatMap { target in
+          Self.catcherFrame(
+            presentation: presenter.presentation, notchTarget: target, screenFrame: screenFrame
+          )
+        }
+      }
+    )
   }
 
   fileprivate func body(_ render: NotchRender) -> AnyView {
