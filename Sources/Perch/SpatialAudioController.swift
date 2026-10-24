@@ -73,6 +73,9 @@ final class SpatialAudioController: ObservableObject {
   /// The last grant the tap reported, so the log records changes rather than every look.
   private var loggedPermission: SystemAudioPermission??
   private var superviseTask: Task<Void, Never>?
+  /// The running supervision loop, so a test can wait for a look whose questions are
+  /// still out to finish, rather than guessing how long that takes.
+  var supervision: Task<Void, Never>? { superviseTask }
   private var tempoTask: Task<Void, Never>?
   private var configRebuildTask: Task<Void, Never>?
   private let defaults: UserDefaults

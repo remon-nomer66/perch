@@ -1,3 +1,4 @@
+import Dispatch
 import Foundation
 import SpatialAudioKit
 import Testing
@@ -10,26 +11,31 @@ import os
 // CaptureSupervisorTests の表にあり、ここではそれが結線どおりに効くことを見る:
 // エンジンを作る・止める・作り直す、オン/取り消しの状態と理由、オンの間の見張り、
 // 問い合わせを MainActor の外で時間を区切って行うこと。
+// 壁時計の長さには頼らない。時間は観測ごとに進む時計で数え、戻らない問い合わせは
+// テストが解放するまで戻らないラッチで表す（負荷がかかっても結果が変わらないように）。
 
 /// 問い合わせごとに順に返す許可の判定（尽きたら最後のものを返し続ける）。問い合わせは
 /// MainActor の外で走るので、記録はロックで守る。
 private final class PermissionScript: Sendable {
   private struct State {
     var asked = 0
+    var answered = 0
     var askedOnMain = false
   }
 
   private let answers: [SystemAudioPermission]
-  /// 1回の問い合わせにかける時間（戻らない問い合わせの代わり）。
-  private let delay: TimeInterval
+  /// あれば、問い合わせはこれが解放されるまで戻らない（戻らない問い合わせの代わり）。
+  private let hold: DispatchSemaphore?
   private let state = OSAllocatedUnfairLock(initialState: State())
 
-  init(_ answers: [SystemAudioPermission], delay: TimeInterval = 0) {
+  init(_ answers: [SystemAudioPermission], hold: DispatchSemaphore? = nil) {
     self.answers = answers
-    self.delay = delay
+    self.hold = hold
   }
 
+  /// 問い合わせが始まった回数と、戻った回数。
   var asked: Int { state.withLock { $0.asked } }
+  var answered: Int { state.withLock { $0.answered } }
   var askedOnMain: Bool { state.withLock { $0.askedOnMain } }
 
   func answer() -> SystemAudioPermission {
@@ -39,7 +45,8 @@ private final class PermissionScript: Sendable {
       state.askedOnMain = state.askedOnMain || onMain
       return state.asked
     }
-    if delay > 0 { Thread.sleep(forTimeInterval: delay) }
+    hold?.wait()
+    state.withLock { $0.answered += 1 }
     return answers[min(index, answers.count - 1)]
   }
 }
@@ -108,8 +115,8 @@ private struct Harness {
     var built: [FakeEngine] = []
     /// n 個目に作るエンジンの許可の台本。尽きたら最後のものを使う。
     var scripts: [[SystemAudioPermission]]
-    /// 1回の問い合わせにかける時間。
-    var probeDelay: TimeInterval = 0
+    /// あれば、作るエンジンの問い合わせはこれが解放されるまで戻らない。
+    var probeHold: DispatchSemaphore?
     /// 新しく作るエンジンで音が流れているか。
     var flowing: Bool
     /// 新しく作るエンジンの出力が動いているか。
@@ -139,11 +146,11 @@ private struct Harness {
     flowing: Bool = false,
     timing: CaptureSupervisor.Timing = Harness.fastTiming,
     clockStep: Duration = .milliseconds(1),
-    probeTimeout: Duration = .seconds(2),
-    probeDelay: TimeInterval = 0
+    probeTimeout: Duration = .seconds(30),
+    probeHold: DispatchSemaphore? = nil
   ) {
     let engines = Engines(scripts: permissions, flowing: flowing)
-    engines.probeDelay = probeDelay
+    engines.probeHold = probeHold
     self.engines = engines
     let defaults = UserDefaults(suiteName: "SpatialAudioControllerTests-\(UUID().uuidString)")!
     let clock = SteppingClock(step: clockStep)
@@ -154,7 +161,7 @@ private struct Harness {
         if engines.failToStart { throw StartFailure() }
         let answers = engines.scripts[min(engines.built.count, engines.scripts.count - 1)]
         let engine = FakeEngine(
-          script: PermissionScript(answers, delay: engines.probeDelay),
+          script: PermissionScript(answers, hold: engines.probeHold),
           flowing: engines.flowing,
           outputRunning: engines.outputRunning
         )
@@ -181,7 +188,7 @@ private struct Harness {
 
   /// 監視タスク（MainActor 上の別タスク）に回す。条件が満ちるまで譲る。
   func drain(until condition: () -> Bool) async {
-    for _ in 0..<1_000 where !condition() {
+    for _ in 0..<5_000 where !condition() {
       try? await Task.sleep(for: .milliseconds(2))
     }
   }
@@ -472,18 +479,21 @@ func permissionProbeRunsOffTheMainActor() async {
 @MainActor
 @Test("問い合わせが戻らなくても MainActor は止まらず、判定できないとして期限で取り消す")
 func hungProbeCountsAsUnknown() async {
-  // 1回の問い合わせに 0.5 秒かかるが、待つのは 20ms まで。戻らない間の問い合わせは
-  // 積まずに「判定できない」とする。
+  // 問い合わせはテストが解放するまで戻らない。待つのは 20ms まで。戻らない間の
+  // 問い合わせは積まずに「判定できない」とする。
+  let hold = DispatchSemaphore(value: 0)
   let harness = Harness(
-    permissions: [[.granted]], probeTimeout: .milliseconds(20), probeDelay: 0.5
+    permissions: [[.granted]], probeTimeout: .milliseconds(20), probeHold: hold
   )
-  let started = ContinuousClock.now
   harness.controller.setEnabled(true)
   await harness.settle()
 
+  // 問い合わせがまだ戻っていないうちに、確認は期限まで進んで終わっている。
+  let script = harness.engines.built[0].script
   #expect(harness.controller.revocation == .noAudioDetected)
-  #expect(ContinuousClock.now - started < .milliseconds(450))
-  #expect(harness.engines.built[0].script.asked == 1)
+  #expect(script.asked == 1)
+  #expect(script.answered == 0)
+  hold.signal()
 }
 
 @MainActor
@@ -505,13 +515,20 @@ func deadlineFollowsTheClock() async {
 @MainActor
 @Test("問い合わせの最中にオフにされたら、戻ってきた答えは捨てる（勝手にオンへ戻らない）")
 func answerArrivingAfterTurningOffIsDropped() async {
-  let harness = Harness(permissions: [[.granted]], probeDelay: 0.15)
+  // 許可ありの答えは、オフにした後でしか戻らない。捨てなければオンへ戻ってしまう。
+  let hold = DispatchSemaphore(value: 0)
+  let harness = Harness(permissions: [[.granted]], probeHold: hold)
   harness.controller.setEnabled(true)
   let engine = harness.engines.built[0]
+  let supervision = harness.controller.supervision
   await harness.drain { engine.script.asked >= 1 }
+  #expect(engine.script.asked == 1)
   harness.controller.setEnabled(false)
-  try? await Task.sleep(for: .milliseconds(300))
+  hold.signal()
+  // 答えが戻り、見張りがそれを受け取って終わるまで待つ。
+  await supervision?.value
 
+  #expect(engine.script.answered == 1)
   #expect(!harness.controller.isEnabled)
   #expect(!harness.controller.isStarting)
   #expect(harness.controller.errorMessage == nil)

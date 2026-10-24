@@ -1,3 +1,4 @@
+import Dispatch
 import Foundation
 import Testing
 import os
@@ -7,6 +8,8 @@ import os
 // 同期の往復（coreaudiod への問い合わせ）を MainActor の外で、時間を区切って行う口。
 // 約束: 外で走る / 時間内に戻らなければ「答えなし」/ 戻らない呼び出しの後ろに次を
 // 積まない（ブロックしたスレッドを増やさない）/ 戻ってくれば次はまた走る。
+// 壁時計の上限は見ない。戻らない呼び出しはテストが解放するまで戻らないラッチで表し、
+// 起きた順序と回数だけを確かめる（負荷がかかっても結果が変わらないように）。
 
 /// 呼ばれた回数と、どのスレッドで走ったかを記録する。
 private final class Calls: Sendable {
@@ -22,10 +25,18 @@ private final class Calls: Sendable {
   }
 }
 
+/// 条件が満ちるまで譲る。回数で区切り、壁時計の長さは問わない。
+@MainActor
+private func eventually(_ condition: () -> Bool) async {
+  for _ in 0..<2_000 where !condition() {
+    try? await Task.sleep(for: .milliseconds(5))
+  }
+}
+
 @MainActor
 @Test("すぐ戻る呼び出しは、その答えを返す。MainActor から呼んでも、走るのは外")
 func quickCallAnswersOffTheMainThread() async {
-  let gate = BlockingCallGate<Int>(label: "test.quick", timeout: .seconds(2))
+  let gate = BlockingCallGate<Int>(label: "test.quick", timeout: .seconds(60))
   let calls = Calls()
   let answer = await gate.run {
     calls.record()
@@ -37,36 +48,41 @@ func quickCallAnswersOffTheMainThread() async {
 }
 
 @MainActor
-@Test("時間内に戻らなければ「答えなし」。戻らないあいだの次の呼び出しは走らせずに「答えなし」")
-func slowCallTimesOutWithoutPilingUp() async {
-  let gate = BlockingCallGate<Int>(label: "test.slow", timeout: .milliseconds(20))
-  let calls = Calls()
-  let started = ContinuousClock.now
-  let first = await gate.run {
-    calls.record()
-    Thread.sleep(forTimeInterval: 0.4)
+@Test("戻らない呼び出しは「答えなし」。その間の次の呼び出しは走らせずに「答えなし」。戻れば次はまた走る")
+func hungCallAnswersNothingAndDoesNotPileUp() async {
+  let gate = BlockingCallGate<Int>(label: "test.hung", timeout: .milliseconds(50))
+  let release = DispatchSemaphore(value: 0)
+  let first = Calls()
+  let firstReturned = Calls()
+
+  let firstAnswer = await gate.run {
+    first.record()
+    release.wait()  // テストが解放するまで戻らない
+    firstReturned.record()
     return 1
   }
-  #expect(first == nil)
-  #expect(ContinuousClock.now - started < .milliseconds(300))
+  #expect(firstAnswer == nil)
 
-  let second = await gate.run {
-    calls.record()
+  let second = Calls()
+  let secondAnswer = await gate.run {
+    second.record()
     return 2
   }
-  #expect(second == nil)
-  #expect(calls.count == 1)
-}
+  #expect(secondAnswer == nil)
+  #expect(second.count == 0)
 
-@MainActor
-@Test("遅れていた呼び出しが戻れば、次はまた走る")
-func gateReopensOnceTheSlowCallReturns() async {
-  let gate = BlockingCallGate<Int>(label: "test.reopen", timeout: .milliseconds(20))
-  _ = await gate.run {
-    Thread.sleep(forTimeInterval: 0.1)
-    return 1
+  // 1回目は確かに走り始めていて、まだ戻っていない。
+  await eventually { first.count == 1 }
+  #expect(first.count == 1)
+  #expect(firstReturned.count == 0)
+
+  release.signal()
+  await eventually { firstReturned.count == 1 }
+  var reopened: Int?
+  for _ in 0..<2_000 where reopened == nil {
+    reopened = await gate.run { 3 }
+    if reopened == nil { try? await Task.sleep(for: .milliseconds(5)) }
   }
-  try? await Task.sleep(for: .milliseconds(250))
-  let answer = await gate.run { 3 }
-  #expect(answer == 3)
+  #expect(reopened == 3)
+  #expect(second.count == 0)
 }
