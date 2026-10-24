@@ -74,7 +74,10 @@ run_probe() {
     return 1
   fi
 
-  acquire "$owner" "probe" "$label${note:+: $note}"
+  # Callers run this under `set +e` to collect the probe's exit code, so a refused
+  # acquire must stop here explicitly — before the trap, which would release a lock that
+  # is not ours. Under `set +e` alone, BUSY was printed and the probe ran anyway.
+  acquire "$owner" "probe" "$label${note:+: $note}" || return 1
   # Release on any exit, including SIGINT/SIGTERM. Bash delivers the trap only after
   # the foreground probe finishes, so the lock is never released while the probe still
   # holds the channel. Ctrl-C also reaches the probe itself (same process group), which
