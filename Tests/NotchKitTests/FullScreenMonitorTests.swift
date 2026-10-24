@@ -24,7 +24,7 @@ private let menuBarLevel = Int(CGWindowLevelForKey(.mainMenuWindow))
 
 /// A row shaped like the real menu bar window: full width, at the very top. Inside
 /// a full-screen space this window stays listed — visibility is proven only
-/// together with a status item.
+/// together with a status item or the desktop.
 private func menuBarRow() -> [String: Any] {
   windowRow(layer: menuBarLevel, bounds: CGRect(x: 0, y: 0, width: 1512, height: 37))
 }
@@ -33,8 +33,24 @@ private let statusItemLevel = Int(CGWindowLevelForKey(.statusWindow))
 
 /// A row shaped like a real status item (the clock is always one): narrow, in the
 /// bar. These leave the window list when the menu bar genuinely hides.
-private func statusItemRow() -> [String: Any] {
-  windowRow(layer: statusItemLevel, bounds: CGRect(x: 1400, y: 0, width: 40, height: 37))
+private func statusItemRow(pid: pid_t = 500) -> [String: Any] {
+  windowRow(
+    layer: statusItemLevel, bounds: CGRect(x: 1400, y: 0, width: 40, height: 37), pid: pid
+  )
+}
+
+/// Reads as macOS 14 through 26 do, where the bar's status items prove it visible.
+private func readThrough26(
+  _ windows: [[String: Any]], screenFrame: CGRect = builtIn, primaryFrame: CGRect = builtIn
+) -> FullScreenReading {
+  FullScreenRule.read(
+    windows: windows,
+    screenFrame: screenFrame,
+    safeAreaTop: 37,
+    primaryFrame: primaryFrame,
+    ownPID: ownPID,
+    witness: .statusItems
+  )
 }
 
 @Test func anOrdinaryDesktopIsNotTaken() {
@@ -45,11 +61,7 @@ private func statusItemRow() -> [String: Any] {
     windowRow(layer: 0, bounds: CGRect(x: 0, y: 37, width: 1512, height: 945)),
   ]
 
-  #expect(
-    !FullScreenMonitor.isTaken(
-      windows: windows, screenFrame: builtIn, safeAreaTop: 37, primaryFrame: builtIn, ownPID: ownPID
-    )
-  )
+  #expect(!readThrough26(windows).isTaken)
 }
 
 @Test func aFullScreenWindowWithTheMenuBarGoneIsTaken() {
@@ -57,11 +69,7 @@ private func statusItemRow() -> [String: Any] {
     windowRow(layer: 0, bounds: builtIn)
   ]
 
-  #expect(
-    FullScreenMonitor.isTaken(
-      windows: windows, screenFrame: builtIn, safeAreaTop: 37, primaryFrame: builtIn, ownPID: ownPID
-    )
-  )
+  #expect(readThrough26(windows).isTaken)
 }
 
 @Test func splitViewIsCaughtThroughItsWiderPane() {
@@ -72,11 +80,7 @@ private func statusItemRow() -> [String: Any] {
     windowRow(layer: 0, bounds: CGRect(x: 910, y: 0, width: 602, height: 982)),
   ]
 
-  #expect(
-    FullScreenMonitor.isTaken(
-      windows: windows, screenFrame: builtIn, safeAreaTop: 37, primaryFrame: builtIn, ownPID: ownPID
-    )
-  )
+  #expect(readThrough26(windows).isTaken)
 }
 
 @Test func aVisibleMenuBarVetoesAWideWindowTouchingTheTop() {
@@ -89,11 +93,7 @@ private func statusItemRow() -> [String: Any] {
     windowRow(layer: 0, bounds: builtIn),
   ]
 
-  #expect(
-    !FullScreenMonitor.isTaken(
-      windows: windows, screenFrame: builtIn, safeAreaTop: 37, primaryFrame: builtIn, ownPID: ownPID
-    )
-  )
+  #expect(!readThrough26(windows).isTaken)
 }
 
 @Test func aNarrowOverlayAtTheMenuBarLevelDoesNotPoseAsTheMenuBar() {
@@ -104,11 +104,7 @@ private func statusItemRow() -> [String: Any] {
     windowRow(layer: 0, bounds: builtIn),
   ]
 
-  #expect(
-    FullScreenMonitor.isTaken(
-      windows: windows, screenFrame: builtIn, safeAreaTop: 37, primaryFrame: builtIn, ownPID: ownPID
-    )
-  )
+  #expect(readThrough26(windows).isTaken)
 }
 
 @Test func ourOwnStripWindowDoesNotCountAsATakeover() {
@@ -116,11 +112,7 @@ private func statusItemRow() -> [String: Any] {
     windowRow(layer: 0, bounds: builtIn, pid: ownPID)
   ]
 
-  #expect(
-    !FullScreenMonitor.isTaken(
-      windows: windows, screenFrame: builtIn, safeAreaTop: 37, primaryFrame: builtIn, ownPID: ownPID
-    )
-  )
+  #expect(!readThrough26(windows).isTaken)
 }
 
 @Test func aFullyTransparentWindowDoesNotCount() {
@@ -128,11 +120,7 @@ private func statusItemRow() -> [String: Any] {
     windowRow(layer: 0, bounds: builtIn, alpha: 0)
   ]
 
-  #expect(
-    !FullScreenMonitor.isTaken(
-      windows: windows, screenFrame: builtIn, safeAreaTop: 37, primaryFrame: builtIn, ownPID: ownPID
-    )
-  )
+  #expect(!readThrough26(windows).isTaken)
 }
 
 @Test func aMaximizedWindowUnderTheVisibleMenuBarDoesNotCount() {
@@ -145,11 +133,7 @@ private func statusItemRow() -> [String: Any] {
     windowRow(layer: 0, bounds: CGRect(x: 0, y: 37, width: 1512, height: 945)),
   ]
 
-  #expect(
-    !FullScreenMonitor.isTaken(
-      windows: windows, screenFrame: builtIn, safeAreaTop: 37, primaryFrame: builtIn, ownPID: ownPID
-    )
-  )
+  #expect(!readThrough26(windows).isTaken)
 }
 
 @Test func aLetterboxedFullScreenWindowIsTaken() {
@@ -161,11 +145,7 @@ private func statusItemRow() -> [String: Any] {
     windowRow(layer: 0, bounds: CGRect(x: 0, y: 37, width: 1512, height: 945))
   ]
 
-  #expect(
-    FullScreenMonitor.isTaken(
-      windows: windows, screenFrame: builtIn, safeAreaTop: 37, primaryFrame: builtIn, ownPID: ownPID
-    )
-  )
+  #expect(readThrough26(windows).isTaken)
 }
 
 @Test func aWindowWellBelowTheTopBandDoesNotCount() {
@@ -175,27 +155,46 @@ private func statusItemRow() -> [String: Any] {
     windowRow(layer: 0, bounds: CGRect(x: 100, y: 200, width: 1200, height: 700))
   ]
 
-  #expect(
-    !FullScreenMonitor.isTaken(
-      windows: windows, screenFrame: builtIn, safeAreaTop: 37, primaryFrame: builtIn, ownPID: ownPID
-    )
-  )
+  #expect(!readThrough26(windows).isTaken)
 }
 
-@Test func aListedMenuBarWithoutStatusItemsDoesNotVeto() {
-  // The shape of a real full-screen space, observed live: the menu bar's window
-  // stays in the on-screen list — opaque — while its status items leave. The bar's
-  // window alone must not read as "visible", or full screen is never detected.
+@Test func theMenuBarsWindowAloneDoesNotVeto() {
+  // The shape of a real full-screen space before macOS 27, observed live: the menu
+  // bar's window stays in the on-screen list — opaque — while its status items leave.
+  // The bar's window alone must not read as "visible", or full screen is never detected.
+  // (macOS 27 lists no status items even on the desktop, where this shape is an
+  // ordinary desktop but for the desktop itself; see the macOS 27 cases below.)
   let windows = [
     menuBarRow(),
     windowRow(layer: 0, bounds: CGRect(x: 0, y: 37, width: 1512, height: 945)),
   ]
 
-  #expect(
-    FullScreenMonitor.isTaken(
-      windows: windows, screenFrame: builtIn, safeAreaTop: 37, primaryFrame: builtIn, ownPID: ownPID
-    )
-  )
+  #expect(readThrough26(windows) == FullScreenReading(reason: .menuBarWithoutStatusItems))
+  #expect(readThrough26(windows).isTaken)
+}
+
+@Test func throughMacOS26TheDesktopDoesNotVouchForTheBar() {
+  // Before macOS 27, full-screen spaces were only ever verified by their status items,
+  // so those releases keep that rule unchanged: the desktop is not consulted there.
+  let windows = [
+    menuBarRow(),
+    windowRow(layer: 0, bounds: CGRect(x: 0, y: 37, width: 1512, height: 945)),
+    windowRow(layer: Int(CGWindowLevelForKey(.desktopIconWindow)), bounds: builtIn),
+  ]
+
+  #expect(readThrough26(windows).isTaken)
+}
+
+@Test func ourOwnStatusItemDoesNotProveTheBarVisible() {
+  // The app shows a status item of its own when it has no notch to live in; that one
+  // says nothing about the bar it sits in.
+  let windows = [
+    menuBarRow(),
+    statusItemRow(pid: ownPID),
+    windowRow(layer: 0, bounds: CGRect(x: 0, y: 37, width: 1512, height: 945)),
+  ]
+
+  #expect(readThrough26(windows).isTaken)
 }
 
 @Test func theTopEdgeFlipsThroughThePrimaryScreensHeight() {
@@ -214,18 +213,227 @@ private func statusItemRow() -> [String: Any] {
     layer: statusItemLevel, bounds: CGRect(x: 3960, y: 158, width: 40, height: 37)
   )
 
+  #expect(readThrough26([fullScreen], screenFrame: screen, primaryFrame: primary).isTaken)
   #expect(
-    FullScreenMonitor.isTaken(
-      windows: [fullScreen], screenFrame: screen, safeAreaTop: 37, primaryFrame: primary, ownPID: ownPID
-    )
+    !readThrough26(
+      [menuBarThere, statusItemThere, fullScreen], screenFrame: screen, primaryFrame: primary
+    ).isTaken
   )
+}
+
+@Test func theTopEdgeFlipsForAScreenAboveThePrimary() {
+  // The notch screen sits above the primary display, so its top edge lies above the
+  // origin of the flipped coordinates: 1440 - (1440 + 982) = -982.
+  let primary = CGRect(x: 0, y: 0, width: 2560, height: 1440)
+  let screen = CGRect(x: 0, y: 1440, width: 1512, height: 982)
+  let fullScreen = windowRow(
+    layer: 0, bounds: CGRect(x: 0, y: -982, width: 1512, height: 982)
+  )
+  // The primary's own maximized window, right under its menu bar: not this screen's.
+  let belowOnThePrimary = windowRow(
+    layer: 0, bounds: CGRect(x: 0, y: 25, width: 2560, height: 1415)
+  )
+
+  #expect(readThrough26([fullScreen], screenFrame: screen, primaryFrame: primary).isTaken)
   #expect(
-    !FullScreenMonitor.isTaken(
-      windows: [menuBarThere, statusItemThere, fullScreen],
-      screenFrame: screen,
-      safeAreaTop: 37,
-      primaryFrame: primary,
-      ownPID: ownPID
-    )
+    !readThrough26([belowOnThePrimary], screenFrame: screen, primaryFrame: primary).isTaken
   )
+}
+
+// MARK: - macOS 27
+
+/// Values measured live on a 16-inch built-in display under macOS 27: the menu bar is
+/// one point deeper than the safe area, so a maximized window starts one point inside
+/// the top band — exactly where full screen letterboxes its window.
+private let builtIn16 = CGRect(x: 0, y: 0, width: 1800, height: 1169)
+private let builtIn16SafeTop: CGFloat = 38
+private let windowServerPID: pid_t = 300
+private let finderPID: pid_t = 301
+private let wallpaperPID: pid_t = 302
+private let fullScreenPID: pid_t = 600
+
+private let desktopLevel = Int(CGWindowLevelForKey(.desktopWindow))
+private let desktopIconLevel = Int(CGWindowLevelForKey(.desktopIconWindow))
+
+/// The menu bar's own window as macOS 27 lists it, on the desktop and inside a
+/// full-screen space alike.
+private func menuBar27() -> [String: Any] {
+  windowRow(
+    layer: menuBarLevel, bounds: CGRect(x: 0, y: 0, width: 1800, height: 39), pid: windowServerPID
+  )
+}
+
+/// A window maximized under the menu bar — and, to the window list, a letterboxed
+/// full-screen window too: both have exactly these bounds.
+private func maximized27(pid: pid_t = 500) -> [String: Any] {
+  windowRow(layer: 0, bounds: CGRect(x: 0, y: 39, width: 1800, height: 1130), pid: pid)
+}
+
+/// Finder's desktop: on screen wherever the desktop is, gone inside a full-screen space.
+private func finderDesktop27() -> [String: Any] {
+  windowRow(layer: desktopIconLevel, bounds: builtIn16, pid: finderPID)
+}
+
+/// The wallpaper, which a full-screen space keeps behind its window.
+private func wallpaper27() -> [String: Any] {
+  windowRow(layer: desktopLevel - 1, bounds: builtIn16, pid: wallpaperPID)
+}
+
+/// The Window Server's desktop layer just above the icons, as deep as the menu bar's
+/// translucent backdrop reaches.
+private func underbelly27() -> [String: Any] {
+  windowRow(
+    layer: desktopIconLevel + 1, bounds: CGRect(x: 0, y: 0, width: 1800, height: 99),
+    pid: windowServerPID
+  )
+}
+
+/// What the Window Server lays over the housing row while the bar is hidden.
+private func housingRowFill27() -> [String: Any] {
+  windowRow(
+    layer: desktopIconLevel + 1, bounds: CGRect(x: 0, y: 0, width: 1800, height: 38),
+    pid: windowServerPID
+  )
+}
+
+/// Reads as macOS 27 does, where the desktop under the bar proves it visible.
+private func read27(_ windows: [[String: Any]]) -> FullScreenReading {
+  FullScreenRule.read(
+    windows: windows,
+    screenFrame: builtIn16,
+    safeAreaTop: builtIn16SafeTop,
+    primaryFrame: builtIn16,
+    ownPID: ownPID,
+    witness: .desktop
+  )
+}
+
+@Test func aMaximizedWindowOnTheMacOS27DesktopIsNotTaken() {
+  // Regression: macOS 27 lists no status items at all, even with the menu bar in plain
+  // sight, so the old proof of a visible bar never held, and a window maximized under it
+  // hid the notch from launch onward. The desktop under the bar proves it instead.
+  let windows = [
+    menuBar27(),
+    maximized27(),
+    finderDesktop27(),
+    wallpaper27(),
+  ]
+
+  #expect(read27(windows) == FullScreenReading(reason: .menuBarOverTheDesktop))
+  #expect(!read27(windows).isTaken)
+}
+
+@Test func theMacOS27FullScreenSpaceIsTaken() {
+  // As observed live: the bar's window stays listed and the window is letterboxed to
+  // the very bounds a maximized one has, but the desktop is gone. A backdrop and the
+  // wallpaper sit behind the window instead, and its title bar strip waits,
+  // transparent, for the pointer.
+  let windows = [
+    windowRow(layer: 1001, bounds: CGRect(x: 0, y: 39, width: 1, height: 1)),
+    menuBar27(),
+    windowRow(
+      layer: 0, bounds: CGRect(x: 0, y: 39, width: 1800, height: 32), pid: fullScreenPID, alpha: 0
+    ),
+    maximized27(pid: fullScreenPID),
+    windowRow(layer: desktopLevel + 1, bounds: builtIn16, pid: wallpaperPID),
+    wallpaper27(),
+    windowRow(layer: desktopLevel - 3, bounds: builtIn16, pid: windowServerPID),
+  ]
+
+  #expect(read27(windows) == FullScreenReading(reason: .menuBarWithoutDesktop))
+  #expect(read27(windows).isTaken)
+}
+
+@Test func aTakeoverWithoutASpaceIsTakenOverTheDesktop() {
+  // A game hiding the menu bar from a borderless window, as observed live: no space is
+  // made, so the desktop stays listed beneath it, but the bar's window leaves the list
+  // and the Window Server fills the housing row instead. With the bar gone, the desktop
+  // under it proves nothing.
+  let windows = [
+    windowRow(layer: 0, bounds: builtIn16, pid: fullScreenPID),
+    maximized27(),
+    housingRowFill27(),
+    underbelly27(),
+    finderDesktop27(),
+    wallpaper27(),
+  ]
+
+  #expect(read27(windows) == FullScreenReading(reason: .menuBarGone))
+  #expect(read27(windows).isTaken)
+}
+
+@Test func aSheetAtTheMenuBarLevelDoesNotPoseAsTheMenuBar() {
+  // Seen live: a system overlay covering the whole screen at the menu bar's level stayed
+  // listed through every state. It is not the bar, so it must not prove the bar visible
+  // while a game holds the screen over the desktop.
+  let windows = [
+    windowRow(layer: menuBarLevel, bounds: builtIn16, pid: 700),
+    windowRow(layer: 0, bounds: builtIn16, pid: fullScreenPID),
+    finderDesktop27(),
+    wallpaper27(),
+  ]
+
+  #expect(read27(windows).isTaken)
+}
+
+@Test func theDesktopLayerAboveTheIconsAlsoWitnessesTheDesktop() {
+  // Finder's window is not the only desktop furniture a full-screen space leaves
+  // behind: the Window Server's own layer just above the icons leaves too, and it does
+  // not depend on the user keeping icons on the desktop.
+  let windows = [
+    menuBar27(),
+    maximized27(),
+    underbelly27(),
+    wallpaper27(),
+  ]
+
+  #expect(!read27(windows).isTaken)
+}
+
+@Test func theHousingRowFillIsNotTheDesktop() {
+  // The fill over the housing row lives at a desktop level but never reaches below the
+  // band; it says nothing about the desktop being there.
+  let windows = [
+    menuBar27(),
+    maximized27(pid: fullScreenPID),
+    housingRowFill27(),
+  ]
+
+  #expect(read27(windows).isTaken)
+}
+
+@Test func aNarrowWindowAtTheDesktopLevelIsNotTheDesktop() {
+  // Desktop widgets park small windows among the icons; only something spanning the
+  // screen stands for the desktop itself.
+  let windows = [
+    menuBar27(),
+    maximized27(pid: fullScreenPID),
+    windowRow(layer: desktopIconLevel, bounds: CGRect(x: 20, y: 20, width: 320, height: 320)),
+  ]
+
+  #expect(read27(windows).isTaken)
+}
+
+@Test func aWideWindowAboveTheDesktopLayersIsNotTheDesktop() {
+  // From the backstop up, a window belongs to the apps, not to the desktop.
+  let windows = [
+    menuBar27(),
+    maximized27(pid: fullScreenPID),
+    windowRow(layer: Int(CGWindowLevelForKey(.backstopMenu)), bounds: builtIn16),
+  ]
+
+  #expect(read27(windows).isTaken)
+}
+
+@Test func onMacOS27AWindowAtTheStatusLevelSaysNothingAboutTheBar() {
+  // macOS 27 lists no status items of its own, so anything at that level belongs to a
+  // third party — and may well follow the user into a full-screen space.
+  let windows = [
+    menuBar27(),
+    windowRow(layer: statusItemLevel, bounds: CGRect(x: 1600, y: 0, width: 40, height: 39)),
+    maximized27(pid: fullScreenPID),
+    wallpaper27(),
+  ]
+
+  #expect(read27(windows).isTaken)
 }
