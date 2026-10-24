@@ -94,6 +94,70 @@ final class LinkOpener: TandemChannelOpening, @unchecked Sendable {
   }
 }
 
+/// Completes each open only when the test releases it, and ignores cancellation on
+/// purpose: an open the session abandoned can still land, which is the race under
+/// test. Opens are numbered from zero in the order they were asked for.
+final class GatedLinkOpener: TandemChannelOpening, @unchecked Sendable {
+  private let lock = NSLock()
+  private let script: [[UInt8]: [UInt8]]
+  private var opened: [LinkDouble] = []
+  private var waiting: [Int: CheckedContinuation<Void, Never>] = [:]
+  private var released: Set<Int> = []
+
+  init(script: [[UInt8]: [UInt8]] = [:]) {
+    self.script = script
+  }
+
+  var links: [LinkDouble] { lock.withLock { opened } }
+
+  func release(_ index: Int) {
+    let gate = lock.withLock { () -> CheckedContinuation<Void, Never>? in
+      released.insert(index)
+      return waiting.removeValue(forKey: index)
+    }
+    gate?.resume()
+  }
+
+  func open(_ device: DeviceIdentity) async throws -> OpenedChannel {
+    let (stream, continuation) = AsyncStream<Data>.makeStream()
+    let link = LinkDouble(inbound: continuation, script: script)
+    let index = lock.withLock { () -> Int in
+      opened.append(link)
+      return opened.count - 1
+    }
+    await withCheckedContinuation { (gate: CheckedContinuation<Void, Never>) in
+      let isReleased = lock.withLock { () -> Bool in
+        guard !released.contains(index) else { return true }
+        waiting[index] = gate
+        return false
+      }
+      if isReleased { gate.resume() }
+    }
+    return OpenedChannel(channel: link, inbound: stream, maximumTransmissionUnit: 512)
+  }
+}
+
+/// Finishes verifying only when the test says so.
+final class HeldVerifier: DeviceVerifying, @unchecked Sendable {
+  private let outcome: VerificationOutcome
+  private let gate: AsyncStream<Void>
+  private let opening: AsyncStream<Void>.Continuation
+
+  init(outcome: VerificationOutcome) {
+    self.outcome = outcome
+    (gate, opening) = AsyncStream<Void>.makeStream()
+  }
+
+  func release() {
+    opening.yield()
+  }
+
+  func verify(over requests: SessionRequesting) async throws -> VerificationOutcome {
+    for await _ in gate { break }
+    return outcome
+  }
+}
+
 struct FixedOutcomeVerifier: DeviceVerifying {
   let outcome: VerificationOutcome
 

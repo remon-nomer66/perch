@@ -327,9 +327,11 @@ public actor SessionCoordinator {
 
   private func channelOpened(_ opened: OpenedChannel, attempt: ConnectionAttempt) async {
     // Ask the policy first. It may have moved on, in which case it tells us to close
-    // rather than adopt the channel.
+    // rather than adopt the channel. It adopts a channel exactly when it starts
+    // verifying it; the phase alone cannot say so, because a stale completion leaves
+    // the phase where it was — `verifying`, when the live attempt already landed.
     let (next, effects) = policy.reduce(state, .channelOpened(attempt))
-    guard next.phase == .verifying else {
+    guard effects.contains(.startVerification) else {
       state = next
       await opened.channel.close()
       for effect in effects where !effect.isChannelClose { await run(effect) }

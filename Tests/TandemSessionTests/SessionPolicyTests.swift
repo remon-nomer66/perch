@@ -616,6 +616,16 @@ private let policy = SessionPolicy(maximumFailureCount: 3)
   #expect(verifying.phase == .verifying)
 }
 
+@Test func aStaleOpenWhileTheLiveOneVerifiesOnlyClosesIt() {
+  // The phase does not move for a stale completion, and here it is already
+  // `verifying`: the coordinator adopts a channel only when told to verify it, so
+  // the effects alone must say whose channel this is.
+  let verifying = state(.verifying, attempt: ConnectionAttempt(5))
+  let (next, effects) = policy.reduce(verifying, .channelOpened(ConnectionAttempt(4)))
+  #expect(next == verifying)
+  #expect(effects == [.closeChannel])
+}
+
 // MARK: - Construction
 
 @Test func aNonReleasedPhaseWithoutATargetIsNotRepresentable() {
