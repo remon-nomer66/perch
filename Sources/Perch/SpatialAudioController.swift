@@ -22,6 +22,9 @@ final class SpatialAudioController: ObservableObject {
   /// The gap between the user asking for it and capture being confirmed — while the
   /// system-audio prompt is up, or the first buffers are still on their way.
   @Published private(set) var isStarting = false
+  /// What the switch shows: on from the moment it is asked for, so that while capture is
+  /// still being confirmed it can be flipped back off to call the attempt off.
+  var isSwitchOn: Bool { isEnabled || isStarting }
   @Published private(set) var errorMessage: String?
   /// Why the last attempt was given up, while its message is still showing.
   private(set) var revocation: CaptureSupervisor.Revocation?

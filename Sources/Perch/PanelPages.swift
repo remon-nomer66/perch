@@ -111,14 +111,15 @@ private struct SpatialAudioPage: View {
   private var spatialColumn: some View {
     if controller.isAvailable {
       VStack(alignment: .leading, spacing: 7) {
-        SwitchRow(title: L("空間オーディオ", "Spatial Audio"), isOn: controller.isEnabled) {
+        SwitchRow(title: L("空間オーディオ", "Spatial Audio"), isOn: controller.isSwitchOn) {
           controller.setEnabled($0)
         }
-        // The switch does not commit to on until capture is confirmed, so while the
-        // permission prompt is up (or the first buffers are on their way) it says so.
-        // And it is headphone-gated: HRTF binaural on speakers falls apart, so with
-        // anything but headphones as the output the feature stays off.
-        .disabled(controller.isStarting || !outputRoute.isHeadphones)
+        // The feature does not commit to on until capture is confirmed, so while the
+        // permission prompt is up (or the first buffers are on their way) it says so —
+        // and the switch stays live, so the attempt can be called off. It is
+        // headphone-gated: HRTF binaural on speakers falls apart, so with anything but
+        // headphones as the output the feature stays off.
+        .disabled(!outputRoute.isHeadphones)
         .opacity(outputRoute.isHeadphones ? 1 : 0.45)
 
         if !outputRoute.isHeadphones {

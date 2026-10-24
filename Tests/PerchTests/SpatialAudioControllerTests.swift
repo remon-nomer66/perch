@@ -284,6 +284,27 @@ func turningOffStopsTheEngine() async {
 }
 
 @MainActor
+@Test("確認中もスイッチはオンを示し、オフにすれば確認を打ち切ってエンジンを止める")
+func switchCancelsWhileConfirming() async {
+  // 許可なしのまま期限までは長く待つ設定。打ち切らなければ確認が続く。
+  let timing = CaptureSupervisor.Timing(
+    confirmInterval: .milliseconds(1),
+    confirmDeadline: .seconds(60)
+  )
+  let harness = Harness(permissions: [[.denied]], timing: timing)
+  #expect(!harness.controller.isSwitchOn)
+  harness.controller.setEnabled(true)
+  #expect(harness.controller.isStarting)
+  #expect(harness.controller.isSwitchOn)
+
+  harness.controller.setEnabled(false)
+  #expect(!harness.controller.isStarting)
+  #expect(!harness.controller.isSwitchOn)
+  #expect(harness.engines.allStopped)
+  #expect(harness.controller.errorMessage == nil)
+}
+
+@MainActor
 @Test("取り消しの後にもう一度オンにすれば、前回の理由は消えて改めて確かめる")
 func retryClearsThePreviousReason() async {
   let harness = Harness(permissions: [[.denied], [.granted]])
