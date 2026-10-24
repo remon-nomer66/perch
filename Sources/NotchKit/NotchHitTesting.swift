@@ -7,6 +7,11 @@ extension NotchController {
   /// feel smaller than it looks.
   nonisolated static let hitSlack: CGFloat = 4
 
+  /// Added above the open panel. Its top edge is the screen's, and `NSEvent.mouseLocation`
+  /// reports a pointer pressed against that edge as exactly the screen's maxY — which
+  /// `CGRect.contains` counts as outside, so a press on the panel's top row dismissed it.
+  nonisolated static let panelTopSlack: CGFloat = 1
+
   /// What the pointer must reach to count as "over the notch", in global screen
   /// coordinates, before slack: exactly the rectangle the view draws in this state.
   /// `barVisible` is the host's answer to whether the bar is widened just now.
@@ -37,5 +42,18 @@ extension NotchController {
       appearance: appearance
     )
     .insetBy(dx: -hitSlack, dy: -hitSlack)
+  }
+
+  /// The open panel, centred on the cutout and hanging from the screen's top edge.
+  nonisolated static func panelTarget(
+    notch: CGRect, screenFrame: CGRect, appearance: NotchAppearance
+  ) -> CGRect {
+    let size = appearance.expandedSize
+    return CGRect(
+      x: notch.midX - size.width / 2,
+      y: screenFrame.maxY - size.height,
+      width: size.width,
+      height: size.height + panelTopSlack
+    )
   }
 }

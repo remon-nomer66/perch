@@ -102,3 +102,27 @@ private let notch = CGRect(x: 620, y: 950, width: 272, height: 32)
   #expect(target.contains(CGPoint(x: notch.midX, y: builtIn.maxY)))
   #expect(target == NotchAppearance.default.closedRect(around: notch).insetBy(dx: -4, dy: -4))
 }
+
+// MARK: - Panel target
+
+@Test func thePanelTargetIsCentredOnTheCutoutAndHangsFromTheTop() {
+  let panel = NotchController.panelTarget(
+    notch: notch, screenFrame: builtIn, appearance: .default
+  )
+
+  #expect(panel.midX == notch.midX)
+  #expect(panel.width == NotchAppearance.default.expandedWidth)
+  #expect(panel.minY == builtIn.maxY - NotchAppearance.default.expandedHeight)
+}
+
+@Test func thePanelTargetIncludesThePointerPressedAgainstTheTopEdge() {
+  // A press on the panel's top row, beside the notch, came back as outside the
+  // panel and dismissed what was being pressed.
+  let panel = NotchController.panelTarget(
+    notch: notch, screenFrame: builtIn, appearance: .default
+  )
+  let besideTheNotch = notch.maxX + 120
+
+  #expect(panel.contains(CGPoint(x: besideTheNotch, y: builtIn.maxY)))
+  #expect(!panel.contains(CGPoint(x: besideTheNotch, y: panel.minY - 1)))
+}

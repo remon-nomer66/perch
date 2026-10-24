@@ -252,7 +252,7 @@ public final class NotchController: ObservableObject {
     presenter.handle(
       .clicked(
         isOverNotch: isOverNotch(location),
-        isInsidePanel: expandedRect.contains(location)
+        isInsidePanel: panelTarget.contains(location)
       )
     )
     apply()
@@ -276,14 +276,10 @@ public final class NotchController: ObservableObject {
     )
   }
 
-  private var expandedRect: CGRect {
+  private var panelTarget: CGRect {
     guard let geometry, let screenFrame else { return .zero }
-    let size = appearance().expandedSize
-    return CGRect(
-      x: geometry.rect.midX - size.width / 2,
-      y: screenFrame.maxY - size.height,
-      width: size.width,
-      height: size.height
+    return Self.panelTarget(
+      notch: geometry.rect, screenFrame: screenFrame, appearance: appearance()
     )
   }
 
