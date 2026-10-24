@@ -859,10 +859,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // Turning the virtual notch on or off does not change the geometry — no screen was
     // plugged or unplugged — so the screen-parameter observer never fires. Re-evaluate
     // the choice of notch directly. `dropFirst` skips the value `start()` already
-    // reflected at launch; `refresh` is a no-op while the notch is switched off.
+    // reflected at launch; `refresh` is a no-op while the notch is switched off. The
+    // controller reads the setting back through its closure, so the refresh waits for
+    // the assignment to land — called from the publisher itself, it rebuilt against
+    // the value being left.
     settingsStore.$isVirtualNotchEnabled
       .removeDuplicates()
       .dropFirst()
+      .afterAssignment()
       .sink { [weak controller] _ in controller?.refresh() }
       .store(in: &cancellables)
 
