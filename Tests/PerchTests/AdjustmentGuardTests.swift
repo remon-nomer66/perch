@@ -61,10 +61,40 @@ func beginRenewsTheLease() {
   #expect(!adjustment.isHolding(now: start.advanced(by: .seconds(18))))
 }
 
-@Test("The lease outlasts a write that waits out one stuck predecessor")
-func leaseCoversOneAbandonedWrite() {
-  // A write queued behind one that never returns starts only once the chain gives
-  // up on that one; its guard must still be holding then, or the refresh snaps the
-  // control back just before the write lands.
+@Test("The lease outlasts the longest gap between two renewals")
+func leaseOutlastsTheGapBetweenRenewals() {
+  // A queued write's guard is renewed each time the chain advances, and a running
+  // write's before its read-back. Either gap is at most the chain's limit; a lease
+  // shorter than that would lapse while the write is merely waiting its turn.
   #expect(AdjustmentGuard.defaultLease > DeviceWriteChain.defaultLimit)
+}
+
+@Test("Renewing restarts the lease from the renewal")
+func renewRestartsTheLease() {
+  var adjustment = AdjustmentGuard(lease: .seconds(20))
+  let start = ContinuousClock.now
+  let token = adjustment.begin(now: start)
+  adjustment.renew(token, now: start.advanced(by: .seconds(15)))
+  #expect(adjustment.isHolding(now: start.advanced(by: .seconds(34))))
+  #expect(!adjustment.isHolding(now: start.advanced(by: .seconds(35))))
+}
+
+@Test("An overtaken token cannot renew the lease its successor holds")
+func staleTokenDoesNotRenew() {
+  var adjustment = AdjustmentGuard(lease: .seconds(20))
+  let start = ContinuousClock.now
+  let first = adjustment.begin(now: start)
+  _ = adjustment.begin(now: start)
+  adjustment.renew(first, now: start.advanced(by: .seconds(15)))
+  #expect(!adjustment.isHolding(now: start.advanced(by: .seconds(20))))
+}
+
+@Test("A guard already lifted is not revived by a late renewal")
+func renewDoesNotReviveALiftedGuard() {
+  var adjustment = AdjustmentGuard(lease: .seconds(20))
+  let start = ContinuousClock.now
+  let token = adjustment.begin(now: start)
+  adjustment.end(token)
+  adjustment.renew(token, now: start.advanced(by: .seconds(1)))
+  #expect(!adjustment.isHolding(now: start.advanced(by: .seconds(2))))
 }

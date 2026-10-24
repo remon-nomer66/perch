@@ -79,6 +79,104 @@ func promptWriteFreesTheChainAtOnce() async {
   await timer.drain()
 }
 
+@MainActor
+@Test("A queued write hears every advance of the chain ahead of it, and none once it runs")
+func queuedWriteHearsEachAdvance() async {
+  let timer = ManualTimer()
+  let first = StuckWrite()
+  let second = StuckWrite()
+  let probe = Probe()
+  var chain = DeviceWriteChain(sleep: timer.sleep)
+  chain.enqueue { await first.run() }
+  chain.enqueue { await second.run() }
+  // Joins once the first is already running, as a write asked mid-chain does.
+  await waitUntil { timer.pending == 1 }
+  chain.enqueue(whileQueued: { probe.heard += 1 }) { probe.started = true }
+
+  await yieldToMainActor()
+  #expect(probe.heard == 0)
+  timer.fire()  // the first write is given up on; the second reaches the head
+  await waitUntil { probe.heard == 1 && timer.pending == 1 }
+  #expect(probe.heard == 1)
+  timer.fire()  // and the second; the queued write itself starts
+  await waitUntil { probe.started }
+  await yieldToMainActor()
+  #expect(probe.heard == 1)
+
+  first.release()
+  second.release()
+  await timer.drain()
+}
+
+/// A write that does not return until released, each on its own stream: one stream
+/// cannot be awaited from two tasks at once.
+private struct StuckWrite {
+  private let stream: AsyncStream<Void>
+  private let continuation: AsyncStream<Void>.Continuation
+
+  init() {
+    (stream, continuation) = AsyncStream<Void>.makeStream()
+  }
+
+  func run() async {
+    for await _ in stream {}
+  }
+
+  func release() {
+    continuation.finish()
+  }
+}
+
+@MainActor
+private final class Probe {
+  var heard = 0
+  var started = false
+}
+
+/// One guarded field, read at an instant the test sets — so how long the writes ahead
+/// took is a step of the test, not a wait.
+@MainActor
+private final class Field {
+  var adjustment = AdjustmentGuard(lease: .seconds(20))
+  var now = ContinuousClock.now
+  var heldWhenItsWriteStarted: Bool?
+}
+
+@MainActor
+@Test("A write queued behind two stuck ones still finds its field guarded when it starts")
+func guardOutlastsTwoStuckWrites() async {
+  let timer = ManualTimer()
+  let first = StuckWrite()
+  let second = StuckWrite()
+  var chain = DeviceWriteChain(limit: .seconds(15), sleep: timer.sleep)
+  let field = Field()
+  let start = field.now
+  chain.enqueue { await first.run() }
+  chain.enqueue { await second.run() }
+  await waitUntil { timer.pending == 1 }
+
+  // Asked at t=3s, behind two writes that will each be waited for the full limit: it
+  // starts at t=30s. Counted from the ask alone, a 20s lease ran out at t=23s and the
+  // refresh showed the device's old value for the last seven seconds of the wait.
+  field.now = start.advanced(by: .seconds(3))
+  let token = field.adjustment.begin(now: field.now)
+  chain.enqueue(whileQueued: { field.adjustment.renew(token, now: field.now) }) {
+    field.heldWhenItsWriteStarted = field.adjustment.isHolding(now: field.now)
+  }
+
+  field.now = start.advanced(by: .seconds(15))
+  timer.fire()
+  await waitUntil { timer.pending == 1 }
+  field.now = start.advanced(by: .seconds(30))
+  timer.fire()
+  await waitUntil { field.heldWhenItsWriteStarted != nil }
+  #expect(field.heldWhenItsWriteStarted == true)
+
+  first.release()
+  second.release()
+  await timer.drain()
+}
+
 @Test("The limit leaves a full response deadline of margin over a merely slow write")
 func limitOutlastsTheSessionDeadline() {
   // A merely slow write can take about two response deadlines — one read-back answered

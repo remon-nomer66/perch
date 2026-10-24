@@ -77,6 +77,11 @@ final class AppModel: ObservableObject {
   /// Queues a write to a guarded field. `send` puts it on the wire; what happens around
   /// it — sent at all, read back, guard lifted — is `GuardedWrite`'s decision, taken
   /// when the write's turn comes rather than when it was asked.
+  ///
+  /// The guard's lease is renewed as the write progresses — when it is queued (a drag's
+  /// pacer queues seconds after the last report), each time the chain ahead of it
+  /// advances, when it starts, and before its read-back — so it never lapses while the
+  /// write is merely waiting; see `AdjustmentGuard`.
   private func enqueueGuardedWrite(
     _ field: ReferenceWritableKeyPath<AppModel, AdjustmentGuard>,
     token: Int,
@@ -84,12 +89,16 @@ final class AppModel: ObservableObject {
     using service: SessionService,
     send: @escaping @MainActor (SessionCoordinator) async -> Void
   ) {
-    deviceWrites.enqueue { [weak self] in
+    self[keyPath: field].renew(token)
+    deviceWrites.enqueue(whileQueued: { [weak self] in self?[keyPath: field].renew(token) }) {
+      [weak self] in
       guard let self else { return }
       let step = GuardedWrite.step(isFinal: isFinal, isCurrent: self[keyPath: field].isCurrent(token))
       guard step.sends else { return }
+      self[keyPath: field].renew(token)
       await send(await service.session)
       guard step.liftsGuard else { return }
+      self[keyPath: field].renew(token)
       await self.refresh(from: service, cause: .deviceWrite)
       self[keyPath: field].end(token)
     }

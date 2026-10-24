@@ -9,13 +9,19 @@
 /// never completes, a drag whose release never arrives because the panel closed under
 /// the finger — would otherwise keep the field frozen on its optimistic value for the
 /// rest of the session, deaf to every change made on the headset itself. Past the
-/// lease the guard lets go on its own and the field follows the device again. Every
-/// `begin` renews it, so a drag that is still moving keeps its field.
+/// lease the guard lets go on its own and the field follows the device again.
+///
+/// The lease counts from the latest sign that the write it covers is still on its way,
+/// not from the moment it was asked. Counted from the ask, a write queued behind two
+/// stuck ones outlived its own lease before it ever started, and the refresh snapped
+/// the control back to the device's old value while it waited. So every `begin`
+/// renews the lease — a drag still moving keeps its field — and `renew` restarts it
+/// as the write progresses: each time the chain ahead of it advances, when it starts,
+/// and before its read-back.
 struct AdjustmentGuard {
-  /// Longer than the write chain's limit, with room to spare: a write queued behind
-  /// one that never returns starts only once the chain gives up on that one, and its
-  /// guard must still be holding when it does — else the refresh snaps the control
-  /// back just before the write lands. The margin covers the write's own read-back.
+  /// Longer than the longest gap between two renewals, with room to spare. The chain
+  /// advances, and a running write gets to its read-back, within the chain's limit;
+  /// the margin covers the read-back itself.
   static let defaultLease: Duration = DeviceWriteChain.defaultLimit + .seconds(5)
 
   private let lease: Duration
@@ -40,6 +46,14 @@ struct AdjustmentGuard {
     generation += 1
     heldUntil = now.advanced(by: lease)
     return generation
+  }
+
+  /// Restarts the lease for `token` from `now`, as the write it covers makes progress.
+  /// Only the latest token renews, and only while it still holds: a write overtaken
+  /// meanwhile, or one whose guard was already lifted, must not hold the field again.
+  mutating func renew(_ token: Int, now: ContinuousClock.Instant = .now) {
+    guard generation == token, heldUntil != nil else { return }
+    heldUntil = now.advanced(by: lease)
   }
 
   /// Lifts the guard, unless a later `begin` has superseded this token.

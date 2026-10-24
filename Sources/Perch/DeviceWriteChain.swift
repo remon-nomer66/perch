@@ -15,6 +15,11 @@ import os
 /// The abandoned write is not cancelled — the session does not observe cancellation,
 /// and should it finish after all, its read-back and the guard it lifts still run —
 /// it merely stops holding up the writes behind it.
+///
+/// Each time a write reaches the head, every write still queued behind it hears so
+/// through its `whileQueued`. The chain advances at least once per `limit`, so a guard
+/// renewed there never lapses while its write is merely waiting its turn, however
+/// many stuck writes are ahead of it.
 @MainActor
 struct DeviceWriteChain {
   /// Three of the session's own response deadlines. A write that is merely slow can
@@ -29,6 +34,8 @@ struct DeviceWriteChain {
   private let limit: Duration
   private let sleep: @MainActor (Duration) async -> Void
   private var tail: Task<Void, Never>?
+  /// Shared by every copy of the chain, as the tail is: they are all the one line.
+  private let queued = QueuedWrites()
 
   /// `sleep` times the limit; tests pass one they advance by hand, so whether a write
   /// was given up on never depends on how busy the machine running them is.
@@ -40,12 +47,20 @@ struct DeviceWriteChain {
     self.sleep = sleep
   }
 
-  mutating func enqueue(_ operation: @escaping @MainActor () async -> Void) {
+  /// Queues `operation` behind every write asked before it. `whileQueued` runs each time
+  /// a write ahead of it reaches the head, and never once `operation` has started.
+  mutating func enqueue(
+    whileQueued: (@MainActor () -> Void)? = nil,
+    _ operation: @escaping @MainActor () async -> Void
+  ) {
     let previous = tail
     let limit = self.limit
     let sleep = self.sleep
+    let queued = self.queued
+    let place = queued.join(whileQueued)
     tail = Task { @MainActor in
       await previous?.value
+      queued.reachHead(place)
       await Self.run(operation, within: limit, sleep: sleep)
     }
   }
@@ -79,6 +94,28 @@ struct DeviceWriteChain {
     }
     await finish.wait()
     deadline.cancel()
+  }
+}
+
+/// The writes waiting their turn, and what each wants to hear while it waits.
+@MainActor
+private final class QueuedWrites {
+  private var listeners: [Int: @MainActor () -> Void] = [:]
+  private var nextPlace = 0
+
+  /// Takes a place in line; `listener`, if any, hears every advance until that place
+  /// reaches the head.
+  func join(_ listener: (@MainActor () -> Void)?) -> Int {
+    nextPlace += 1
+    listeners[nextPlace] = listener
+    return nextPlace
+  }
+
+  /// The write at `place` reached the head: it leaves the line, and every write still
+  /// behind it hears the chain move.
+  func reachHead(_ place: Int) {
+    listeners[place] = nil
+    for listener in listeners.values { listener() }
   }
 }
 
