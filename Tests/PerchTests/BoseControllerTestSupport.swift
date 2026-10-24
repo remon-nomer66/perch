@@ -41,6 +41,16 @@ final class ScriptedAudioOutput: AudioOutputObserving, @unchecked Sendable {
 
 // MARK: - Devices
 
+/// A scanned BMAP candidate. Disconnected and never accessed unless said otherwise — the
+/// facts that rank neither above the other.
+func candidate(
+  _ address: String,
+  connected: Bool = false,
+  lastAccess: Date? = nil
+) -> BmapDeviceCandidate {
+  BmapDeviceCandidate(address: address, isConnected: connected, lastAccess: lastAccess)
+}
+
 /// How a scripted BMAP address behaves when opened.
 enum ScriptedBmapBehaviour {
   /// The open itself fails.
@@ -52,18 +62,25 @@ enum ScriptedBmapBehaviour {
 }
 
 /// A `BmapDeviceAccess` with scripted candidates, recording every open it is asked for.
+/// Candidates are listed in the order given, none of them connected, none with an access
+/// date, so correlation falls back to the scan order unless a test says otherwise.
 @MainActor
 final class ScriptedBmapDevices: BmapDeviceAccess {
-  var candidates: [String]
+  var scanned: [BmapDeviceCandidate]
   var behaviours: [String: ScriptedBmapBehaviour]
   private(set) var opened: [String] = []
+  /// How many SDP scans the controller has asked for.
+  private(set) var scans = 0
 
   init(_ behaviours: KeyValuePairs<String, ScriptedBmapBehaviour>) {
-    candidates = behaviours.map(\.key)
+    scanned = behaviours.map { candidate($0.key) }
     self.behaviours = Dictionary(uniqueKeysWithValues: behaviours.map { ($0.key, $0.value) })
   }
 
-  func candidateAddresses() -> [String] { candidates }
+  func candidates() -> [BmapDeviceCandidate] {
+    scans += 1
+    return scanned
+  }
 
   func config(forAddress address: String) -> (config: BoseDeviceConfig, productId: UInt16?) {
     (BoseCatalog.fallbackConfig, nil)

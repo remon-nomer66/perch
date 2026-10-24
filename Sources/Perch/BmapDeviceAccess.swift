@@ -16,8 +16,8 @@ import Foundation
 /// is only delivered to a thread with a run loop (see `currentBoseControlAddress`).
 @MainActor
 protocol BmapDeviceAccess {
-  /// Every paired device that advertises BMAP, most promising first.
-  func candidateAddresses() -> [String]
+  /// Every paired device that advertises BMAP, connected ones first.
+  func candidates() -> [BmapDeviceCandidate]
   /// The config for the device at `address`, from the product id it announces.
   func config(forAddress address: String) -> (config: BoseDeviceConfig, productId: UInt16?)
   /// Opens the BMAP control channel on the device at `address`.
@@ -26,8 +26,8 @@ protocol BmapDeviceAccess {
 
 /// The real edge: cached SDP and RFCOMM, through `BoseTransport`.
 struct LiveBmapDeviceAccess: BmapDeviceAccess {
-  func candidateAddresses() -> [String] {
-    bmapDeviceAddresses()
+  func candidates() -> [BmapDeviceCandidate] {
+    bmapDeviceCandidates()
   }
 
   func config(forAddress address: String) -> (config: BoseDeviceConfig, productId: UInt16?) {

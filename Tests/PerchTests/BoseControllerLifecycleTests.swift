@@ -118,6 +118,22 @@ private let control = "00-11-22-33-44-56"
   #expect(controller.readout?.status == .ready)
 }
 
+/// The scan's link facts reach correlation: of two Bose devices equally far from the
+/// output, the one the Mac is linked to is tried first, though it is listed second.
+@MainActor
+@Test func theConnectedCandidateIsTriedFirst() async {
+  let asleep = "00-11-22-a0-00-01"
+  let linked = "00-11-22-b0-00-02"
+  let audio = ScriptedAudioOutput(bluetooth: output)
+  let devices = ScriptedBmapDevices([asleep: .refusesToOpen, linked: .readsBack])
+  devices.scanned = [candidate(asleep), candidate(linked, connected: true)]
+  let controller = BoseDeviceController(audio: audio, devices: devices)
+
+  await controller.tick()
+  #expect(devices.opened == [linked])
+  #expect(controller.readout?.status == .ready)
+}
+
 /// Setting a silent candidate aside never silences the loop: with nothing else to try,
 /// the rotation starts over and the same address is tried again — a bud that was in its
 /// case may be out now.

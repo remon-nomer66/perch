@@ -162,10 +162,10 @@ final class BoseDeviceController: ObservableObject {
       failedAddressesOutput = output
     }
 
-    let candidates = devices.candidateAddresses()
+    let candidates = devices.candidates()
     var chosen = Self.correlate(
       output: output,
-      candidates: candidates.filter { !failedAddresses.contains(Self.normalized($0)) }
+      candidates: candidates.filter { !failedAddresses.contains(Self.normalized($0.address)) }
     )
     if chosen == nil, !failedAddresses.isEmpty {
       // Every candidate has failed at least once. Forget that and start the rotation
@@ -191,36 +191,6 @@ final class BoseDeviceController: ObservableObject {
     case .unidentifiedBluetooth(let uid): return uid
     case .other: return nil
     }
-  }
-
-  /// Picks the BMAP control address belonging to the device currently playing audio.
-  ///
-  /// A headset's audio address *is* its control address, so an exact match settles it. TWS
-  /// earbuds are the case that cannot be settled that way — their audio rides one address
-  /// and BMAP another — which is why correlation falls back to the OUI (the manufacturer
-  /// block both share). With a single Bose device paired the OUI is enough; with several,
-  /// it names them all, so the fallback then prefers the candidate sharing the longest
-  /// address prefix with the output. A pair's two addresses are allocated together and
-  /// agree well past the OUI, while a different Bose product diverges at it — so the
-  /// earbuds in the ears win over the headphones in the bag.
-  ///
-  /// `nonisolated` and pure: the whole rule is exercised without Bluetooth.
-  nonisolated static func correlate(output: String, candidates: [String]) -> String? {
-    let outputOctets = addressOctets(of: output)
-    guard outputOctets.count >= 3 else { return nil }
-    let outputOUI = Array(outputOctets.prefix(3))
-
-    var best: (address: String, shared: Int)?
-    for candidate in candidates {
-      let octets = addressOctets(of: candidate)
-      guard Array(octets.prefix(3)) == outputOUI else { continue }
-      let shared = zip(octets, outputOctets).prefix { $0 == $1 }.count
-      // A full match is the device itself; nothing can beat it.
-      if shared == outputOctets.count, shared == octets.count { return candidate }
-      // Ties keep the earlier candidate: `bmapDeviceAddresses` orders connected first.
-      if best == nil || shared > best!.shared { best = (candidate, shared) }
-    }
-    return best?.address
   }
 
   // MARK: - Session lifecycle
