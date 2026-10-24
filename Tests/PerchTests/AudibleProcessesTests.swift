@@ -1,3 +1,4 @@
+import CoreAudio
 import Testing
 
 @testable import Perch
@@ -7,45 +8,47 @@ import Testing
 
 private typealias Snapshot = AudibleProcesses.Snapshot
 
-private let ownPID: Int32 = 100
+/// Perch 自身のプロセスオブジェクト（pid を translate して得るもの）。
+private let ownObject: AudioObjectID = 100
 
 @Test(
   "自分以外に音を出しているプロセスがあるか（Perch 自身の出力は空間化した音なので数えない）",
   arguments: [
     ([], false),
-    ([Snapshot(pid: ownPID, bundleID: "dev.perch.mac", isRunningOutput: true)], false),
+    ([Snapshot(objectID: ownObject, bundleID: "dev.perch.mac", isRunningOutput: true)], false),
     (
       [
-        Snapshot(pid: ownPID, bundleID: "dev.perch.mac", isRunningOutput: true),
-        Snapshot(pid: 200, bundleID: "com.example.player", isRunningOutput: false),
+        Snapshot(objectID: ownObject, bundleID: "dev.perch.mac", isRunningOutput: true),
+        Snapshot(objectID: 200, bundleID: "com.example.player", isRunningOutput: false),
       ],
       false
     ),
     (
       [
-        Snapshot(pid: ownPID, bundleID: "dev.perch.mac", isRunningOutput: true),
-        Snapshot(pid: 200, bundleID: "com.example.player", isRunningOutput: true),
+        Snapshot(objectID: ownObject, bundleID: "dev.perch.mac", isRunningOutput: true),
+        Snapshot(objectID: 200, bundleID: "com.example.player", isRunningOutput: true),
       ],
       true
     ),
-    ([Snapshot(pid: 200, bundleID: nil, isRunningOutput: true)], true),
-    // pid を読めないものは、自分かどうか分からないので数えない（自分を数えると、
-    // 空間化している間ずっと「他が再生中」に見えてしまう）。
-    ([Snapshot(pid: nil, bundleID: "com.example.player", isRunningOutput: true)], false),
+    // 自分かどうかはオブジェクト ID で決まる。bundle ID（や pid）を読めない他プロセスも
+    // 数える。
+    ([Snapshot(objectID: 200, bundleID: nil, isRunningOutput: true)], true),
+    // 同じ bundle ID でも、別のオブジェクトなら別のプロセス。
+    ([Snapshot(objectID: 300, bundleID: "dev.perch.mac", isRunningOutput: true)], true),
   ] as [([Snapshot], Bool)]
 )
 private func anotherProcessIsOutputting(row: ([Snapshot], Bool)) {
   let (snapshots, expected) = row
-  #expect(AudibleProcesses.anyOutputting(snapshots, excluding: ownPID) == expected)
+  #expect(AudibleProcesses.anyOutputting(snapshots, excluding: ownObject) == expected)
 }
 
 @Test("音を出しているプロセスの bundle ID だけを集める。空や読めないものは除く")
 func bundleIDsOfOutputtingProcesses() {
   let snapshots = [
-    Snapshot(pid: 1, bundleID: "com.example.browser", isRunningOutput: true),
-    Snapshot(pid: 2, bundleID: "com.example.idle", isRunningOutput: false),
-    Snapshot(pid: 3, bundleID: "", isRunningOutput: true),
-    Snapshot(pid: 4, bundleID: nil, isRunningOutput: true),
+    Snapshot(objectID: 1, bundleID: "com.example.browser", isRunningOutput: true),
+    Snapshot(objectID: 2, bundleID: "com.example.idle", isRunningOutput: false),
+    Snapshot(objectID: 3, bundleID: "", isRunningOutput: true),
+    Snapshot(objectID: 4, bundleID: nil, isRunningOutput: true),
   ]
   #expect(AudibleProcesses.bundleIDs(outputtingIn: snapshots) == ["com.example.browser"])
 }

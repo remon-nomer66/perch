@@ -225,8 +225,9 @@ public final class SystemAudioTap {
   }
 
   /// 自プロセスの pid を Core Audio のプロセスオブジェクトIDへ変換する。
-  /// タップから自分の出力を除外するために使う。
-  private static func currentProcessObjectID() -> AudioObjectID? {
+  /// タップから自分の出力を除外するために使う。他のプロセスの一覧から自分を見分ける
+  /// ときも、同じ ID で比べる。
+  public static func currentProcessObjectID() -> AudioObjectID? {
     var pid = getpid()
     var address = AudioObjectPropertyAddress(
       mSelector: kAudioHardwarePropertyTranslatePIDToProcessObject,

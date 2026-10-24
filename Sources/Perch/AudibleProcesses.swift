@@ -1,5 +1,6 @@
 import CoreAudio
 import Foundation
+import SpatialAudioKit
 
 /// Which processes are currently outputting audio, read from Core Audio's process
 /// objects (macOS 14.4+). The artist rules use this before trusting a browser tab's
@@ -8,11 +9,12 @@ import Foundation
 /// simply hears silence.
 enum AudibleProcesses {
   /// What one process object says about itself — as much as the questions here need.
-  /// Both questions are about processes that are outputting, so the pid and bundle ID
-  /// are read only for those.
+  /// Both questions are about processes that are outputting, so the bundle ID is read
+  /// only for those.
   struct Snapshot: Equatable, Sendable {
-    /// nil when it cannot be read.
-    let pid: pid_t?
+    /// The process object itself, straight from the list — always known, unlike the
+    /// pid or bundle ID.
+    let objectID: AudioObjectID
     let bundleID: String?
     let isRunningOutput: Bool
   }
@@ -25,10 +27,13 @@ enum AudibleProcesses {
 
   /// Whether a process other than Perch is outputting audio. Perch itself is left out:
   /// while spatial audio runs, its own output is the spatialised copy of everyone else's.
-  /// nil when the process objects cannot be read — "unknown", not silence.
+  /// It is told apart by its process object, translated from its pid the same way the tap
+  /// excludes it. nil when the process objects, or Perch's own, cannot be read —
+  /// "unknown", not silence.
   static func isAnotherProcessOutputting() -> Bool? {
-    let ownPID = getpid()
-    return snapshots().map { anyOutputting($0, excluding: ownPID) }
+    guard #available(macOS 14.4, *), let ownObject = SystemAudioTap.currentProcessObjectID()
+    else { return nil }
+    return snapshots().map { anyOutputting($0, excluding: ownObject) }
   }
 
   static func bundleIDs(outputtingIn snapshots: [Snapshot]) -> Set<String> {
@@ -40,13 +45,8 @@ enum AudibleProcesses {
     )
   }
 
-  /// A process whose pid cannot be read is not counted: it might be Perch itself, and
-  /// counting Perch would make "others are playing" true for as long as it spatialises.
-  static func anyOutputting(_ snapshots: [Snapshot], excluding pid: pid_t) -> Bool {
-    snapshots.contains { snapshot in
-      guard snapshot.isRunningOutput, let processID = snapshot.pid else { return false }
-      return processID != pid
-    }
+  static func anyOutputting(_ snapshots: [Snapshot], excluding ownObject: AudioObjectID) -> Bool {
+    snapshots.contains { $0.isRunningOutput && $0.objectID != ownObject }
   }
 
   private static func snapshots() -> [Snapshot]? {
@@ -71,7 +71,7 @@ enum AudibleProcesses {
     return processes.map { process in
       let outputting = isRunningOutput(process)
       return Snapshot(
-        pid: outputting ? pid(process) : nil,
+        objectID: process,
         bundleID: outputting ? bundleID(process) : nil,
         isRunningOutput: outputting
       )
@@ -91,20 +91,6 @@ enum AudibleProcesses {
       return false
     }
     return running != 0
-  }
-
-  @available(macOS 14.4, *)
-  private static func pid(_ process: AudioObjectID) -> pid_t? {
-    var address = AudioObjectPropertyAddress(
-      mSelector: kAudioProcessPropertyPID,
-      mScope: kAudioObjectPropertyScopeGlobal,
-      mElement: kAudioObjectPropertyElementMain
-    )
-    var pid: pid_t = -1
-    var size = UInt32(MemoryLayout<pid_t>.size)
-    guard AudioObjectGetPropertyData(process, &address, 0, nil, &size, &pid) == noErr, pid > 0
-    else { return nil }
-    return pid
   }
 
   @available(macOS 14.4, *)
