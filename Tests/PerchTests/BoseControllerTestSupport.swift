@@ -74,6 +74,10 @@ final class ScriptedBmapDevices: BmapDeviceAccess {
   private(set) var opened: [String] = []
   /// How many SDP scans the controller has asked for.
   private(set) var scans = 0
+  /// While set, every open waits until `releaseOpens()` — an open still in flight, which
+  /// does not end on cancellation, the way a slow channel open need not.
+  var holdsOpens = false
+  private var heldOpens: [CheckedContinuation<Void, Never>] = []
 
   init(_ behaviours: KeyValuePairs<String, ScriptedBmapBehaviour>) {
     scanned = behaviours.map { candidate($0.key) }
@@ -89,8 +93,17 @@ final class ScriptedBmapDevices: BmapDeviceAccess {
     (BoseCatalog.fallbackConfig, nil)
   }
 
+  func releaseOpens() {
+    holdsOpens = false
+    heldOpens.forEach { $0.resume() }
+    heldOpens = []
+  }
+
   func open(address: String, timeout: Duration) async throws -> OpenedBmapChannel {
     opened.append(address)
+    if holdsOpens {
+      await withCheckedContinuation { heldOpens.append($0) }
+    }
     switch behaviours[address] ?? .refusesToOpen {
     case .refusesToOpen:
       throw BmapChannelOpenFailure.openTimedOut

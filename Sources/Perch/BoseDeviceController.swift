@@ -117,15 +117,22 @@ final class BoseDeviceController: ObservableObject {
   }
 
   func stop() async {
-    loopTask?.cancel()
+    let loop = loopTask
     loopTask = nil
+    loop?.cancel()
     stopWatchingOutput()
+    // A tick in flight carries on once its awaits resume. Torn down underneath it, it
+    // would put back a session and a readout with nothing left to clear them; cancelled,
+    // it finishes its pass and the loop ends, so it is waited for before the teardown.
+    await loop?.value
     await teardown()
   }
 
   /// Stops the loop and hands the live session to the caller to close. Used at
   /// termination, where the main thread blocks on a bound wait and so cannot run the
   /// main-actor `stop()`; `BoseSession` is its own actor, closable from a detached task.
+  /// Unlike `stop()` it does not wait for a tick in flight, and need not: with the main
+  /// thread blocked until the process exits, that tick never resumes.
   func detachForTermination() -> BoseSession? {
     loopTask?.cancel()
     loopTask = nil

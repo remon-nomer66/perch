@@ -79,6 +79,37 @@ private let control = "00-11-22-33-44-56"
   #expect(controller.panelModel == nil)
 }
 
+/// `stop()` while a connect is still in flight. The tick carries on once its open returns;
+/// stopping used to tear down underneath it, and the connect then put a session and a
+/// readout back with nothing left to clear them.
+@MainActor
+@Test func stoppingMidConnectLeavesNothingBehind() async throws {
+  let audio = ScriptedAudioOutput(bluetooth: output)
+  let devices = ScriptedBmapDevices([control: .readsBack])
+  devices.holdsOpens = true
+  let controller = BoseDeviceController(
+    audio: audio, devices: devices, refreshInterval: .seconds(3600)
+  )
+  controller.start()
+  while devices.opened.isEmpty { try await Task.sleep(for: .milliseconds(10)) }
+
+  let stopping = Task { await controller.stop() }
+  // Let `stop()` get as far as it will before the open returns.
+  for _ in 0..<20 { await Task.yield() }
+  devices.releaseOpens()
+  await stopping.value
+
+  // The resumed connect needs a few milliseconds at most to finish (every read on the
+  // cancelled task fails at once); watch well past that for anything it puts back.
+  let deadline = ContinuousClock.now.advanced(by: .milliseconds(300))
+  while ContinuousClock.now < deadline {
+    #expect(controller.readout == nil)
+    #expect(controller.panelModel == nil)
+    if controller.readout != nil || controller.panelModel != nil { break }
+    try await Task.sleep(for: .milliseconds(10))
+  }
+}
+
 // MARK: - Candidate rotation
 
 /// Two BMAP addresses answer for one output (seen on hardware: one product published two,
