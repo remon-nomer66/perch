@@ -23,7 +23,7 @@ private final class Writes {
 func releaseIsWrittenAtOnce() async {
   let writes = Writes()
   let timer = ManualTimer()
-  var pacer = DragWritePacer(sleep: timer.sleep)
+  let pacer = DragWritePacer(sleep: timer.sleep)
   pacer.report(isFinal: true, write: writes.recorder("a"))
   #expect(writes.log == ["a:final"])
   await timer.drain()
@@ -34,7 +34,7 @@ func releaseIsWrittenAtOnce() async {
 func intermediatesAreDebounced() async {
   let writes = Writes()
   let timer = ManualTimer()
-  var pacer = DragWritePacer(sleep: timer.sleep)
+  let pacer = DragWritePacer(sleep: timer.sleep)
   pacer.report(isFinal: false, write: writes.recorder("a"))
   pacer.report(isFinal: false, write: writes.recorder("b"))
   pacer.report(isFinal: false, write: writes.recorder("c"))
@@ -56,7 +56,7 @@ func intermediatesAreDebounced() async {
 func abandonedDragIsFinalised() async {
   let writes = Writes()
   let timer = ManualTimer()
-  var pacer = DragWritePacer(sleep: timer.sleep)
+  let pacer = DragWritePacer(sleep: timer.sleep)
   pacer.report(isFinal: false, write: writes.recorder("a"))
   await waitUntil { timer.pending == 1 }
   timer.fire()
@@ -74,7 +74,7 @@ func abandonedDragIsFinalised() async {
 func releaseSupersedesTheSettle() async {
   let writes = Writes()
   let timer = ManualTimer()
-  var pacer = DragWritePacer(sleep: timer.sleep)
+  let pacer = DragWritePacer(sleep: timer.sleep)
   pacer.report(isFinal: false, write: writes.recorder("a"))
   await waitUntil { timer.pending == 1 }
   timer.fire()
@@ -94,7 +94,7 @@ func releaseSupersedesTheSettle() async {
 func cancelDropsEverythingPending() async {
   let writes = Writes()
   let timer = ManualTimer()
-  var pacer = DragWritePacer(sleep: timer.sleep)
+  let pacer = DragWritePacer(sleep: timer.sleep)
   pacer.report(isFinal: false, write: writes.recorder("a"))
   pacer.cancel()
   await waitUntil { timer.pending == 1 }
@@ -102,6 +102,63 @@ func cancelDropsEverythingPending() async {
   await yieldToMainActor()
   #expect(writes.log.isEmpty)
   await timer.drain()
+}
+
+@MainActor
+@Test("A drag finalised on its own says so, until the next report or a cancel")
+func settledOnItsOwnLastsUntilTheNextReport() async {
+  let writes = Writes()
+  let timer = ManualTimer()
+  let pacer = DragWritePacer(sleep: timer.sleep)
+  pacer.report(isFinal: false, write: writes.recorder("a"))
+  #expect(!pacer.hasSettledOnItsOwn)
+  await waitUntil { timer.pending == 1 }
+  timer.fire()
+  await waitUntil { writes.log == ["a:intermediate"] && timer.pending == 1 }
+  #expect(!pacer.hasSettledOnItsOwn)
+  timer.fire()
+  await waitUntil { writes.log.count == 2 }
+  #expect(pacer.hasSettledOnItsOwn)
+
+  // Moving on: the drag continues, and the next release is a real one again.
+  pacer.report(isFinal: false, write: writes.recorder("b"))
+  #expect(!pacer.hasSettledOnItsOwn)
+  pacer.cancel()
+  await timer.drain()
+}
+
+@MainActor
+@Test("Cancelling forgets that the drag settled on its own")
+func cancelForgetsTheSettledFinal() async {
+  let writes = Writes()
+  let timer = ManualTimer()
+  let pacer = DragWritePacer(sleep: timer.sleep)
+  pacer.report(isFinal: false, write: writes.recorder("a"))
+  await waitUntil { timer.pending == 1 }
+  timer.fire()
+  await waitUntil { timer.pending == 1 && !writes.log.isEmpty }
+  timer.fire()
+  await waitUntil { pacer.hasSettledOnItsOwn }
+  pacer.cancel()
+  #expect(!pacer.hasSettledOnItsOwn)
+  await timer.drain()
+}
+
+@Test(
+  "A release repeats the drag's own final only when the drag settled on its own, unmoved",
+  arguments: [
+    (isFinal: true, settled: true, unchanged: true, repeats: true),
+    (isFinal: true, settled: true, unchanged: false, repeats: false),
+    (isFinal: true, settled: false, unchanged: true, repeats: false),
+    (isFinal: false, settled: true, unchanged: true, repeats: false),
+  ]
+)
+func releaseRepeatsTheSettledFinal(isFinal: Bool, settled: Bool, unchanged: Bool, repeats: Bool) {
+  #expect(
+    DragWritePacer.repeatsSettledFinal(
+      isFinal: isFinal, settledOnItsOwn: settled, valueUnchanged: unchanged
+    ) == repeats
+  )
 }
 
 @Test("The quiet spell is far longer than the debounce")

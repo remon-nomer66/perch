@@ -79,7 +79,8 @@ func writeReadBackKeepsTheTrack() async {
 @MainActor
 @Test("An intermediate drag value keeps its field guarded; only the final read-back lifts it")
 func onlyTheFinalLiftsADragsGuard() async {
-  let model = AppModel()
+  let timer = ManualTimer()
+  let model = AppModel(dragSleep: timer.sleep)
   let service = deviceLessService()
   model.panel.noiseControl = ambientReading
 
@@ -87,9 +88,10 @@ func onlyTheFinalLiftsADragsGuard() async {
   let dragged = model.panel.noiseControl
   #expect(dragged?.state.ambientLevel == 12)
 
-  // Let the paused-on value go out as an intermediate write, well before the quiet
-  // spell would finalise it on its own.
-  try? await Task.sleep(for: .milliseconds(300))
+  // The pointer pauses: the value goes out as an intermediate write.
+  await waitUntil { timer.pending == 1 }
+  timer.fire()
+  await waitUntil { timer.pending == 1 }
   await model.settleDeviceWrites()
   // The released session reads nothing back: an unguarded field would now be empty.
   await model.refresh(from: service, cause: .periodic)
@@ -99,6 +101,33 @@ func onlyTheFinalLiftsADragsGuard() async {
   await model.settleDeviceWrites()
   await model.refresh(from: service, cause: .periodic)
   #expect(model.panel.noiseControl == nil)
+  await timer.drain()
+}
+
+@MainActor
+@Test("A release left unsent after the drag settled on its own leaves nothing guarded")
+func skippedReleaseLeavesTheFieldUnguarded() async {
+  let timer = ManualTimer()
+  let model = AppModel(dragSleep: timer.sleep)
+  let service = deviceLessService()
+  model.panel.noiseControl = ambientReading
+
+  model.dragNoiseLevel(level: 12, isFinal: false, using: service)
+  await waitUntil { timer.pending == 1 }
+  timer.fire()  // the pause: an intermediate write
+  await waitUntil { timer.pending == 1 }
+  timer.fire()  // the quiet spell: finalised where it stopped
+  await yieldToMainActor()
+  await model.settleDeviceWrites()
+
+  // Released without moving since: the same final is not sent again. Skipping it must
+  // not strand a guard — had the release taken a token whose write never came, the
+  // field would stay frozen on the dragged value for a whole lease.
+  model.dragNoiseLevel(level: 12, isFinal: true, using: service)
+  await model.settleDeviceWrites()
+  await model.refresh(from: service, cause: .periodic)
+  #expect(model.panel.noiseControl == nil)
+  await timer.drain()
 }
 
 @MainActor

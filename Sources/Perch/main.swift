@@ -35,7 +35,10 @@ final class AppModel: ObservableObject {
   private var headTrackingGate: AnyCancellable?
   private var routeGate: AnyCancellable?
 
-  init() {
+  /// `dragSleep` times the drag pacers' waits; tests pass one they advance by hand.
+  init(dragSleep: @escaping @MainActor (Duration) async -> Void = { try? await Task.sleep(for: $0) }) {
+    levelDrag = DragWritePacer(sleep: dragSleep)
+    bandDrag = DragWritePacer(sleep: dragSleep)
     headTracking.applyPose = { [weak self] orientation, distanceRatio in
       self?.spatial.updateListenerPose(orientation, distanceRatio: distanceRatio)
     }
@@ -56,7 +59,7 @@ final class AppModel: ObservableObject {
   /// The panel is not updated optimistically: on an unverified model the headset may
   /// do something other than what was asked, and showing the requested value would
   /// hide exactly the mismatch worth seeing.
-  private var levelDrag = DragWritePacer()
+  private let levelDrag: DragWritePacer
   /// While holding, the periodic refresh leaves the noise-control reading alone, so
   /// the device's not-yet-updated value cannot overwrite the level being dragged.
   private var levelAdjustment = AdjustmentGuard()
@@ -146,6 +149,11 @@ final class AppModel: ObservableObject {
       ambientLevel: clamped,
       noiseAdaptation: reading.state.noiseAdaptation
     )
+    // A release after the drag settled on its own, unmoved: that final already went
+    // out, and its read-back lifts the guard. Skipped before any token is taken.
+    if levelDrag.repeatsItsOwnFinal(isFinal: isFinal, valueUnchanged: reading.state == target) {
+      return levelDrag.cancel()
+    }
 
     // Own the level for the whole gesture, including the final read-back, so the
     // periodic refresh cannot overwrite the slider with the device's lagging value
@@ -178,7 +186,7 @@ final class AppModel: ObservableObject {
   /// While holding, the periodic refresh leaves the equaliser reading alone so a band
   /// drag or preset change is not snapped back by the device's lagging value.
   private var equalizerAdjustment = AdjustmentGuard()
-  private var bandDrag = DragWritePacer()
+  private let bandDrag: DragWritePacer
 
   /// Selects a preset. The bands are left empty so the device loads the preset's own
   /// curve rather than being handed the current custom values.
@@ -204,6 +212,11 @@ final class AppModel: ObservableObject {
     guard let reading = panel.equalizer, let presetIdentifier = reading.editablePresetIdentifier
     else { return }
     let bands = reading.settingBand(index, toStep: step)
+    let unchanged = reading.selectedPreset == presetIdentifier && reading.bandSteps == bands.map(Int.init)
+    // As for the level: a release only repeating the drag's own final is not sent.
+    if bandDrag.repeatsItsOwnFinal(isFinal: isFinal, valueUnchanged: unchanged) {
+      return bandDrag.cancel()
+    }
     let token = equalizerAdjustment.begin()
     panel.equalizer = Self.equalizer(
       reading,
