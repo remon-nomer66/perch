@@ -54,7 +54,7 @@ final class AppModel: ObservableObject {
     }
   }
 
-  /// The parallel Bose control path. Runs its own loop; `refresh(from:)` reads its
+  /// The parallel Bose control path. Runs its own loop; `refresh(from:cause:)` reads its
   /// `readout` and folds it into the panel when Sony has no device. Started/stopped by
   /// the AppDelegate alongside the Sony session.
   let bose = BoseDeviceController()

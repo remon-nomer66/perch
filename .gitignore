@@ -7,7 +7,7 @@ DerivedData/
 .ruff_cache/
 CLAUDE.md
 
-# Runtime coordination for the single Sony control channel (never committed)
+# Runtime coordination for the single headset control channel (never committed)
 .control-session.lock
 .control-session.log
 __pycache__/

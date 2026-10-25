@@ -4,12 +4,12 @@ Conventions every agent working in this repository must follow.
 
 ## Single control session (most important)
 
-The headset exposes exactly **one** RFCOMM control channel. `Perch.app` and
-`perch-probe` both open it, so running two control clients at once hangs the
-second one. Coordinate through `tools/control-lock.sh`:
+The headset exposes exactly **one** RFCOMM control channel. `Perch.app`,
+`perch-probe` (Sony) and `bose-probe` (Bose) all open it, so running two control
+clients at once hangs the second one. Coordinate through `tools/control-lock.sh`:
 
-- Before launching either, acquire the lock; release it after stopping.
-  `app-start` / `app-stop` / `probe` wrap acquire and release for you.
+- Before launching any of them, acquire the lock; release it after stopping.
+  `app-start` / `app-stop` / `probe` / `bose-probe` wrap acquire and release for you.
 - If `status` reports BUSY, do not launch — find out who holds the lock first.
 - Never stop or take over another owner's running session without `force`,
   and use `force` only deliberately, after coordinating.
