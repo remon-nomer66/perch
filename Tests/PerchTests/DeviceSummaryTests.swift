@@ -17,6 +17,9 @@ func phaseMapsToStatus() {
   #expect(DeviceSummary.status(for: .contended, reason: nil) == .takenByAnotherDevice)
   #expect(DeviceSummary.status(for: .retryWaiting, reason: nil) == .unreachable)
   #expect(DeviceSummary.status(for: .retryExhausted, reason: nil) == .unreachable)
+  // Shown like exhaustion, retry button included: the session stopped trying and
+  // only an explicit retry moves it.
+  #expect(DeviceSummary.status(for: .incompatible, reason: nil) == .unreachable)
   #expect(DeviceSummary.status(for: .ready, reason: nil) == .ready)
 }
 

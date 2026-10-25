@@ -9,7 +9,7 @@ import AppKit
 @MainActor
 public final class PointerMonitor {
   public var onPointerMoved: ((CGPoint) -> Void)?
-  public var onClick: ((CGPoint) -> Void)?
+  public var onClick: ((PointerClick) -> Void)?
 
   private var globalMonitors: [Any] = []
   private var localMonitor: Any?
@@ -28,20 +28,28 @@ public final class PointerMonitor {
     }) {
       globalMonitors.append(monitor)
     }
-    if let monitor = NSEvent.addGlobalMonitorForEvents(matching: clicks, handler: { [weak self] _ in
-      MainActor.assumeIsolated { self?.reportClick() }
+    if let monitor = NSEvent.addGlobalMonitorForEvents(matching: clicks, handler: { [weak self] event in
+      let clickCount = event.clickCount
+      MainActor.assumeIsolated {
+        self?.reportClick(route: .global, clickCount: clickCount, windowNumber: nil)
+      }
     }) {
       globalMonitors.append(monitor)
     }
 
     localMonitor = NSEvent.addLocalMonitorForEvents(matching: movement.union(clicks)) { [weak self] event in
+      // Clicks must be reported as clicks here too: once the panel is open the
+      // window is interactive, so a click on the notch arrives through this
+      // monitor — and closing on that click is how the panel is dismissed from
+      // where the pointer already is. While closed, a press on the bar lands on the
+      // click catcher and arrives here as well, which is the route that opens it.
+      let isClick = clicks.contains(NSEvent.EventTypeMask(type: event.type))
+      // Read only for a press: asking anything else for its click count raises.
+      let clickCount = isClick ? event.clickCount : 0
+      let windowNumber = event.windowNumber
       MainActor.assumeIsolated {
-        // Clicks must be reported as clicks here too: once the panel is open the
-        // window is interactive, so a click on the notch arrives through this
-        // monitor — and closing on that click is how the panel is dismissed from
-        // where the pointer already is.
-        if clicks.contains(NSEvent.EventTypeMask(type: event.type)) {
-          self?.reportClick()
+        if isClick {
+          self?.reportClick(route: .local, clickCount: clickCount, windowNumber: windowNumber)
         } else {
           self?.reportPointer()
         }
@@ -71,7 +79,17 @@ public final class PointerMonitor {
     onPointerMoved?(NSEvent.mouseLocation)
   }
 
-  private func reportClick() {
-    onClick?(NSEvent.mouseLocation)
+  /// The location is read from `NSEvent.mouseLocation` on both routes, so the two speak
+  /// the same global coordinates without converting from a window that may be gone.
+  /// AppKit numbers "no window" 0, which is kept as no window rather than a number.
+  private func reportClick(route: PointerClick.Route, clickCount: Int, windowNumber: Int?) {
+    onClick?(
+      PointerClick(
+        location: NSEvent.mouseLocation,
+        route: route,
+        clickCount: clickCount,
+        windowNumber: windowNumber.flatMap { $0 > 0 ? $0 : nil }
+      )
+    )
   }
 }

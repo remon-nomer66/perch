@@ -10,34 +10,6 @@ import TandemSession
 // control, listening mode, speak-to-chat, and call-time sidetone are all read from
 // the headset.
 
-/// Guards one panel field against the periodic refresh while writes are in flight.
-///
-/// Consecutive writes to the same field overlap: were the guard a plain flag, the
-/// first write's completion would lift it while the second is still waiting, and the
-/// refresh would snap the control back to the device's lagging value. Each `begin`
-/// issues a fresh token; only the latest token's holder may lift the guard.
-private struct AdjustmentGuard {
-  private(set) var isHolding = false
-  private var generation = 0
-
-  mutating func begin() -> Int {
-    generation += 1
-    isHolding = true
-    return generation
-  }
-
-  /// Lifts the guard, unless a later `begin` has superseded this token.
-  mutating func end(_ token: Int) {
-    if generation == token { isHolding = false }
-  }
-
-  /// Lifts the guard now and invalidates every outstanding token.
-  mutating func cancel() {
-    generation += 1
-    isHolding = false
-  }
-}
-
 @MainActor
 final class AppModel: ObservableObject {
   @Published var panel = PanelModel()
@@ -63,7 +35,10 @@ final class AppModel: ObservableObject {
   private var headTrackingGate: AnyCancellable?
   private var routeGate: AnyCancellable?
 
-  init() {
+  /// `dragSleep` times the drag pacers' waits; tests pass one they advance by hand.
+  init(dragSleep: @escaping @MainActor (Duration) async -> Void = { try? await Task.sleep(for: $0) }) {
+    levelDrag = DragWritePacer(sleep: dragSleep)
+    bandDrag = DragWritePacer(sleep: dragSleep)
     headTracking.applyPose = { [weak self] orientation, distanceRatio in
       self?.spatial.updateListenerPose(orientation, distanceRatio: distanceRatio)
     }
@@ -89,7 +64,7 @@ final class AppModel: ObservableObject {
   /// The panel is not updated optimistically: on an unverified model the headset may
   /// do something other than what was asked, and showing the requested value would
   /// hide exactly the mismatch worth seeing.
-  private var levelDrag: Task<Void, Never>?
+  private let levelDrag: DragWritePacer
   /// While holding, the periodic refresh leaves the noise-control reading alone, so
   /// the device's not-yet-updated value cannot overwrite the level being dragged.
   private var levelAdjustment = AdjustmentGuard()
@@ -97,16 +72,43 @@ final class AppModel: ObservableObject {
   /// device that takes a moment to apply a mode change cannot snap the picker back.
   private var listeningAdjustment = AdjustmentGuard()
 
-  /// Device writes land in the order they were asked. Each write is its own Task, and
-  /// two independent Tasks can reach the session actor in either order — a rule switch
-  /// whose "restore the old value" landed *after* the new rule's write was exactly that
-  /// race. Every write hops onto the tail of the previous one instead.
-  private var deviceWriteChain: Task<Void, Never>?
-  private func enqueueDeviceWrite(_ operation: @escaping @MainActor () async -> Void) {
-    let previous = deviceWriteChain
-    deviceWriteChain = Task { @MainActor in
-      await previous?.value
-      await operation()
+  /// Device writes land in the order they were asked — tiles, pickers, switches and
+  /// drags alike; see `DeviceWriteChain`.
+  private var deviceWrites = DeviceWriteChain()
+
+  /// Waits until every device write asked so far has landed or been given up on.
+  /// Exposed for tests; nothing in the app waits on the chain.
+  func settleDeviceWrites() async {
+    await deviceWrites.settled()
+  }
+
+  /// Queues a write to a guarded field. `send` puts it on the wire; what happens around
+  /// it — sent at all, read back, guard lifted — is `GuardedWrite`'s decision, taken
+  /// when the write's turn comes rather than when it was asked.
+  ///
+  /// The guard's lease is renewed as the write progresses — when it is queued (a drag's
+  /// pacer queues seconds after the last report), each time the chain ahead of it
+  /// advances, when it starts, and before its read-back — so it never lapses while the
+  /// write is merely waiting; see `AdjustmentGuard`.
+  private func enqueueGuardedWrite(
+    _ field: ReferenceWritableKeyPath<AppModel, AdjustmentGuard>,
+    token: Int,
+    isFinal: Bool = true,
+    using service: SessionService,
+    send: @escaping @MainActor (SessionCoordinator) async -> Void
+  ) {
+    self[keyPath: field].renew(token)
+    deviceWrites.enqueue(whileQueued: { [weak self] in self?[keyPath: field].renew(token) }) {
+      [weak self] in
+      guard let self else { return }
+      let step = GuardedWrite.step(isFinal: isFinal, isCurrent: self[keyPath: field].isCurrent(token))
+      guard step.sends else { return }
+      self[keyPath: field].renew(token)
+      await send(await service.session)
+      guard step.liftsGuard else { return }
+      self[keyPath: field].renew(token)
+      await self.refresh(from: service, cause: .deviceWrite)
+      self[keyPath: field].end(token)
     }
   }
 
@@ -120,21 +122,18 @@ final class AppModel: ObservableObject {
       selection: target,
       savedRoom: savedRoom
     )
-    enqueueDeviceWrite { [weak self] in
-      let session = await service.session
-      try? await session.apply(listeningSelection: target)
-      await self?.refresh(from: service)
-      self?.listeningAdjustment.end(token)
+    enqueueGuardedWrite(\.listeningAdjustment, token: token, using: service) {
+      try? await $0.apply(listeningSelection: target)
     }
   }
 
   func applyNoiseControl(_ target: TandemNoiseControlState, using service: SessionService) {
-    levelDrag?.cancel()
+    levelDrag.cancel()
     levelAdjustment.cancel()
-    enqueueDeviceWrite { [weak self] in
+    deviceWrites.enqueue { [weak self] in
       let session = await service.session
       try? await session.apply(noiseControl: target)
-      await self?.refresh(from: service)
+      await self?.refresh(from: service, cause: .deviceWrite)
     }
   }
 
@@ -142,8 +141,9 @@ final class AppModel: ObservableObject {
   ///
   /// The target is built from the current reading each time, so the release sends the
   /// value the finger actually settled on rather than a stale captured one.
-  /// Intermediate values are debounced and sent as non-final; only the release is read
-  /// back and reflected in the panel.
+  /// Intermediate values are debounced and sent as non-final; only the release — or,
+  /// should none come, the value the drag stopped on — is read back and reflected in
+  /// the panel. See `DragWritePacer`.
   func dragNoiseLevel(level: Int, isFinal: Bool, using service: SessionService) {
     guard let reading = panel.noiseControl else { return }
     let clamped = reading.quantizedLevel(level, mode: reading.state.ambientMode)
@@ -154,6 +154,11 @@ final class AppModel: ObservableObject {
       ambientLevel: clamped,
       noiseAdaptation: reading.state.noiseAdaptation
     )
+    // A release after the drag settled on its own, unmoved: that final already went
+    // out, and its read-back lifts the guard. Skipped before any token is taken.
+    if levelDrag.repeatsItsOwnFinal(isFinal: isFinal, valueUnchanged: reading.state == target) {
+      return levelDrag.cancel()
+    }
 
     // Own the level for the whole gesture, including the final read-back, so the
     // periodic refresh cannot overwrite the slider with the device's lagging value
@@ -167,25 +172,26 @@ final class AppModel: ObservableObject {
       legacyWindKind: reading.legacyWindKind
     )
 
-    levelDrag?.cancel()
-    levelDrag = Task {
-      if !isFinal {
-        try? await Task.sleep(for: .milliseconds(90))
-        if Task.isCancelled { return }
-      }
-      let session = await service.session
-      try? await session.apply(noiseControl: target, isFinal: isFinal)
-      if isFinal {
-        await refresh(from: service)
-        levelAdjustment.end(token)
-      }
+    levelDrag.report(isFinal: isFinal) { [weak self] isFinal in
+      self?.writeLevel(target, isFinal: isFinal, token: token, using: service)
+    }
+  }
+
+  /// Queues one level write behind the others. An intermediate value overtaken while
+  /// it waited is dropped and a final always lands; why dropping is safe — every report
+  /// that takes the token reaches the pacer, which writes it — is on `GuardedWrite`.
+  private func writeLevel(
+    _ target: TandemNoiseControlState, isFinal: Bool, token: Int, using service: SessionService
+  ) {
+    enqueueGuardedWrite(\.levelAdjustment, token: token, isFinal: isFinal, using: service) {
+      try? await $0.apply(noiseControl: target, isFinal: isFinal)
     }
   }
 
   /// While holding, the periodic refresh leaves the equaliser reading alone so a band
   /// drag or preset change is not snapped back by the device's lagging value.
   private var equalizerAdjustment = AdjustmentGuard()
-  private var bandDrag: Task<Void, Never>?
+  private let bandDrag: DragWritePacer
 
   /// Selects a preset. The bands are left empty so the device loads the preset's own
   /// curve rather than being handed the current custom values.
@@ -193,18 +199,15 @@ final class AppModel: ObservableObject {
     _ identifier: UInt8, bandSteps: [UInt8] = [], using service: SessionService
   ) {
     guard let reading = panel.equalizer else { return }
-    bandDrag?.cancel()
+    bandDrag.cancel()
     let token = equalizerAdjustment.begin()
     panel.equalizer = Self.equalizer(
       reading,
       selectedPreset: identifier,
       bandSteps: bandSteps.isEmpty ? reading.bandSteps : bandSteps.map(Int.init)
     )
-    enqueueDeviceWrite { [weak self] in
-      let session = await service.session
-      try? await session.apply(equalizerPreset: identifier, bandSteps: bandSteps)
-      await self?.refresh(from: service)
-      self?.equalizerAdjustment.end(token)
+    enqueueGuardedWrite(\.equalizerAdjustment, token: token, using: service) {
+      try? await $0.apply(equalizerPreset: identifier, bandSteps: bandSteps)
     }
   }
 
@@ -214,31 +217,31 @@ final class AppModel: ObservableObject {
     guard let reading = panel.equalizer, let presetIdentifier = reading.editablePresetIdentifier
     else { return }
     let bands = reading.settingBand(index, toStep: step)
-    // The settled curve is remembered app-side as well as by the device, so the
-    // user's own shape survives the device being adjusted from elsewhere.
-    if isFinal { onBandsCommitted?(presetIdentifier, bands.map(Int.init)) }
+    let unchanged = reading.selectedPreset == presetIdentifier && reading.bandSteps == bands.map(Int.init)
+    // As for the level: a release only repeating the drag's own final is not sent.
+    if bandDrag.repeatsItsOwnFinal(isFinal: isFinal, valueUnchanged: unchanged) {
+      return bandDrag.cancel()
+    }
     let token = equalizerAdjustment.begin()
     panel.equalizer = Self.equalizer(
       reading,
       selectedPreset: presetIdentifier,
       bandSteps: bands.map(Int.init)
     )
-    bandDrag?.cancel()
-    bandDrag = Task {
-      if !isFinal {
-        try? await Task.sleep(for: .milliseconds(90))
-        if Task.isCancelled { return }
-      }
-      let session = await service.session
-      try? await session.apply(
-        equalizerPreset: presetIdentifier,
-        bandSteps: bands,
-        isFinal: isFinal
-      )
-      if isFinal {
-        await refresh(from: service)
-        equalizerAdjustment.end(token)
-      }
+    bandDrag.report(isFinal: isFinal) { [weak self] isFinal in
+      self?.writeBands(bands, preset: presetIdentifier, isFinal: isFinal, token: token, using: service)
+    }
+  }
+
+  /// Queues one band write, the way `writeLevel` queues a level.
+  private func writeBands(
+    _ bands: [UInt8], preset: UInt8, isFinal: Bool, token: Int, using service: SessionService
+  ) {
+    // The settled curve is remembered app-side as well as by the device, so the
+    // user's own shape survives the device being adjusted from elsewhere.
+    if isFinal { onBandsCommitted?(preset, bands.map(Int.init)) }
+    enqueueGuardedWrite(\.equalizerAdjustment, token: token, isFinal: isFinal, using: service) {
+      try? await $0.apply(equalizerPreset: preset, bandSteps: bands, isFinal: isFinal)
     }
   }
 
@@ -272,12 +275,16 @@ final class AppModel: ObservableObject {
   private var hadContent = false
   private var arrivalAnnounceUntil: ContinuousClock.Instant?
 
-  /// Pulls what the session knows into the shape the panel draws.
-  func refresh(from service: SessionService) async {
+  /// Pulls what the session knows into the shape the panel draws. Only the periodic
+  /// refresh asks the players; a write's read-back passes `.deviceWrite` and keeps the
+  /// track shown — see `PanelRefreshCause`.
+  func refresh(from service: SessionService, cause: PanelRefreshCause) async {
     // Asked first: the Apple Events answer can take up to its deadline, and the
     // guarded panel fields below must be read and published without that wait
     // sitting between them.
-    let nowPlaying = playerQueriesAllowed ? await nowPlayingService.read() : nil
+    let nowPlaying = await cause.nowPlaying(queriesAllowed: playerQueriesAllowed) {
+      await nowPlayingService.read()
+    }
     let session = await service.session
     // One consistent hop: read piecemeal, an invalidation could land mid-read and show
     // a ready phase with no model name for a frame — which device-scoped rules read as
@@ -298,13 +305,13 @@ final class AppModel: ObservableObject {
 
     let readings = snap.readings
     next.summary.codec = readings.codec?.description
-    next.equalizer = equalizerAdjustment.isHolding ? panel.equalizer : readings.equalizer
-    next.listeningMode = listeningAdjustment.isHolding ? panel.listeningMode : readings.listeningMode
-    next.speakToChat = speakToChatAdjustment.isHolding ? panel.speakToChat : readings.speakToChat
-    next.sidetone = sidetoneAdjustment.isHolding ? panel.sidetone : readings.sidetone
+    next.equalizer = equalizerAdjustment.isHolding() ? panel.equalizer : readings.equalizer
+    next.listeningMode = listeningAdjustment.isHolding() ? panel.listeningMode : readings.listeningMode
+    next.speakToChat = speakToChatAdjustment.isHolding() ? panel.speakToChat : readings.speakToChat
+    next.sidetone = sidetoneAdjustment.isHolding() ? panel.sidetone : readings.sidetone
     // A drag in progress owns the level; the device's lagging value must not clobber
     // it mid-gesture.
-    next.noiseControl = levelAdjustment.isHolding ? panel.noiseControl : readings.noiseControl
+    next.noiseControl = levelAdjustment.isHolding() ? panel.noiseControl : readings.noiseControl
     next.battery = Self.batteryLayout(for: fingerprint, readings: readings)
 
     // Bose runs in parallel. When Sony has no controllable device, a Bose device that is
@@ -313,14 +320,7 @@ final class AppModel: ObservableObject {
     // decided; see `PanelModel.foldingIn(bose:)`.
     next = next.foldingIn(bose: bose.readout)
 
-    next.nowPlaying = nowPlaying.map {
-      PanelModel.NowPlaying(
-        title: $0.title,
-        artist: $0.artist,
-        isPlaying: $0.isPlaying,
-        artworkURL: $0.artworkURL
-      )
-    }
+    next.nowPlaying = nowPlaying.resolved(current: panel.nowPlaying)
     // A device that went away takes the editor preview with it: there is nothing left
     // to put back, and stale values must not land on the next device.
     if !next.summary.isControllable {
@@ -330,10 +330,9 @@ final class AppModel: ObservableObject {
       ruleHold = nil
     }
 
-    // The same condition NotchPanelView.hasContent widens the bar by: its rising
-    // edge opens the five-second announcement window the quiet mode shows.
-    let hasContent = next.summary.isControllable
-      && (next.summary.modelName != nil || next.battery != .unknown)
+    // The same condition the bar widens by: its rising edge opens the five-second
+    // announcement window the quiet mode shows.
+    let hasContent = next.hasContent
     if hasContent, !hadContent {
       arrivalAnnounceUntil = ContinuousClock.now.advanced(by: .seconds(5))
       // A device arriving always turns spatial audio off. Arriving mid-capture — the
@@ -435,11 +434,8 @@ final class AppModel: ObservableObject {
     guard let current = panel.speakToChat else { return }
     let token = speakToChatAdjustment.begin()
     panel.speakToChat = Self.speakToChat(current, isEnabled: enabled)
-    Task {
-      let session = await service.session
-      try? await session.apply(speakToChatEnabled: enabled)
-      await refresh(from: service)
-      speakToChatAdjustment.end(token)
+    enqueueGuardedWrite(\.speakToChatAdjustment, token: token, using: service) {
+      try? await $0.apply(speakToChatEnabled: enabled)
     }
   }
 
@@ -451,11 +447,8 @@ final class AppModel: ObservableObject {
     guard let current = panel.speakToChat else { return }
     let token = speakToChatAdjustment.begin()
     panel.speakToChat = Self.speakToChat(current, sensitivity: sensitivity, timeout: timeout)
-    Task {
-      let session = await service.session
-      try? await session.apply(speakToChatSensitivity: sensitivity, timeout: timeout)
-      await refresh(from: service)
-      speakToChatAdjustment.end(token)
+    enqueueGuardedWrite(\.speakToChatAdjustment, token: token, using: service) {
+      try? await $0.apply(speakToChatSensitivity: sensitivity, timeout: timeout)
     }
   }
 
@@ -490,11 +483,8 @@ final class AppModel: ObservableObject {
         value: .boolean(enabled)
       )
     )
-    Task {
-      let session = await service.session
-      try? await session.apply(sidetoneEnabled: enabled)
-      await refresh(from: service)
-      sidetoneAdjustment.end(token)
+    enqueueGuardedWrite(\.sidetoneAdjustment, token: token, using: service) {
+      try? await $0.apply(sidetoneEnabled: enabled)
     }
   }
 
@@ -880,17 +870,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       // whichever way the notch went.
       MainActor.assumeIsolated { self?.installStatusItem() }
     }
-    // The hover target follows the bar's drawn size: while the bar stays bare —
-    // nothing to carry yet, or quiet mode with the panel closed — only the cutout
-    // itself reacts to the pointer, not the invisible side reaches of the hidden bar.
+    // The hover target follows the bar's drawn size by the very rule the view draws
+    // by: while the bar stays bare — nothing to carry yet, or quiet mode with nothing
+    // to announce — only the cutout itself reacts, not the hidden bar's side reaches.
     controller.isBarVisible = { [weak controller] in
       guard let controller else { return true }
-      let summary = model.panel.summary
-      // The same condition NotchPanelView.hasContent widens the bar by.
-      let hasContent = summary.isControllable
-        && (summary.modelName != nil || model.panel.battery != .unknown)
-      guard hasContent else { return false }
-      return settingsStore.notchDisplayMode == .always || controller.presentation != .closed
+      return NotchBarVisibility.isExtended(
+        model: model.panel,
+        isVirtual: controller.isVirtualNotch,
+        displayMode: settingsStore.notchDisplayMode,
+        presentation: controller.presentation
+      )
     }
     self.controller = controller
 
@@ -931,10 +921,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // Turning the virtual notch on or off does not change the geometry — no screen was
     // plugged or unplugged — so the screen-parameter observer never fires. Re-evaluate
     // the choice of notch directly. `dropFirst` skips the value `start()` already
-    // reflected at launch; `refresh` is a no-op while the notch is switched off.
+    // reflected at launch; `refresh` is a no-op while the notch is switched off. The
+    // controller reads the setting back through its closure, so the refresh waits for
+    // the assignment to land — called from the publisher itself, it rebuilt against
+    // the value being left.
     settingsStore.$isVirtualNotchEnabled
       .removeDuplicates()
       .dropFirst()
+      .afterAssignment()
       .sink { [weak controller] _ in controller?.refresh() }
       .store(in: &cancellables)
 
@@ -1002,7 +996,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     Task {
       await service.start()
       while !Task.isCancelled {
-        await model.refresh(from: service)
+        await model.refresh(from: service, cause: .periodic)
         try? await Task.sleep(for: .milliseconds(500))
       }
     }
@@ -1212,7 +1206,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // The bundle should always carry the artwork; a bare symbol beats an empty slot
     // in the bar if it somehow does not. The symbol is always drawn as a template —
     // a non-template stand-in would be invisible against a matching menu bar.
-    let bundled = Bundle.module.image(forResource: name)
+    //
+    // Read from the app bundle, never `Bundle.module`. SwiftPM's accessor for an
+    // *executable* target looks in exactly two places — `Bundle.main.bundleURL`
+    // (the .app's own directory, not its Resources) and the absolute build path
+    // baked in at compile time — and calls `fatalError` when both miss. Packaged
+    // into an .app the first always misses, so the app ran only on a machine that
+    // still had the build tree at that exact path: on every other Mac it crashed
+    // here at launch. `Bundle.main` finds what package_app.sh installs, and a miss
+    // falls through to the symbol below instead of killing the process.
+    let bundled = Bundle.main.image(forResource: name)
     guard
       let image = bundled
         ?? NSImage(systemSymbolName: "headphones", accessibilityDescription: "Perch")

@@ -112,6 +112,23 @@ import Testing
   #expect(spatializer.hasReceivedAudio)
 }
 
+@available(macOS 14.4, *)
+@Test func everyAudibleBlockIsCountedNotJustTheFirst() throws {
+  // オンにした後の見張りは「いまも音が届いているか」を知りたい。最初の信号で走査を
+  // 打ち切ると、後から黙ったタップ（許可を取り消された等）を見分けられない。
+  let spatializer = try MultibandSpatializer(muteOriginal: false)
+  let silent = [Float](repeating: 0, count: 256)
+  var tone = silent
+  tone[3] = 0.5
+  #expect(spatializer.audibleBlockCount == 0)
+  spatializer.feed(left: tone, right: silent)
+  spatializer.feed(left: silent, right: silent)
+  #expect(spatializer.audibleBlockCount == 1)
+  spatializer.feed(left: silent, right: tone)
+  #expect(spatializer.audibleBlockCount == 2)
+  #expect(spatializer.hasAudioSignal)
+}
+
 // MARK: - 出力構成の変更通知
 
 @available(macOS 14.4, *)

@@ -12,3 +12,13 @@ CLAUDE.md
 .control-session.log
 __pycache__/
 *.pyc
+
+# Signing and notarization credentials. The build never reads these — it takes an
+# identity *name* and a Keychain profile *name*, and the secrets stay in the
+# Keychain — so a file matching one of these in the tree is an accident.
+*.p12
+*.p8
+*.cer
+*.certSigningRequest
+*.mobileprovision
+*.provisionprofile

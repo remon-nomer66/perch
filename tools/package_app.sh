@@ -64,11 +64,40 @@ if [ -n "$build_number" ]; then
         "$app_dir/Contents/Info.plist"
 fi
 
-# SwiftPM resource bundle (menu bar icons). Bundle.module looks for it in
-# Contents/Resources and traps when it is missing, so it must ride along. Everything
-# under Contents/Resources has to land before codesign seals the bundle.
+# Menu bar icons. SwiftPM collects them into a resource bundle; they are installed
+# flat into Contents/Resources, where `Bundle.main` finds them — which is what the
+# app reads. Copying the .bundle wholesale instead is what shipped before, and it
+# never worked off this machine: SwiftPM's `Bundle.module` accessor for an
+# executable target looks only in Bundle.main.bundleURL (the .app itself, not its
+# Resources) and the build path baked in at compile time, so the app fell back to
+# the developer's own build tree and crashed at launch anywhere else.
+#
+# Everything under Contents/Resources has to land before codesign seals the bundle.
+#
+# Where inside the bundle the PNGs sit depends on the toolchain: older SwiftPM builds
+# leave them flat at the bundle's root, while the Swift Build backend (Swift 6.4,
+# `.build/debug -> out/Products/Debug`) makes a real macOS bundle and puts them in
+# Contents/Resources. Looking only at the root found nothing on the newer toolchain,
+# so debug builds quietly fell back to the symbol and release builds aborted below.
+# Both layouts are searched; the signature directory is never a source of icons.
 mkdir -p "$app_dir/Contents/Resources"
-cp -R "$build_dir/Perch_Perch.bundle" "$app_dir/Contents/Resources/"
+icon_bundle="$build_dir/Perch_Perch.bundle"
+if [ -d "$icon_bundle" ]; then
+    find "$icon_bundle" -maxdepth 3 -type f -name '*.png' -not -path '*/_CodeSignature/*' \
+        -exec install -m 0644 {} "$app_dir/Contents/Resources/" \;
+fi
+
+# Checked, not assumed. The build tree is the one place these are certain to exist,
+# which is exactly why a packaging mistake here stays invisible on the machine that
+# built it and only shows up on someone else's Mac.
+installed_icons=$(find "$app_dir/Contents/Resources" -maxdepth 1 -name '*.png' | wc -l)
+if [ "$installed_icons" -eq 0 ]; then
+    if [ "$configuration" = "release" ]; then
+        echo "error: no menu bar icon reached Contents/Resources; aborting." >&2
+        exit 1
+    fi
+    echo "warning: no menu bar icon installed; the bar falls back to a symbol." >&2
+fi
 
 # Localized permission strings. Info.plist holds the English defaults; each .lproj
 # overrides them for its language.
