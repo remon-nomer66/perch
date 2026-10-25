@@ -144,6 +144,10 @@ private struct GeneralTab: View {
   @ObservedObject var bose: BoseDeviceController
   let service: SessionService
 
+  private var controls: DeviceControls {
+    DeviceControls(panel: model.panel, bosePanel: bose.panelModel)
+  }
+
   var body: some View {
     ScrollView {
       VStack(alignment: .leading, spacing: 12) {
@@ -156,9 +160,17 @@ private struct GeneralTab: View {
         // A Bose device owns the controls: its own panel (noise/ambient, equalizer,
         // immersive audio) reading and writing over the live BMAP session. Shown instead
         // of the Sony pages, which are for the Tandem session that is idle here.
-        if let boseModel = bose.panelModel {
+        //
+        // Which brand draws is `DeviceControls` — the one decision the notch reads too,
+        // made from the panel's ownership (`model.panel.isBose`). A live `bose.panelModel`
+        // alone is not it: a Bose session can be open while Sony still holds a
+        // controllable device, and judging by the session drew Bose controls here while
+        // the notch drew Sony's. Nor is "anything controllable": under Bose ownership with
+        // no live panel, that fell through to Sony's controls.
+        switch controls {
+        case .bose(let boseModel):
           BoseControlsSection(model: boseModel)
-        } else if model.panel.summary.isControllable {
+        case .sony:
           if let caveat = model.panel.summary.caveat {
             Label(caveat, systemImage: "exclamationmark.triangle.fill")
               .font(.system(size: 11))
@@ -178,6 +190,8 @@ private struct GeneralTab: View {
               await service.session.gestureCaptures()
             }
           )
+        case .neither:
+          EmptyView()
         }
 
         // The common (device-independent) sheets — spatial audio above all — need no
@@ -188,10 +202,7 @@ private struct GeneralTab: View {
         // just the common sheets follow.
         ForEach(
           model.panelPages(using: service)
-            .filter { page in
-              if bose.panelModel != nil { return page.isCommon }
-              return model.panel.summary.isControllable || page.isCommon
-            }
+            .filter { page in controls.drawsSonyPages || page.isCommon }
         ) { page in
           page.content
             .frame(maxWidth: .infinity, alignment: .topLeading)
@@ -291,6 +302,10 @@ private struct DeviceStatusHeader: View {
       ]
       .compactMap(\.self)
       .joined(separator: "  ")
+    case .numbered(let cells):
+      cells
+        .compactMap { cell in cell.percent.map { "\(cell.slot) \($0)%" } }
+        .joined(separator: "  ")
     case .unknown:
       ""
     }
@@ -392,19 +407,10 @@ private struct BehaviorTab: View {
         // The choices a rule offers are the connected device's declarations, so a rule
         // is written against a real device — and while writing one, each choice lands
         // on the device at once so it can be judged by ear.
-        if model.panel.summary.isControllable {
+        if model.supportsRules {
           newRuleEditor
         } else {
-          Text(
-            L(
-              "ルールの追加は機器の接続中に行えます。接続中は選んだ設定がその場で機器に反映され、"
-                + "聴きながら選べます。",
-              "Rules can be added while a device is connected. While connected, each choice "
-                + "is applied to the device right away, so it can be judged by ear."
-            )
-          )
-          .font(.system(size: 11))
-          .foregroundStyle(.secondary)
+          RuleEditorUnavailableNotice(reason: model.ruleUnavailableReason)
         }
       }
 

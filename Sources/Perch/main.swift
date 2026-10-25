@@ -309,18 +309,9 @@ final class AppModel: ObservableObject {
 
     // Bose runs in parallel. When Sony has no controllable device, a Bose device that is
     // the current audio output owns the summary and battery, so the shared closed bar and
-    // the General tab show it instead of "対応機器なし". Read-only for now — the expanded
-    // Bose controls are a later milestone.
-    if !next.summary.isControllable, let bose = bose.readout {
-      next.summary.status = bose.status
-      next.summary.modelName = bose.modelName
-      next.summary.firmwareVersion = bose.firmwareVersion
-      // Ultra 2 accepts the live noise-control and equalizer writes the Bose panel sends,
-      // so the header shows no read-only caveat — matching the writable Bose controls.
-      next.summary.acceptsWrites = true
-      next.battery = bose.battery
-      next.isBose = true
-    }
+    // the General tab show it instead of "対応機器なし". This is the one place ownership is
+    // decided; see `PanelModel.foldingIn(bose:)`.
+    next = next.foldingIn(bose: bose.readout)
 
     next.nowPlaying = nowPlaying.map {
       PanelModel.NowPlaying(
@@ -365,7 +356,8 @@ final class AppModel: ObservableObject {
     // sheets it actually has, not the fixed Sony count. The non-readable states collapse
     // to the common sheets plus one status sheet for either brand.
     let stops: Int
-    if next.isBose, next.summary.isControllable, let boseModel = bose.panelModel {
+    if case .bose(let boseModel) = DeviceControls(panel: next, bosePanel: bose.panelModel),
+      next.summary.isControllable {
       stops = BoseNotchLayout.pageCount(for: boseModel.state)
     } else {
       stops = Self.pagerStops(for: next.summary.status)
@@ -545,11 +537,29 @@ final class AppModel: ObservableObject {
 
   func playingNow() async -> NowPlayingService.PlayingAnswer { await nowPlayingService.playing() }
 
+  /// Whether rules can act on the device that owns the panel right now. See
+  /// `PanelModel.supportsRules`.
+  var supportsRules: Bool { panel.supportsRules }
+
+  /// Why the rule editor is withheld, for the notice shown in its place.
+  var ruleUnavailableReason: RuleEditorUnavailableNotice.Reason { panel.ruleUnavailableReason }
+
   /// Applies the matched rule, first undoing whichever rule held before it.
   ///
   /// A hold is kept even when the rule changed nothing, so a source that is already
   /// set up right does not have later manual adjustments captured as its own.
   func applyRule(_ rule: SoundRule?, using service: SessionService) {
+    // A device without rule support is refused up front rather than falling through every
+    // branch below on nil readings: the outcome was the same silent no-op, but nothing in
+    // the code said so, and the editor happily wrote rules that could never fire. Any hold
+    // still standing is released first — the rule that set it applied to another device.
+    guard supportsRules else {
+      if let hold = ruleHold {
+        release(hold, using: service)
+        ruleHold = nil
+      }
+      return
+    }
     // The hold being replaced is kept around: its restore writes are still in
     // flight, so for a field both rules touch the panel still shows the old rule's
     // value — the true original lives only in the old hold.
@@ -1370,7 +1380,9 @@ private struct NotchPanelBridge: View {
   /// spatial/sidetone), matching the General tab; otherwise the Sony sheets are shown, which
   /// also carry the common spatial sheet when no device is connected at all.
   private var notchPages: [PanelPage] {
-    if model.panel.isBose, let boseModel = model.bose.panelModel {
+    // The same decision the General tab draws from, so the two show one brand.
+    let controls = DeviceControls(panel: model.panel, bosePanel: model.bose.panelModel)
+    if case .bose(let boseModel) = controls {
       return model.bosePanelPages(boseModel)
     }
     return model.panelPages(using: service)

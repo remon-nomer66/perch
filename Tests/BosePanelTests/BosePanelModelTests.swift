@@ -121,11 +121,15 @@ struct BosePanelModelTests {
     #expect(model.state.audioModes?.selectedSlot == 4)
   }
 
-  @Test("Setting sidetone updates the state")
-  func setSidetone() {
+  /// Sidetone has no reverse-engineered wire mapping, so nothing reads it back and the
+  /// setter writes nothing. The panel therefore never offers the control — a switch that
+  /// moves under the finger and changes nothing on the device is worse than its absence.
+  @Test("Sidetone is not exposed while it has no wire mapping")
+  func sidetoneIsWithheld() {
     let model = ultra2Model()
+    #expect(model.state.sidetone == nil)
     model.setSidetone(.low)
-    #expect(model.state.sidetone == .low)
+    #expect(model.state.sidetone == nil)
   }
 
   @Test("A gesture for a feature the model does not declare is a no-op")

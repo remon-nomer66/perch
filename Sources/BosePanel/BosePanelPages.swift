@@ -245,8 +245,8 @@ struct BoseExtrasPage: View {
       if state.spatial == nil && state.sidetone == nil {
         BoseNotDeclared(
           text: L(
-            "この機器は空間オーディオやサイドトーンを申告していません",
-            "This device declares neither spatial audio nor sidetone"
+            "この機器はイマーシブオーディオやサイドトーンを申告していません",
+            "This device declares neither immersive audio nor sidetone"
           )
         )
       } else {
@@ -258,7 +258,12 @@ struct BoseExtrasPage: View {
 
   private func spatialRow(_ spatial: BmapNoiseControlSetting.Spatial) -> some View {
     VStack(alignment: .leading, spacing: 5) {
-      Text(L("空間オーディオ", "Spatial Audio"))
+      // Named for what it is — the headset's own feature — not "空間オーディオ". Perch has a
+      // spatial-audio switch of its own on the common sheet, and two identically titled
+      // controls sitting a swipe apart, each doing something different, read as one broken
+      // control. The two can also be turned on together, and telling them apart is the
+      // first thing the user needs to do that deliberately.
+      Text(L("Bose イマーシブオーディオ", "Bose Immersive Audio"))
         .font(.system(size: 9))
         .foregroundStyle(.white.opacity(0.6))
       HStack(spacing: 5) {

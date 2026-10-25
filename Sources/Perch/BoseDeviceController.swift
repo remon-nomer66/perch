@@ -12,12 +12,14 @@ import os
 /// From it this drives two things: a `Readout` the shared closed bar / General header show
 /// (model name, battery, status), and a live `BosePanelModel` that reads every feature back
 /// and turns the panel's gestures — noise control, ambient level, equalizer, immersive
-/// audio — into device writes. The Sony session runs alongside untouched: it maps any
-/// non-Sony output to "no device", and this only ever engages a device whose audio output
-/// correlates to a BMAP control service, so the two never fight for a device.
+/// audio — into device writes. The Sony session runs alongside untouched, and the two can
+/// both be live at once — it targets any identified output, whatever the brand, while this
+/// engages a device whose audio output correlates to a BMAP control service. Which of them
+/// owns the screens is therefore decided in one place, `PanelModel.foldingIn(bose:)`.
 ///
 /// It runs its own loop rather than doing work inside `AppModel.refresh`, so opening a
-/// channel (seconds) never stalls the 500 ms Sony refresh. Blocking IOBluetooth SDP
+/// channel (seconds) never stalls the 500 ms Sony refresh. The loop polls, and a switch of
+/// the default output to another device wakes it early. Blocking IOBluetooth SDP
 /// enumeration is kept off the main actor; only the resulting values touch it.
 @MainActor
 final class BoseDeviceController: ObservableObject {
@@ -29,6 +31,7 @@ final class BoseDeviceController: ObservableObject {
   }
 
   /// The closed-bar / header summary, or `nil` when no Bose device is the audio output.
+  /// `.ready` only while `panelModel` is live: every teardown clears it.
   @Published private(set) var readout: Readout?
   /// The live controls view-model, present exactly while a Bose device is connected.
   @Published private(set) var panelModel: BosePanelModel?
@@ -36,12 +39,35 @@ final class BoseDeviceController: ObservableObject {
   var isActive: Bool { panelModel != nil }
 
   private let audio: any AudioOutputObserving
+  private let devices: any BmapDeviceAccess
   private let openTimeout: Duration
   private let refreshInterval: Duration
-  private let config: BoseDeviceConfig = .qcUltra2
+  /// The connected model's config, resolved from the product id it announces over SDP at
+  /// every connect. `BoseCatalog`'s provisional Ultra 2 profile until a device names
+  /// itself — and again for any id the catalog does not know.
+  private var config: BoseDeviceConfig = BoseCatalog.fallbackConfig
 
   private var session: BoseSession?
   private var activeAddress: String?
+  /// The audio output identity `activeAddress` was correlated from. The fast path is keyed
+  /// on this rather than on the output's OUI: two paired Bose devices share an OUI, so an
+  /// OUI-keyed cache stays "valid" when the output moves from one to the other and pins the
+  /// session to the device that is no longer playing.
+  private var correlatedOutput: String?
+  /// The output the loop last looked at, whatever came of it — a Bose device, another
+  /// maker's, or none. A reported change is a switch only against this: the correlation
+  /// above is cleared by every teardown, including the one that precedes a connect, so
+  /// judged by it a move to the speakers just after connecting looked like no change.
+  private var observedOutput: String?
+  /// BMAP addresses that would not open, and the audio output they were tried against.
+  ///
+  /// A paired Bose product can publish more than one BMAP address — a probe of QC Ultra
+  /// Earbuds found two, and only the second answered; the first timed out. Correlation
+  /// cannot tell those apart from the address alone, so the loop rotates: an address that
+  /// fails to open is set aside and the next candidate is tried, until one answers or the
+  /// list is exhausted and the whole set is reconsidered.
+  private var failedAddresses: Set<String> = []
+  private var failedAddressesOutput: String?
   private var firmwareVersion: String?
   /// The last full snapshot, so a periodic partial re-read keeps name and equalizer.
   private var snapshot = BoseDeviceSnapshot()
@@ -50,44 +76,71 @@ final class BoseDeviceController: ObservableObject {
   private var modeList: [BoseAudioMode] = []
 
   private var loopTask: Task<Void, Never>?
+  /// Listens for default-output changes, so a switch is acted on when it is reported.
+  private var outputTask: Task<Void, Never>?
+  /// The wait between two ticks while it runs; cancelled to wake the loop early.
+  private var pauseTask: Task<Void, Never>?
+  /// A switch reported mid-tick: the pause after it is skipped rather than slept through.
+  private var wakePending = false
 
   private static let log = Logger(subsystem: "dev.perch.mac", category: "bose")
 
   init(
     audio: any AudioOutputObserving = AudioOutputObserver(),
+    devices: any BmapDeviceAccess = LiveBmapDeviceAccess(),
     openTimeout: Duration = .seconds(12),
     refreshInterval: Duration = .seconds(4)
   ) {
     self.audio = audio
+    self.devices = devices
     self.openTimeout = openTimeout
     self.refreshInterval = refreshInterval
   }
 
   func start() {
     guard loopTask == nil else { return }
+    // Taken before `start()`, which publishes the current output to whoever is listening.
+    let changes = audio.changes
+    audio.start()
+    outputTask = Task { [weak self] in
+      for await output in changes {
+        self?.outputChanged(to: output)
+      }
+    }
     loopTask = Task { [weak self] in
       while !Task.isCancelled {
-        await self?.tick()
-        try? await Task.sleep(for: self?.refreshInterval ?? .seconds(4))
+        guard let self else { return }
+        await self.tick()
+        await self.pause()
       }
     }
   }
 
   func stop() async {
-    loopTask?.cancel()
+    let loop = loopTask
     loopTask = nil
+    loop?.cancel()
+    stopWatchingOutput()
+    // A tick in flight carries on once its awaits resume. Torn down underneath it, it
+    // would put back a session and a readout with nothing left to clear them; cancelled,
+    // it finishes its pass and the loop ends, so it is waited for before the teardown.
+    await loop?.value
     await teardown()
   }
 
   /// Stops the loop and hands the live session to the caller to close. Used at
   /// termination, where the main thread blocks on a bound wait and so cannot run the
   /// main-actor `stop()`; `BoseSession` is its own actor, closable from a detached task.
+  /// Unlike `stop()` it does not wait for a tick in flight, and need not: with the main
+  /// thread blocked until the process exits, that tick never resumes.
   func detachForTermination() -> BoseSession? {
     loopTask?.cancel()
     loopTask = nil
+    stopWatchingOutput()
     let live = session
     session = nil
     activeAddress = nil
+    correlatedOutput = nil
     panelModel = nil
     readout = nil
     return live
@@ -95,7 +148,9 @@ final class BoseDeviceController: ObservableObject {
 
   // MARK: - Loop
 
-  private func tick() async {
+  /// One pass of the loop. Internal rather than private so a test can step the loop
+  /// itself instead of racing its timer.
+  func tick() async {
     let target = currentBoseControlAddress()
 
     if target != activeAddress {
@@ -113,34 +168,113 @@ final class BoseDeviceController: ObservableObject {
     }
   }
 
+  /// Waits out the refresh interval between two ticks — or less, when a switch is
+  /// reported meanwhile (`outputChanged`).
+  private func pause() async {
+    guard !wakePending else {
+      wakePending = false
+      return
+    }
+    let pause = Task<Void, Never> { [refreshInterval] in
+      try? await Task.sleep(for: refreshInterval)
+    }
+    pauseTask = pause
+    // The loop's own cancellation must end the wait too: `pause` is not its child.
+    await withTaskCancellationHandler {
+      await pause.value
+    } onCancel: {
+      pause.cancel()
+    }
+    pauseTask = nil
+  }
+
+  /// A reported change of the default output.
+  ///
+  /// The poll alone re-correlates a switch only when it next comes round, and until then
+  /// the panel keeps driving the device that stopped playing — a gesture in that window
+  /// writes to headphones nobody is listening to. So a switch to another device wakes the
+  /// loop now: the pause in progress is cut short, or, mid-tick, the next one is skipped.
+  private func outputChanged(to output: AudioOutput) {
+    guard Self.isSwitch(to: output, awayFrom: observedOutput) else { return }
+    if let pauseTask {
+      pauseTask.cancel()
+    } else {
+      wakePending = true
+    }
+  }
+
+  private func stopWatchingOutput() {
+    outputTask?.cancel()
+    outputTask = nil
+    audio.stop()
+  }
+
   /// The BMAP control address for the current audio output, or `nil` when the output is
-  /// not a Bose device. Correlation is by OUI (the address's manufacturer block): the
-  /// earbuds' audio address and their BMAP control address share it, while a Sony output
-  /// or the speakers share it with no BMAP device — so idle earbuds are never woken and
-  /// Sony is never disturbed.
+  /// not a Bose device. See `correlate(output:candidates:)` for how the two are matched.
   ///
   /// The IOBluetooth SDP scan runs here on the main actor deliberately: IOBluetooth
   /// delivers cached SDP off the calling thread's run loop, and a background thread has
   /// none, so `getServiceRecord` returns empty there. It reads cached records (no live
   /// query), so it does not block; only opening a channel is slow, and that is async.
   private func currentBoseControlAddress() -> String? {
-    guard let outputOUI = currentOutputOUI() else { return nil }
-    // Fast path: still connected to a device of this OUI. The SDP scan below does
-    // synchronous CoreBluetooth XPC, so it is skipped while the session holds — only a
-    // change of audio output re-runs it, keeping the steady state off that XPC path.
-    if session != nil, let active = activeAddress, Self.oui(of: active) == outputOUI {
+    observedOutput = currentOutputIdentifier()
+    guard let output = observedOutput else {
+      correlatedOutput = nil
+      return nil
+    }
+    // Fast path: the output is the very one the live session was correlated from. The SDP
+    // scan below does synchronous CoreBluetooth XPC, so it is skipped while the session
+    // holds — only a change of audio *device* re-runs it, keeping the steady state off
+    // that XPC path while still noticing a move between two Bose devices.
+    if session != nil, let active = activeAddress, correlatedOutput == output {
       return active
     }
-    return bmapDeviceAddresses().first { Self.oui(of: $0) == outputOUI }
+    // Failures belong to the output they happened under; a different device starts clean.
+    if failedAddressesOutput != output {
+      failedAddresses.removeAll()
+      failedAddressesOutput = output
+    }
+
+    let candidates = devices.candidates()
+    var chosen = Self.correlate(
+      output: output,
+      candidates: candidates.filter { !failedAddresses.contains(Self.normalized($0.address)) }
+    )
+    if chosen == nil, !failedAddresses.isEmpty {
+      // Every candidate has failed at least once. Forget that and start the rotation
+      // again rather than go silent for good: a bud that was in its case may be out now.
+      failedAddresses.removeAll()
+      chosen = Self.correlate(output: output, candidates: candidates)
+    }
+    correlatedOutput = chosen == nil ? nil : output
+    return chosen
   }
 
-  /// The OUI of the current default audio output, or `nil` when it is not Bluetooth.
-  private func currentOutputOUI() -> String? {
-    switch audio.current() {
-    case .identified(let device): return Self.oui(of: device.rawValue)
-    case .unidentifiedBluetooth(let uid): return Self.oui(of: uid)
+  /// An address in one canonical form, so the same device is recognised however the
+  /// separators and case came out of IOBluetooth or Core Audio.
+  nonisolated static func normalized(_ address: String) -> String {
+    addressOctets(of: address).joined(separator: ":")
+  }
+
+  private func currentOutputIdentifier() -> String? {
+    Self.identifier(of: audio.current())
+  }
+
+  /// The device identifier of an audio output, or `nil` when it is not Bluetooth. The
+  /// raw string, so two Bose devices are told apart — never logged.
+  nonisolated static func identifier(of output: AudioOutput) -> String? {
+    switch output {
+    case .identified(let device): return device.rawValue
+    case .unidentifiedBluetooth(let uid): return uid
     case .other: return nil
     }
+  }
+
+  /// Whether a reported output names a device other than the one the loop last looked at
+  /// — the only change worth waking it for. Core Audio reports the same output again too,
+  /// and each wake costs a synchronous SDP scan or a reopen.
+  nonisolated static func isSwitch(to output: AudioOutput, awayFrom observed: String?) -> Bool {
+    identifier(of: output) != observed
   }
 
   // MARK: - Session lifecycle
@@ -148,31 +282,64 @@ final class BoseDeviceController: ObservableObject {
   private func connect(to address: String) async {
     readout = Readout(status: .connecting, modelName: nil, firmwareVersion: nil, battery: .unknown)
     do {
-      let opened = try await BmapRFCOMMChannelOpener(openTimeout: openTimeout).open(address: address)
-      // Only the Ultra 2 family is byte-verified today; its config also drives the
-      // provisional profile for unknown ids, so it is the safe default for a first read.
+      // The model decides the dialect — QC35 answers nothing until it receives the [0.1]
+      // init, reports a one-byte battery, and has no block 31 — so the config is resolved
+      // from the announced product id *before* the session starts. An id the catalog does
+      // not know keeps the provisional Ultra 2 profile, which is what it is there for.
+      let (resolved, productId) = devices.config(forAddress: address)
+      config = resolved
+      Self.log.notice(
+        """
+        bose config resolved: \
+        productId=\(productId.map { String(format: "0x%04X", $0) } ?? "unknown", privacy: .public) \
+        supported=\(productId.map(BoseCatalog.isSupported(productId:)) ?? false, privacy: .public)
+        """
+      )
+      let opened = try await devices.open(address: address, timeout: openTimeout)
       let session = await BoseSession.start(opened: opened, config: config)
       try await session.connect()
       self.session = session
 
-      firmwareVersion = try? await readFirmware(session)
+      firmwareVersion = config.supports(.firmwareVersion) ? try? await readFirmware(session) : nil
       snapshot = await readSnapshot(session, includingStable: true)
-      // The session talks the Ultra 2 dialect for every model in the family, but the panel
-      // display config is chosen once the device has named itself: the earbuds withhold
-      // wind reduction while the headphones keep it. Product ids are not yet plumbed from
-      // SDP, so the device-reported product name is the only signal that tells them apart.
+      // An opened channel that answers nothing is not a connection. Publishing `.ready`
+      // here would show an empty panel over a link the next refresh has to tear down
+      // anyway, so it fails now — exactly as a refused open does.
+      guard snapshot.isControllable else {
+        Self.log.notice("bose connected but read nothing back; treating as unreachable")
+        await abandonConnect(to: address)
+        return
+      }
+      // One config drives both the wire and the panel. The display axes it carries — wind
+      // reduction above all, which the earbuds lack though their [31.10] payload still
+      // has the byte — come from the catalog entry for the announced product id, rather
+      // than from looking for "earbud" in a name that is localisable and, on a renamed
+      // device, not the model's at all. Only a device the catalog cannot describe falls
+      // back to the name, and only to withhold wind reduction (see `panelConfig`).
       panelModel = BosePanelModel(
         snapshot: snapshot,
-        config: Self.displayConfig(forModelName: snapshot.modelName),
+        config: Self.panelConfig(wire: config, productId: productId, modelName: snapshot.modelName),
         session: session
       )
       publishReadout(status: .ready)
       Self.log.notice("bose connected: controllable")
     } catch {
       Self.log.notice("bose connect failed: \(String(describing: error), privacy: .public)")
-      await teardown(keepingAddress: true)
-      readout = Readout(status: .unreachable, modelName: nil, firmwareVersion: nil, battery: .unknown)
+      await abandonConnect(to: address)
     }
+  }
+
+  /// The one way out of a connect that did not end controllable, whichever step failed.
+  ///
+  /// The address is set aside so the next tick tries a different BMAP candidate instead
+  /// of the one that just failed, over and over. An open that read nothing back used to
+  /// skip this — only a refused open joined the rotation — so a product publishing two
+  /// addresses could hold the loop on the silent one for good, reopening it every tick
+  /// over the one control channel the device has.
+  private func abandonConnect(to address: String) async {
+    failedAddresses.insert(Self.normalized(address))
+    await teardown(keepingAddress: true)
+    readout = Readout(status: .unreachable, modelName: nil, firmwareVersion: nil, battery: .unknown)
   }
 
   private func refreshSnapshot() async {
@@ -193,16 +360,28 @@ final class BoseDeviceController: ObservableObject {
     publishReadout(status: .ready)
   }
 
+  /// Closes the session and drops everything read from it — the readout included.
+  ///
+  /// The readout is what `AppModel.refresh` folds in as the panel's device whenever Sony
+  /// has none, so it must not outlive the session it describes. Left in place, the last
+  /// `.ready` (name, battery) kept a device on screen after it had left the audio output,
+  /// and with no panel model behind it the settings window drew Sony's controls under
+  /// Bose ownership. A caller that has something to say about the address it keeps —
+  /// that it is unreachable — publishes that afterwards.
   private func teardown(keepingAddress: Bool = false) async {
     if let session {
       await session.close()
     }
     session = nil
     panelModel = nil
+    readout = nil
     firmwareVersion = nil
     snapshot = BoseDeviceSnapshot()
     modeList = []
-    if !keepingAddress { activeAddress = nil }
+    if !keepingAddress {
+      activeAddress = nil
+      correlatedOutput = nil
+    }
   }
 
   private func publishReadout(status: DeviceSummary.Status) {
@@ -219,27 +398,50 @@ final class BoseDeviceController: ObservableObject {
   /// Reads the device into a snapshot. `includingStable` also fetches the fields that do
   /// not change while connected (model name, equalizer) — read once at connect and then
   /// carried forward, so the periodic refresh stays to battery and noise control.
+  ///
+  /// `isControllable` answers one question only: did *this* call get an answer out of the
+  /// device. It is therefore raised by live reads alone — never by a field carried over
+  /// from an earlier snapshot. Counting the carried name and equalizer kept the flag true
+  /// for the life of the connection, which made the caller's link-drop check dead code and
+  /// left a dead session showing stale readings as `.ready`.
   private func readSnapshot(_ session: BoseSession, includingStable: Bool) async -> BoseDeviceSnapshot {
     var snap = BoseDeviceSnapshot()
-    snap.isControllable = true
     snap.acceptsWrites = true
+    /// Whether any GET in this call came back parsed. The only evidence the link is alive.
+    var readSomething = false
 
+    // Every GET is gated on the config, so a model is never asked for a block it would
+    // refuse — the whole point of the config carrying its capabilities. The single
+    // addresses go by its feature set; the block-31 mode reads go by its declared mode
+    // slots instead (`supportsModeBlock`, and `modeSlots`, empty without block 31), not by
+    // `.modeConfig` in the feature set.
     if includingStable {
-      snap.modelName = try? await readModelName(session)
-      snap.equalizerBands = try? await readEqualizer(session)
+      if config.supports(.deviceName) {
+        snap.modelName = try? await readModelName(session)
+        readSomething = readSomething || snap.modelName != nil
+      }
+      if config.supports(.equalizer) {
+        snap.equalizerBands = try? await readEqualizer(session)
+        readSomething = readSomething || snap.equalizerBands != nil
+      }
       modeList = (try? await readModeList(session)) ?? []
+      readSomething = readSomething || !modeList.isEmpty
     } else {
       snap.modelName = snapshot.modelName
       snap.equalizerBands = snapshot.equalizerBands
     }
 
-    // Battery [2.2]. Its absence is not a link failure (some reads race a device that is
-    // busy), so an empty battery does not clear `isControllable`.
-    if let battery = try? await readBatteryComponents(session) {
+    // Battery [2.2]. A device that is busy can answer with no components at all, so an
+    // empty list is still an answer: the read succeeded, which is what the flag tracks.
+    if config.supports(.battery), let battery = try? await readBatteryComponents(session) {
       snap.battery = battery
+      readSomething = true
     }
     // Noise cancellation level [1.5] — the CNC range and current ambient/ANC balance.
-    snap.noiseCancellation = try? await readNoiseCancellation(session)
+    if config.supports(.noiseCancellationRead) {
+      snap.noiseCancellation = try? await readNoiseCancellation(session)
+      readSomething = readSomething || snap.noiseCancellation != nil
+    }
 
     // Audio modes (block 31). Ultra 2's live [31.10] answers a GET with
     // functionNotSupported, so the current ANC / spatial / wind state is read from the
@@ -247,30 +449,18 @@ final class BoseDeviceController: ObservableObject {
     var currentMode: Int?
     if config.supportsModeBlock {
       currentMode = try? await readCurrentMode(session)
+      readSomething = readSomething || currentMode != nil
       if let currentMode, let cfg = try? await readModeConfig(session, index: currentMode) {
         snap.liveNoiseControl = cfg.noiseControl
+        readSomething = true
       }
       if !modeList.isEmpty {
         snap.audioModes = BoseAudioModes(modes: modeList, selectedSlot: currentMode)
       }
     }
 
-    // If nothing at all came back, treat the link as gone.
-    let gotAnything = !snap.battery.isEmpty || snap.noiseCancellation != nil
-      || snap.liveNoiseControl != nil || snap.modelName != nil || snap.equalizerBands != nil
-      || snap.audioModes != nil
-    snap.isControllable = gotAnything
+    snap.isControllable = readSomething
     return snap
-  }
-
-  /// The panel display config for a device that has named itself. Every Ultra 2 device
-  /// shares the protocol config, so this differs from `config` only in the display axes
-  /// that hardware, not the wire, decides — today just wind reduction, which the earbuds
-  /// lack. An unread or unrecognised name keeps the headphones' full-feature default.
-  private static func displayConfig(forModelName modelName: String?) -> BoseDeviceConfig {
-    guard let name = modelName?.lowercased() else { return .qcUltra2 }
-    let isEarbuds = name.contains("earbud") || name.contains("buds")
-    return isEarbuds ? .qcUltra2Earbuds : .qcUltra2
   }
 
   private func readModelName(_ session: BoseSession) async throws -> String {
@@ -298,12 +488,13 @@ final class BoseDeviceController: ObservableObject {
     return try BmapNoiseCancellationReader.parse(frame)
   }
 
-  /// Reads every mode slot's [31.6] config and keeps the configured (named) ones. Slots
-  /// 0...10 cover the presets (Quiet/Aware/Immersion/Cinema) and the user slots; empty
-  /// slots report the name "None" and are dropped.
+  /// Reads every mode slot's [31.6] config and keeps the ones the device marks configured.
+  /// The slots walked come from the model's declared preset + editable ranges, never a
+  /// baked-in span, and an empty slot is recognised by its STATUS[4] flag rather than by
+  /// its (localisable) placeholder name.
   private func readModeList(_ session: BoseSession) async throws -> [BoseAudioMode] {
     var modes: [BoseAudioMode] = []
-    for index in 0...10 {
+    for index in config.modeSlots {
       guard
         let frame = try? await session.request(try BmapAudioMode.configRequest(index: index)),
         let cfg = try? BmapAudioMode.parseConfig(frame), cfg.isConfigured
@@ -330,29 +521,47 @@ final class BoseDeviceController: ObservableObject {
 
   // MARK: - Helpers
 
-  private static func batteryLayout(from components: [BmapBatteryComponent]) -> BatteryLayout {
+  /// Maps the parsed [2.2] components onto the shared layout.
+  ///
+  /// A single component is the whole headset. Several become numbered cells, never L / R /
+  /// case: `BmapBatteryComponent.componentId` is device-defined, so which enclosure each
+  /// reading belongs to is not something the payload declares — the parse layer says so
+  /// and deliberately keeps the id raw. Reading the order as left, right, case put the two
+  /// earbud charges the wrong way round on any model that reports them differently. The
+  /// Bose panel already numbers them (`BosePanelState.batteryReading`); this matches it, so
+  /// the notch and the panel agree.
+  nonisolated static func batteryLayout(from components: [BmapBatteryComponent]) -> BatteryLayout {
     switch components.count {
     case 0:
       return .unknown
     case 1:
       return .single(components[0].percent)
     default:
-      return .leftRight(
-        left: components[0].percent,
-        right: components[1].percent,
-        charging: components.count >= 3 ? components[2].percent : nil
+      return .numbered(
+        components.enumerated().map { index, component in
+          BatteryLayout.Cell(slot: index + 1, percent: component.percent)
+        }
       )
     }
   }
 
-  /// The first three address octets (the OUI / manufacturer block), lowercased, from a
-  /// string containing a Bluetooth address in any common separator/case. Never the whole
-  /// address. `nonisolated` so the off-main SDP scan can call it.
-  nonisolated static func oui(of string: String) -> String? {
+  /// The address octets, lowercased, from a string containing a Bluetooth address in any
+  /// common separator/case. Capped at the six a BD_ADDR has, so trailing hex-looking
+  /// fragments of a Core Audio device UID cannot extend it. `nonisolated` so the off-main
+  /// SDP scan can call it.
+  nonisolated static func addressOctets(of string: String) -> [String] {
     let octets = string.split(whereSeparator: { $0 == "-" || $0 == ":" })
       .map(String.init)
       .filter { $0.count == 2 && $0.allSatisfy(\.isHexDigit) }
+      .map { $0.lowercased() }
+    return Array(octets.prefix(6))
+  }
+
+  /// The first three address octets (the OUI / manufacturer block). Never the whole
+  /// address, so it identifies the maker and not a device.
+  nonisolated static func oui(of string: String) -> String? {
+    let octets = addressOctets(of: string)
     guard octets.count >= 3 else { return nil }
-    return octets.prefix(3).map { $0.lowercased() }.joined(separator: ":")
+    return octets.prefix(3).joined(separator: ":")
   }
 }

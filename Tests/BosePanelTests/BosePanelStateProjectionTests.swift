@@ -49,7 +49,9 @@ struct BosePanelStateProjectionTests {
     #expect(state.equalizer?.bands.count == 3)
     #expect(state.equalizer?.bands.map(\.value) == [0, -2, -6])
     #expect(state.audioModes?.selectedSlot == 0)
-    #expect(state.sidetone == .medium)
+    // Sidetone is withheld even when the snapshot carries one: it has no wire mapping, so
+    // the control could be moved but would never reach the device.
+    #expect(state.sidetone == nil)
     #expect(state.isControllable)
     #expect(state.acceptsWrites)
   }

@@ -84,19 +84,10 @@ struct MusicRulesView: View {
           )
         }
 
-        if model.panel.summary.isControllable {
+        if model.supportsRules {
           newRuleEditor
         } else {
-          Text(
-            L(
-              "ルールの追加は機器の接続中に行えます。接続中は選んだ設定がその場で機器に反映され、"
-                + "聴きながら選べます。",
-              "Rules can be added while a device is connected. While connected, each choice "
-                + "is applied to the device right away, so it can be judged by ear."
-            )
-          )
-          .font(.system(size: 11))
-          .foregroundStyle(.secondary)
+          RuleEditorUnavailableNotice(reason: model.ruleUnavailableReason)
         }
       }
     }
