@@ -54,6 +54,11 @@ final class AppModel: ObservableObject {
     }
   }
 
+  /// The parallel Bose control path. Runs its own loop; `refresh(from:cause:)` reads its
+  /// `readout` and folds it into the panel when Sony has no device. Started/stopped by
+  /// the AppDelegate alongside the Sony session.
+  let bose = BoseDeviceController()
+
   /// Sends a change and refreshes from what the device actually reports back.
   ///
   /// The panel is not updated optimistically: on an unverified model the headset may
@@ -308,6 +313,13 @@ final class AppModel: ObservableObject {
     // it mid-gesture.
     next.noiseControl = levelAdjustment.isHolding() ? panel.noiseControl : readings.noiseControl
     next.battery = Self.batteryLayout(for: fingerprint, readings: readings)
+
+    // Bose runs in parallel. When Sony has no controllable device, a Bose device that is
+    // the current audio output owns the summary and battery, so the shared closed bar and
+    // the General tab show it instead of "対応機器なし". This is the one place ownership is
+    // decided; see `PanelModel.foldingIn(bose:)`.
+    next = next.foldingIn(bose: bose.readout)
+
     next.nowPlaying = nowPlaying.resolved(current: panel.nowPlaying)
     // A device that went away takes the editor preview with it: there is nothing left
     // to put back, and stale values must not land on the next device.
@@ -339,7 +351,16 @@ final class AppModel: ObservableObject {
     // count, or swipes dead-zone against stops that are not on screen — after a
     // disconnect from the fourth sheet, a swipe would "move" through pages that no
     // longer exist before anything visibly changed.
-    let stops = Self.pagerStops(for: next.summary.status)
+    // A Bose device declares its own feature set, so its readable stops come from the
+    // sheets it actually has, not the fixed Sony count. The non-readable states collapse
+    // to the common sheets plus one status sheet for either brand.
+    let stops: Int
+    if case .bose(let boseModel) = DeviceControls(panel: next, bosePanel: bose.panelModel),
+      next.summary.isControllable {
+      stops = BoseNotchLayout.pageCount(for: boseModel.state)
+    } else {
+      stops = Self.pagerStops(for: next.summary.status)
+    }
     if pager.pageCount != stops {
       pager.setPageCount(stops)
       page = min(page, stops - 1)
@@ -506,11 +527,29 @@ final class AppModel: ObservableObject {
 
   func playingNow() async -> NowPlayingService.PlayingAnswer { await nowPlayingService.playing() }
 
+  /// Whether rules can act on the device that owns the panel right now. See
+  /// `PanelModel.supportsRules`.
+  var supportsRules: Bool { panel.supportsRules }
+
+  /// Why the rule editor is withheld, for the notice shown in its place.
+  var ruleUnavailableReason: RuleEditorUnavailableNotice.Reason { panel.ruleUnavailableReason }
+
   /// Applies the matched rule, first undoing whichever rule held before it.
   ///
   /// A hold is kept even when the rule changed nothing, so a source that is already
   /// set up right does not have later manual adjustments captured as its own.
   func applyRule(_ rule: SoundRule?, using service: SessionService) {
+    // A device without rule support is refused up front rather than falling through every
+    // branch below on nil readings: the outcome was the same silent no-op, but nothing in
+    // the code said so, and the editor happily wrote rules that could never fire. Any hold
+    // still standing is released first — the rule that set it applied to another device.
+    guard supportsRules else {
+      if let hold = ruleHold {
+        release(hold, using: service)
+        ruleHold = nil
+      }
+      return
+    }
     // The hold being replaced is kept around: its restore writes are still in
     // flight, so for a field both rules touch the panel still shows the old rule's
     // value — the true original lives only in the old hold.
@@ -936,6 +975,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       .sink { [weak self] connected in self?.updateStatusIcon(connected: connected) }
       .store(in: &cancellables)
 
+    // The Bose controller watches the audio output on its own loop and connects to a
+    // Bose device when one becomes the output; the refresh below reads its result.
+    model.bose.start()
+
     // When an update becomes available (or is dismissed), rebuild the menu so the
     // "download" item comes and goes. Only availability flips rebuild it — not the
     // checking→result churn — so the menu is not torn down mid-open on every poll.
@@ -1089,9 +1132,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // hostage. Detached, because this wait blocks the main thread the plain Task
     // would have needed.
     let service = self.service
+    // Hand off the Bose session synchronously (main-actor here) so the detached task can
+    // close its RFCOMM channel too — the earbuds need it released to serve the next host.
+    let boseSession = model.bose.detachForTermination()
     let stopped = DispatchSemaphore(value: 0)
     Task.detached(priority: .userInitiated) {
       await service.stop()
+      await boseSession?.close()
       stopped.signal()
     }
     _ = stopped.wait(timeout: .now() + .seconds(2))
@@ -1316,7 +1363,7 @@ private struct NotchPanelBridge: View {
       displayMode: settingsStore.notchDisplayMode,
       model: model.panel,
       page: $model.page,
-      pages: model.panelPages(using: service),
+      pages: notchPages,
       transport: NowPlayingTransport(
         playPause: { model.nowPlayingPlayPause() },
         next: { model.nowPlayingNext() },
@@ -1325,9 +1372,23 @@ private struct NotchPanelBridge: View {
       openSettings: openSettings,
       retry: { await service.session.handle(.manualRetry) }
     )
+    // The Bose sheets observe the Bose model themselves, so a drag redraws them even
+    // though this bridge does not; the identity below still rebuilds on a language switch.
     // The pages bake their strings when built; a new identity rebuilds them in the
     // newly chosen language.
     .id(settingsStore.language)
+  }
+
+  /// The sheets the notch shows: a connected Bose device brings its own (equalizer, modes,
+  /// spatial/sidetone), matching the General tab; otherwise the Sony sheets are shown, which
+  /// also carry the common spatial sheet when no device is connected at all.
+  private var notchPages: [PanelPage] {
+    // The same decision the General tab draws from, so the two show one brand.
+    let controls = DeviceControls(panel: model.panel, bosePanel: model.bose.panelModel)
+    if case .bose(let boseModel) = controls {
+      return model.bosePanelPages(boseModel)
+    }
+    return model.panelPages(using: service)
   }
 }
 

@@ -1,4 +1,5 @@
 import AppKit
+import BosePanel
 import NotchKit
 import ServiceManagement
 import SwiftUI
@@ -23,7 +24,7 @@ struct SettingsView: View {
 
   var body: some View {
     TabView(selection: $selectedTab) {
-      GeneralTab(model: model, service: service)
+      GeneralTab(model: model, bose: model.bose, service: service)
         .tabItem { Label(L("一般", "General"), systemImage: "slider.horizontal.3") }
         .tag(Tab.general)
       BehaviorTab(settings: settingsStore, loginItem: loginItem, model: model, service: service)
@@ -92,6 +93,46 @@ extension AppModel {
       }
     )
   }
+
+  /// The notch sheets for a connected Bose device, in the Sony pattern: the common
+  /// (device-independent) sheet first, then one sheet per Bose feature the device actually
+  /// declares — the same items the General tab's Bose cards show, and in the same order.
+  /// A model that declares a feature gets its sheet; one that does not is simply absent,
+  /// so the pager never stops on a dead sheet. The header (name, charge) and the media
+  /// column are the notch's own and need nothing from here.
+  func bosePanelPages(_ boseModel: BosePanelModel) -> [PanelPage] {
+    var pages = PanelPages.commonPages(
+      spatial: spatial, headTracking: headTracking, outputRoute: outputRoute
+    )
+    for kind in BoseNotchLayout.deviceSheets(for: boseModel.state) {
+      pages.append(
+        PanelPage(id: "bose-\(kind.rawValue)", content: AnyView(
+          BosePanelSheet(model: boseModel, kind: kind)
+        ))
+      )
+    }
+    return pages
+  }
+}
+
+/// The single source of truth for which Bose device sheets exist for a given state, so the
+/// pager's stop count (decided in the refresh, before any view is built) and the sheets the
+/// notch renders can never disagree. Noise control is deliberately absent — on the Ultra
+/// family it lives on the listening mode, so the modes sheet is its one home.
+@MainActor
+enum BoseNotchLayout {
+  static func deviceSheets(for state: BosePanelState) -> [BosePanelSheet.Kind] {
+    var sheets: [BosePanelSheet.Kind] = []
+    if state.equalizer != nil { sheets.append(.equalizer) }
+    if state.audioModes?.modes.isEmpty == false { sheets.append(.modes) }
+    if state.spatial != nil || state.sidetone != nil { sheets.append(.extras) }
+    return sheets
+  }
+
+  /// Total notch stops for a Bose device: the common sheet(s) plus each declared feature.
+  static func pageCount(for state: BosePanelState) -> Int {
+    PanelPages.commonPageIDs.count + deviceSheets(for: state).count
+  }
 }
 
 // MARK: - General (device controls)
@@ -100,7 +141,12 @@ extension AppModel {
 /// themselves for the notch's black backdrop, so each card recreates it.
 private struct GeneralTab: View {
   @ObservedObject var model: AppModel
+  @ObservedObject var bose: BoseDeviceController
   let service: SessionService
+
+  private var controls: DeviceControls {
+    DeviceControls(panel: model.panel, bosePanel: bose.panelModel)
+  }
 
   var body: some View {
     ScrollView {
@@ -111,7 +157,20 @@ private struct GeneralTab: View {
           retry: { await service.session.handle(.manualRetry) }
         )
 
-        if model.panel.summary.isControllable {
+        // A Bose device owns the controls: its own panel (noise/ambient, equalizer,
+        // immersive audio) reading and writing over the live BMAP session. Shown instead
+        // of the Sony pages, which are for the Tandem session that is idle here.
+        //
+        // Which brand draws is `DeviceControls` — the one decision the notch reads too,
+        // made from the panel's ownership (`model.panel.isBose`). A live `bose.panelModel`
+        // alone is not it: a Bose session can be open while Sony still holds a
+        // controllable device, and judging by the session drew Bose controls here while
+        // the notch drew Sony's. Nor is "anything controllable": under Bose ownership with
+        // no live panel, that fell through to Sony's controls.
+        switch controls {
+        case .bose(let boseModel):
+          BoseControlsSection(model: boseModel)
+        case .sony:
           if let caveat = model.panel.summary.caveat {
             Label(caveat, systemImage: "exclamationmark.triangle.fill")
               .font(.system(size: 11))
@@ -131,14 +190,19 @@ private struct GeneralTab: View {
               await service.session.gestureCaptures()
             }
           )
+        case .neither:
+          EmptyView()
         }
 
         // The common (device-independent) sheets — spatial audio above all — need no
         // device at all, so neither the missing device nor a read-only session may
-        // hide or disable them; only the device sheets are gated.
+        // hide or disable them; only the device sheets are gated. When a Bose device is
+        // connected it owns the device controls (its own cards above), so the Sony
+        // device sheets — which would only draw "not declared" here — are dropped, and
+        // just the common sheets follow.
         ForEach(
           model.panelPages(using: service)
-            .filter { model.panel.summary.isControllable || $0.isCommon }
+            .filter { page in controls.drawsSonyPages || page.isCommon }
         ) { page in
           page.content
             .frame(maxWidth: .infinity, alignment: .topLeading)
@@ -152,6 +216,19 @@ private struct GeneralTab: View {
       .padding(16)
       .frame(maxWidth: .infinity, alignment: .leading)
     }
+  }
+}
+
+/// The Bose device's live controls in the settings window: the Bose panel's features
+/// (noise control + ambient level, equalizer, audio modes, immersive audio) stacked as
+/// one scrolling column of cards rather than paged behind tabs, so the window reads like
+/// the Sony one below it. Driven by the same `BosePanelModel` the notch panel uses; only
+/// the features the device actually declares get a card, so nothing irrelevant is shown.
+private struct BoseControlsSection: View {
+  @ObservedObject var model: BosePanelModel
+
+  var body: some View {
+    BosePanelStackView(state: model.state, actions: model.actions)
   }
 }
 
@@ -225,6 +302,10 @@ private struct DeviceStatusHeader: View {
       ]
       .compactMap(\.self)
       .joined(separator: "  ")
+    case .numbered(let cells):
+      cells
+        .compactMap { cell in cell.percent.map { "\(cell.slot) \($0)%" } }
+        .joined(separator: "  ")
     case .unknown:
       ""
     }
@@ -326,19 +407,10 @@ private struct BehaviorTab: View {
         // The choices a rule offers are the connected device's declarations, so a rule
         // is written against a real device — and while writing one, each choice lands
         // on the device at once so it can be judged by ear.
-        if model.panel.summary.isControllable {
+        if model.supportsRules {
           newRuleEditor
         } else {
-          Text(
-            L(
-              "ルールの追加は機器の接続中に行えます。接続中は選んだ設定がその場で機器に反映され、"
-                + "聴きながら選べます。",
-              "Rules can be added while a device is connected. While connected, each choice "
-                + "is applied to the device right away, so it can be judged by ear."
-            )
-          )
-          .font(.system(size: 11))
-          .foregroundStyle(.secondary)
+          RuleEditorUnavailableNotice(reason: model.ruleUnavailableReason)
         }
       }
 
