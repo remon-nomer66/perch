@@ -142,6 +142,29 @@ private let fullDeclaration: [UInt8] = [0x29, 0x2A, 0x12, 0x57, 0x6D, 0xEB, 0xE5
   #expect(requester.requestedPayloads.isEmpty)
 }
 
+// MARK: - Which reads may fault the session
+
+@Test func onlyThePrimaryBatteryQueryRidesTheFaultingPath() async throws {
+  // Every other read in the poll is an optional facet of the device: a declared
+  // function it leaves unanswered must fail only itself. As requests, one such
+  // silence tore the session down on every cycle. The primary battery stays a
+  // request — it is what lets a cycle notice a session that stopped answering
+  // altogether.
+  let requester = CurrentDeviceRequester(script: fullScript)
+  _ = await FeatureReader().read(declaring: declared(fullDeclaration), over: requester)
+
+  #expect(requester.requestedPayloads.map { Array($0.prefix(2)) } == [[0x22, 0x09]])
+  for prefix: [UInt8] in [
+    [0x22, 0x0A], [0x12, 0x02], [0x50, 0x04], [0x56, 0x04], [0x60, 0x19], [0x66, 0x19],
+    [0xE6, 0x09], [0xE6, 0x04], [0xF0, 0x0C], [0xF6, 0x0C], [0xFA, 0x0C],
+  ] {
+    #expect(
+      requester.probedPayloads.contains { Array($0.prefix(2)) == prefix },
+      "\(prefix) did not go out as a probe"
+    )
+  }
+}
+
 // MARK: - Equaliser extended info
 
 @Test func equalizerBandFrequenciesRideTheProbePath() async throws {

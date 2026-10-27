@@ -114,8 +114,6 @@ tools/make_dmg.sh                        # .build/Perch.app から .build/Perch.
 - 制御セッションは同時に1クライアントしか保持できない。本アプリはMacが音声出力先である間だけ保持し、外れたら解放する
 - 再生情報はScriptingBridge経由で取得する。システム全体の再生情報を読む非公開APIは、自前ビルドのアプリからは利用できないため使わない
 
-設計の全体は [docs/implementation-plan.md](docs/implementation-plan.md) を参照。
-
 ## ライセンス
 
 本ソフトウェアは **GNU Affero General Public License v3.0 (AGPL-3.0)** で提供する。Copyright (C) 2026 remon-nomer66。全文は [LICENSE](LICENSE)。

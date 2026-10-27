@@ -1,27 +1,54 @@
 import AppKit
+import os
 
 /// Watches whether the notch screen has been taken over by a full-screen app — the
 /// state in which the menu bar hides itself, and a bar hovering over the content
 /// would be unwelcome.
 ///
-/// Full screen is read from the window list: a normal-level window reaching the top
-/// band of the screen — the camera housing row plus the line just under it, where
-/// full screen letterboxes its window — while the menu bar is nowhere to be seen
-/// means the screen was handed over whole (full screen and Split View alike). While
-/// the menu bar is showing, nothing was handed over, whatever else reaches the band.
-/// Space changes and app switches re-check at once; a
-/// slow poll catches games and players that take the screen without creating a space.
-/// Only window bounds, levels, and alphas are read — none needs the screen-recording
-/// permission that window names do.
+/// The window list tells (see `FullScreenRule`). Space changes and app switches re-check
+/// at once, and again once the slide has settled; a slow poll catches games and players
+/// that take the screen without creating a space. A takeover is reported only once a
+/// later reading confirms it, a release at once (see `FullScreenHysteresis`).
 @MainActor
 public final class FullScreenMonitor {
-  public var onChange: ((Bool) -> Void)?
-  public private(set) var isFullScreen = false
+  private static let log = Logger(subsystem: "dev.perch.mac", category: "fullscreen")
+  private static let pollInterval: TimeInterval = 2
+  /// How soon the list is read again after a space change or a first taken reading. The
+  /// space-change notice can arrive while the old space is still sliding out, and the
+  /// slow poll would leave the notch over the content for seconds. Just past the
+  /// hysteresis' settling time, so this very read can confirm a takeover.
+  private static let followUpDelay = FullScreenHysteresis.settleTime + 0.1
 
+  public var onChange: ((Bool) -> Void)?
+  public var isFullScreen: Bool { hysteresis.isFullScreen }
+
+  private let read: @MainActor () -> FullScreenReading
+  private let now: @MainActor () -> TimeInterval
+  private var hysteresis = FullScreenHysteresis()
+  /// The reason last read, so the log records each change of evidence once rather than
+  /// once per poll.
+  private var lastReason: FullScreenReading.Reason?
   private var observers: [any NSObjectProtocol] = []
   private var poller: Timer?
+  private var followUp: Timer?
 
-  public init() {}
+  public convenience init() {
+    let reader = NotchScreenReader()
+    self.init(read: reader.read, now: { ProcessInfo.processInfo.systemUptime })
+  }
+
+  /// Takes the reading and the time from elsewhere, so the timing can be exercised
+  /// without a screen.
+  init(
+    read: @escaping @MainActor () -> FullScreenReading,
+    now: @escaping @MainActor () -> TimeInterval
+  ) {
+    self.read = read
+    self.now = now
+  }
+
+  /// A read is already scheduled to look again shortly.
+  var isFollowUpPending: Bool { followUp != nil }
 
   public func start() {
     stop()
@@ -32,11 +59,16 @@ public final class FullScreenMonitor {
     ] {
       observers.append(
         center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
-          MainActor.assumeIsolated { self?.evaluate() }
+          MainActor.assumeIsolated {
+            // A notice already queued when watching stopped must not restart it.
+            guard let self, self.poller != nil else { return }
+            self.evaluate()
+            self.scheduleFollowUp()
+          }
         }
       )
     }
-    let poller = Timer(timeInterval: 2, repeats: true) { [weak self] _ in
+    let poller = Timer(timeInterval: Self.pollInterval, repeats: true) { [weak self] _ in
       MainActor.assumeIsolated { self?.evaluate() }
     }
     RunLoop.main.add(poller, forMode: .common)
@@ -52,105 +84,46 @@ public final class FullScreenMonitor {
     observers = []
     poller?.invalidate()
     poller = nil
-    if isFullScreen {
-      isFullScreen = false
-      onChange?(false)
+    followUp?.invalidate()
+    followUp = nil
+    let wasFullScreen = isFullScreen
+    hysteresis = FullScreenHysteresis()
+    lastReason = nil
+    guard wasFullScreen else { return }
+    Self.log.notice("Notch screen released: no longer watched")
+    onChange?(false)
+  }
+
+  /// Reads the screen once and reports a change. Internal so the timing can be stepped
+  /// through reading by reading.
+  func evaluate() {
+    let reading = read()
+    let reason = reading.reason.rawValue
+    if reading.reason != lastReason {
+      lastReason = reading.reason
+      Self.log.debug("Read \(reason, privacy: .public) (taken: \(reading.isTaken))")
     }
+    let previous = hysteresis
+    hysteresis = previous.applying(reading, at: now())
+    if hysteresis.isAwaitingConfirmation { scheduleFollowUp() }
+    guard hysteresis.isFullScreen != previous.isFullScreen else { return }
+    // Notice, not info: info stays in memory only, and a report that the notch stepped
+    // aside unasked usually arrives after the fact, when only a persisted line can say why.
+    let state = hysteresis.isFullScreen ? "taken" : "released"
+    Self.log.notice("Notch screen \(state, privacy: .public): \(reason, privacy: .public)")
+    onChange?(hysteresis.isFullScreen)
   }
 
-  private func evaluate() {
-    let taken = Self.isTakenFullScreen(NSScreen.withNotch)
-    guard taken != isFullScreen else { return }
-    isFullScreen = taken
-    onChange?(taken)
-  }
-
-  private static func isTakenFullScreen(_ screen: NSScreen?) -> Bool {
-    guard let screen, let primary = NSScreen.screens.first,
-      let windows = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID)
-        as? [[String: Any]]
-    else { return false }
-    return isTaken(
-      windows: windows,
-      screenFrame: screen.frame,
-      safeAreaTop: screen.safeAreaInsets.top,
-      primaryFrame: primary.frame,
-      ownPID: ProcessInfo.processInfo.processIdentifier
-    )
-  }
-
-  /// The rule itself, separated from the live query so it can be exercised against
-  /// synthetic window lists.
-  ///
-  /// The frames arrive in AppKit coordinates; the window list speaks in
-  /// top-left-origin global coordinates. The primary screen anchors both systems, so
-  /// the screen's top edge flips through the primary's maxY.
-  nonisolated static func isTaken(
-    windows: [[String: Any]],
-    screenFrame: CGRect,
-    safeAreaTop: CGFloat,
-    primaryFrame: CGRect,
-    ownPID: pid_t
-  ) -> Bool {
-    // Full screen on a notched display is letterboxed below the camera housing, so
-    // the window that owns the screen tops out at the safe-area line, never at the
-    // screen's very top. The strip therefore spans the housing row plus a couple of
-    // points below it: deep enough to catch a letterboxed window's top edge — which
-    // is also where an ordinary maximized window sits, so the menu bar veto below is
-    // what separates the two.
-    let topStrip = CGRect(
-      x: screenFrame.minX,
-      y: primaryFrame.maxY - screenFrame.maxY,
-      width: screenFrame.width,
-      height: safeAreaTop + 2
-    )
-
-    // The menu bar showing at this screen's top is the strongest sign the screen was
-    // *not* handed over: taking that bar away is precisely what full screen does.
-    // Without this signal, any wide normal-level window laid over the whole screen
-    // (overlay tools, borderless windows, the Dock's own desktop backdrop) would
-    // read as a takeover even with the menu bar in plain sight.
-    //
-    // "Showing" needs two window levels, both permission free. The bar's own window
-    // (kCGMainMenuWindowLevel, full width so a third party's narrow overlay at the
-    // same level cannot pose as it) stays in the on-screen list — opaque — even
-    // inside a full-screen space, so on its own it proves nothing. Its status items
-    // (kCGStatusWindowLevel: the clock is always one) do leave the list when the
-    // bar genuinely hides, and that departure is the observable difference between
-    // a visible bar and a full-screen space. Only both together count as visible;
-    // then the width rule below decides, which is the state the feature exists for:
-    // the menu bar hides, and ours follows it out of the way.
-    let menuBarLevel = Int(CGWindowLevelForKey(.mainMenuWindow))
-    let statusItemLevel = Int(CGWindowLevelForKey(.statusWindow))
-    var menuBarWindowListed = false
-    var statusItemListed = false
-    var takenByWindow = false
-    for row in windows {
-      guard let window = visibleWindow(row), window.bounds.intersects(topStrip)
-      else { continue }
-      // Status items are narrow by nature; the bar itself and a takeover are wide.
-      // Half the screen keeps stray palettes out while still catching the narrower
-      // pane of a Split View pair through its wider partner.
-      let isWide = window.bounds.width >= screenFrame.width / 2
-      if window.layer == statusItemLevel, window.pid != ownPID { statusItemListed = true }
-      guard isWide else { continue }
-      if window.layer == menuBarLevel { menuBarWindowListed = true }
-      if window.layer == 0, window.pid != ownPID { takenByWindow = true }
+  /// One read is pending at most; a request while it waits is already covered by it.
+  private func scheduleFollowUp() {
+    guard followUp == nil else { return }
+    let followUp = Timer(timeInterval: Self.followUpDelay, repeats: false) { [weak self] _ in
+      MainActor.assumeIsolated {
+        self?.followUp = nil
+        self?.evaluate()
+      }
     }
-    return takenByWindow && !(menuBarWindowListed && statusItemListed)
-  }
-
-  /// One row of the window list, parsed; nil when a field is missing or the window
-  /// is fully transparent.
-  private nonisolated static func visibleWindow(
-    _ window: [String: Any]
-  ) -> (layer: Int, pid: pid_t, bounds: CGRect)? {
-    guard let layer = window[kCGWindowLayer as String] as? Int,
-      let pid = window[kCGWindowOwnerPID as String] as? pid_t,
-      let alpha = window[kCGWindowAlpha as String] as? Double, alpha > 0,
-      let boundsDict = window[kCGWindowBounds as String] as? NSDictionary,
-      let bounds = CGRect(dictionaryRepresentation: boundsDict)
-    else { return nil }
-    return (layer, pid, bounds)
+    RunLoop.main.add(followUp, forMode: .common)
+    self.followUp = followUp
   }
 }

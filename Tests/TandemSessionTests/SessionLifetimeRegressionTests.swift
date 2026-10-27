@@ -290,7 +290,7 @@ private func lifetimeReady(
   await coordinator.shutdown()
 }
 
-@Test func anOldInboundFrameWaitingOnItsAckCannotCompleteANewRequest() async throws {
+@Test func anOldAcknowledgementCannotHoldUpASuccessorSession() async throws {
   let (coordinator, opener, old) = try await lifetimeReady()
   let gate = Gate()
   await old.holdAcknowledgement(on: gate)
@@ -303,11 +303,12 @@ private func lifetimeReady(
   try #require(await lifetimeEventually { await coordinator.phase == .ready })
   let request = Task { try await coordinator.send(lifetimeFrame(0x0A), matching: lifetimeReply) }
   try #require(await lifetimeEventually { await next.count(0x0A) == 1 })
-  await gate.release()
-  #expect(await coordinator.inFlightAcknowledged != nil)
+  // The old ACK remains blocked. The successor's request and ACK use a fresh
+  // transport chain, so they must finish before that old write is released.
   try await next.reply([0x0B, 1])
   let response = try await request.value
   #expect([UInt8](response.payload) == [0x0B, 1])
+  await gate.release()
   await coordinator.shutdown()
 }
 

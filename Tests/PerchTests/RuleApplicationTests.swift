@@ -147,7 +147,8 @@ private struct RuleFixture {
 
   static func make(
     codes: [UInt8] = [0x57, 0x6D, 0xE4, 0xE5], cinema: Bool = false,
-    holdInitialEqualizer: Bool = false
+    holdInitialEqualizer: Bool = false,
+    writeSleep: @escaping @MainActor (Duration) async -> Void = { try? await Task.sleep(for: $0) }
   ) async throws -> Self {
     func opened() -> (RuleChannel, OpenedChannel) {
       let (stream, continuation) = AsyncStream<Data>.makeStream()
@@ -166,7 +167,7 @@ private struct RuleFixture {
     let service = SessionService(coordinator: session)
     let fixture = Self(
       session: session, channel: channel, replacement: replacement,
-      service: service, model: AppModel(), codes: codes)
+      service: service, model: AppModel(writeSleep: writeSleep), codes: codes)
     await session.handle(.defaultOutputChanged(first))
     if holdInitialEqualizer {
       try #require(await ruleEventually { await channel.hasDelayedEqualizer })
@@ -530,4 +531,58 @@ private func noiseRule(_ action: SoundRule.NoiseAction) -> SoundRule {
   await f.apply(nil)
   #expect(await f.session.readings.equalizer?.selectedPreset == 0)
   await f.finish()
+}
+
+@Test @MainActor func timedOutRuleCannotSendLaterFieldsOrReplaceSuccessorHold() async throws {
+  let timer = ManualTimer()
+  let f = try await RuleFixture.make(cinema: true, writeSleep: timer.sleep)
+  await f.channel.holdNoiseReply()
+  var first = noiseRule(.ambient)
+  first.listening = .standard
+  first.equalizerPreset = 0xA0
+  f.model.applyRule(first, using: f.service)
+  let channel = f.channel
+  try #require(await ruleEventually { await channel.hasDelayedNoise })
+  await waitUntil { timer.pending > 0 }
+  timer.fire()
+  await f.model.settleDeviceWrites()
+
+  f.model.applyRule(noiseRule(.off), using: f.service)
+  await waitUntil { timer.pending > 0 }
+  try await channel.releaseNoiseReply()
+  await f.model.settleDeviceWrites()
+  #expect(await channel.count(0xE8) == 0)
+  #expect(await channel.count(0x58) == 0)
+  #expect(await f.session.readings.noiseControl?.state.isActive == false)
+  await f.apply(nil)
+  // The successor captures whichever confirmed baseline it sees before its SET.
+  // Its own undo must survive the abandoned rule's eventual completion.
+  #expect(await channel.count(0x68) == 3)
+  await f.finish()
+  await timer.drain()
+}
+
+@Test @MainActor func timedOutPreviewReleasesGateAndLateCompletionCannotRestoreOwnership() async throws {
+  let timer = ManualTimer()
+  let f = try await RuleFixture.make(writeSleep: timer.sleep)
+  await f.channel.holdNoiseReply()
+  f.model.previewNoise(.ambient, using: f.service)
+  let channel = f.channel
+  try #require(await ruleEventually { await channel.hasDelayedNoise })
+  await waitUntil { timer.pending > 0 }
+  timer.fire()
+  await f.model.settleDeviceWrites()
+  #expect(!f.model.isPreviewing)
+  try await channel.releaseNoiseReply()
+  let session = f.session
+  try #require(await ruleEventually {
+    await session.readings.noiseControl?.state.isNoiseCancelling == false
+  })
+  await yieldToMainActor()
+  #expect(!f.model.isPreviewing)
+  f.model.endPreview(using: f.service)
+  await f.model.settleDeviceWrites()
+  #expect(await channel.count(0x68) == 1)
+  await f.finish()
+  await timer.drain()
 }

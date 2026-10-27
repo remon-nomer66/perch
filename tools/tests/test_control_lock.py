@@ -5,6 +5,7 @@ Run with: python3 -I tools/tests/test_control_lock.py
 No command here can inspect or operate the real app, probe, or control lock.
 """
 
+import json
 import os
 from pathlib import Path
 import shutil
@@ -17,6 +18,7 @@ import unittest
 
 
 STUB = r'''#!/usr/bin/env python3
+import json
 import os
 from pathlib import Path
 import signal
@@ -51,7 +53,23 @@ signal.signal(signal.SIGINT, interrupted)
 if command == "pgrep":
     if (state / "pgrep.error").exists():
         sys.exit(2)
-    path = state / ("app.pid" if "Contents/MacOS" in sys.argv[-1] else "probe.pid")
+    if (state / "process-lines").exists():
+        # Match synthetic command lines with the same POSIX ERE syntax as pgrep.
+        result = subprocess.run(["/usr/bin/grep", "-E", "--", sys.argv[-1]],
+                                input=(state / "process-lines").read_text(),
+                                stdout=subprocess.PIPE, text=True)
+        if result.returncode == 0:
+            print("4243")
+            sys.exit(0)
+        if result.returncode != 1:
+            sys.exit(result.returncode)
+    if "bose-probe" in sys.argv[-1]:
+        name = "bose.pid"
+    elif "Contents/MacOS" in sys.argv[-1]:
+        name = "app.pid"
+    else:
+        name = "probe.pid"
+    path = state / name
     if path.exists():
         print(path.read_text().strip())
         sys.exit(0)
@@ -75,13 +93,16 @@ elif command == "pkill":
     if not (state / "stubborn").exists():
         (state / "app.pid").unlink(missing_ok=True)
     sys.exit(exit_code("kill"))
-elif command == "perch-probe":
-    (state / "probe.pid").write_text(str(os.getpid()))
+elif command in ("perch-probe", "bose-probe"):
+    name = "bose" if command == "bose-probe" else "probe"
+    (state / (name + ".args")).write_text(json.dumps(sys.argv[1:]))
+    (state / (name + ".pid")).write_text(str(os.getpid()))
     try:
-        gate("probe")
-        sys.exit(exit_code("probe"))
+        gate(name)
+        print(name + " synthetic output")
+        sys.exit(exit_code(name))
     finally:
-        (state / "probe.pid").unlink(missing_ok=True)
+        (state / (name + ".pid")).unlink(missing_ok=True)
 elif command == "mv":
     gate("move")
     sys.exit(subprocess.call(["/bin/mv", *sys.argv[1:]]))
@@ -131,6 +152,7 @@ class ControlLockTests(unittest.TestCase):
             (self.bin / name).symlink_to(self.stub)
         (self.tools / "package_app.sh").symlink_to(self.stub)
         (self.root / ".build/debug/perch-probe").symlink_to(self.stub)
+        (self.root / ".build/debug/bose-probe").symlink_to(self.stub)
         # Bounded retries finish quickly; synchronization uses marker gates.
         (self.bin / "sleep").write_text("#!/bin/sh\nexec /bin/sleep 0.01\n")
         (self.bin / "sleep").chmod(0o755)
@@ -466,6 +488,100 @@ class ControlLockTests(unittest.TestCase):
         process.send_signal(signal.SIGTERM)
         self.finish(process, 143)
         self.assertFalse((self.state / "probe.pid").exists())
+        self.assert_free()
+
+    def test_bose_wrapper_forwards_arguments_output_and_exit_status(self):
+        self.mark("bose.block")
+        self.mark("bose.exit", "7")
+        output = self.state / "bose-output"
+        arguments = ["--synthetic-flag", "synthetic value", "synthetic-address"]
+        process = self.start("bose-probe", "session-a", str(output), *arguments)
+        self.await_marker("bose.ready")
+        self.assertEqual(json.loads((self.state / "bose.args").read_text()), arguments)
+        self.assertEqual(self.fields()["note"], "bose-probe")
+        self.assertEqual(self.fields()["role"], "probe")
+        log = (self.root / ".control-session.log").read_text()
+        self.assertIn("note=bose-probe", log)
+        self.assertNotIn("synthetic-address", log)
+        self.assertNotIn(str(output), log)
+        self.mark("bose.continue")
+        _, stdout, _ = self.finish(process, 7)
+        self.assertIn("bose-probe exit=7", stdout)
+        self.assertEqual(output.read_text(), "bose synthetic output\n")
+        self.assert_free()
+
+    def test_bose_wrapper_accepts_no_optional_arguments(self):
+        self.run_lock("bose-probe", "session-a", str(self.state / "bose-output"))
+        self.assertEqual(json.loads((self.state / "bose.args").read_text()), [])
+        self.assert_free()
+
+    def test_bose_missing_binary_leaves_other_reservation_untouched(self):
+        self.run_lock("acquire", "session-a", "app")
+        original = self.lock.read_bytes()
+        (self.root / ".build/debug/bose-probe").unlink()
+        _, _, stderr = self.run_lock("bose-probe", "session-b", str(self.state / "bose-output"), expected=1)
+        self.assertIn("swift build --product bose-probe", stderr)
+        self.assertEqual(self.lock.read_bytes(), original)
+        self.assertFalse((self.state / "bose.called").exists())
+
+    def test_running_bose_blocks_sony_app_and_same_owner_reentry(self):
+        self.mark("bose.block")
+        process = self.start("bose-probe", "session-a", str(self.state / "bose-output"))
+        self.await_marker("bose.ready")
+        original = self.lock.read_bytes()
+        self.run_lock("probe", "session-b", "synthetic-address", str(self.state / "probe-output"), expected=1)
+        self.run_lock("app-start", "session-b", expected=1)
+        self.run_lock("bose-probe", "session-a", str(self.state / "second-bose-output"), expected=1)
+        self.assertEqual(self.lock.read_bytes(), original)
+        self.assertFalse((self.state / "probe.called").exists())
+        self.assertFalse((self.state / "package.called").exists())
+        self.assertFalse((self.state / "second-bose-output").exists())
+        self.mark("bose.continue")
+        self.finish(process, 0)
+        self.assert_free()
+
+    def test_running_sony_and_app_reservation_each_block_bose(self):
+        self.mark("probe.block")
+        process = self.start("probe", "session-a", "synthetic-address", str(self.state / "probe-output"))
+        self.await_marker("probe.ready")
+        self.run_lock("bose-probe", "session-b", str(self.state / "bose-output"), expected=1)
+        self.assertFalse((self.state / "bose.called").exists())
+        self.mark("probe.continue")
+        self.finish(process, 0)
+        self.run_lock("acquire", "session-a", "app")
+        original = self.lock.read_bytes()
+        self.run_lock("bose-probe", "session-b", str(self.state / "bose-output"), expected=1)
+        self.assertEqual(self.lock.read_bytes(), original)
+        self.assertFalse((self.state / "bose.called").exists())
+
+    def test_unreserved_bose_process_blocks_every_control_client(self):
+        self.mark("bose.pid", "4243")
+        self.run_lock("acquire", "session-a", "app", expected=1)
+        self.run_lock("app-start", "session-a", expected=1)
+        self.run_lock("probe", "session-a", "synthetic-address", str(self.state / "probe-output"), expected=1)
+        self.run_lock("bose-probe", "session-a", str(self.state / "bose-output"), expected=1)
+        self.assertFalse((self.state / "package.called").exists())
+        self.assertFalse((self.state / "probe.called").exists())
+        self.assertFalse((self.state / "bose.called").exists())
+        self.assert_free()
+
+    def test_bose_process_pattern_matches_binary_but_not_wrapper_subcommand(self):
+        self.mark("process-lines", "bash tools/control-lock.sh bose-probe session-a output\n")
+        self.run_lock("bose-probe", "session-a", str(self.state / "bose-output"))
+        self.assert_free()
+        for command in (".build/debug/bose-probe", "BoseProbe.app/Contents/MacOS/bose-probe", "bose-probe"):
+            with self.subTest(command=command):
+                self.mark("process-lines", command + " synthetic-argument\n")
+                self.run_lock("acquire", "session-a", "app", expected=1)
+                self.assert_free()
+
+    def test_bose_signal_stops_owned_child_and_releases(self):
+        self.mark("bose.block")
+        process = self.start("bose-probe", "session-a", str(self.state / "bose-output"))
+        self.await_marker("bose.ready")
+        process.send_signal(signal.SIGTERM)
+        self.finish(process, 143)
+        self.assertFalse((self.state / "bose.pid").exists())
         self.assert_free()
 
 

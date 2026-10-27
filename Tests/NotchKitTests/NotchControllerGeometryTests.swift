@@ -39,7 +39,8 @@ private let notch = CGRect(x: 620, y: 950, width: 272, height: 32)
 
 @Test func theHoverTargetIsTheWidenedBarWhileItIsVisible() {
   let target = NotchController.hoverTarget(
-    barVisible: true, notch: notch, isVirtual: false, appearance: .default
+    barVisible: true, presentation: .closed, notch: notch, isVirtual: false,
+    appearance: .default
   )
 
   #expect(target == NotchAppearance.default.closedRect(around: notch))
@@ -49,19 +50,79 @@ private let notch = CGRect(x: 620, y: 950, width: 272, height: 32)
   // With the bar hidden there is nothing beside the cutout to point at; the side
   // reaches of the invisible bar must not react to the pointer.
   let target = NotchController.hoverTarget(
-    barVisible: false, notch: notch, isVirtual: false, appearance: .default
+    barVisible: false, presentation: .closed, notch: notch, isVirtual: false,
+    appearance: .default
   )
 
   #expect(target == notch)
 }
 
-@Test func theHoverTargetForAVirtualNotchIsItsRestingSliver() {
-  // A virtual notch rests as a thin sliver, so that sliver — not a bar, not a full
-  // cutout — is what the pointer must reach to wake it. The visible-bar flag does not
-  // apply: at rest there is only ever the sliver to point at.
+@Test func theHoverTargetForAVirtualNotchAtRestIsItsSliver() {
+  // At rest, with nothing to announce, a virtual notch is only the sliver: that and
+  // nothing larger is what the pointer must reach to wake it.
   let target = NotchController.hoverTarget(
-    barVisible: true, notch: notch, isVirtual: true, appearance: .default
+    barVisible: false, presentation: .closed, notch: notch, isVirtual: true,
+    appearance: .default
   )
 
   #expect(target == NotchAppearance.default.restingSliver(in: notch))
+}
+
+@Test func theHoverTargetForAVirtualNotchFollowsWhatIsDrawn() {
+  // Popping, the virtual notch is drawn at the full cutout — or at the bar once it
+  // has something to carry — and the pointer anywhere on that keeps it awake. A
+  // target left at the sliver closed it the moment the pointer moved down into the
+  // drawn bar, and a click there then fell on nothing.
+  let bare = NotchController.hoverTarget(
+    barVisible: false, presentation: .popping, notch: notch, isVirtual: true,
+    appearance: .default
+  )
+  let widened = NotchController.hoverTarget(
+    barVisible: true, presentation: .popping, notch: notch, isVirtual: true,
+    appearance: .default
+  )
+  let announcing = NotchController.hoverTarget(
+    barVisible: true, presentation: .closed, notch: notch, isVirtual: true,
+    appearance: .default
+  )
+
+  #expect(bare == notch)
+  #expect(widened == NotchAppearance.default.closedRect(around: notch))
+  #expect(announcing == NotchAppearance.default.closedRect(around: notch))
+}
+
+@Test func theNotchTargetReachesThePointerPressedAgainstTheTopEdge() {
+  // `NSEvent.mouseLocation` reports a pointer on the screen's top row as exactly the
+  // screen's maxY, which `CGRect.contains` counts as outside a rect ending there.
+  let target = NotchController.notchTarget(
+    barVisible: true, presentation: .closed, notch: notch, isVirtual: false,
+    appearance: .default
+  )
+
+  #expect(target.contains(CGPoint(x: notch.midX, y: builtIn.maxY)))
+  #expect(target == NotchAppearance.default.closedRect(around: notch).insetBy(dx: -4, dy: -4))
+}
+
+// MARK: - Panel target
+
+@Test func thePanelTargetIsCentredOnTheCutoutAndHangsFromTheTop() {
+  let panel = NotchController.panelTarget(
+    notch: notch, screenFrame: builtIn, appearance: .default
+  )
+
+  #expect(panel.midX == notch.midX)
+  #expect(panel.width == NotchAppearance.default.expandedWidth)
+  #expect(panel.minY == builtIn.maxY - NotchAppearance.default.expandedHeight)
+}
+
+@Test func thePanelTargetIncludesThePointerPressedAgainstTheTopEdge() {
+  // A press on the panel's top row, beside the notch, came back as outside the
+  // panel and dismissed what was being pressed.
+  let panel = NotchController.panelTarget(
+    notch: notch, screenFrame: builtIn, appearance: .default
+  )
+  let besideTheNotch = notch.maxX + 120
+
+  #expect(panel.contains(CGPoint(x: besideTheNotch, y: builtIn.maxY)))
+  #expect(!panel.contains(CGPoint(x: besideTheNotch, y: panel.minY - 1)))
 }

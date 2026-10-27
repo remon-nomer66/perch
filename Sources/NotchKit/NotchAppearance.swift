@@ -7,7 +7,8 @@ import Foundation
 /// the extension should reach depends on how crowded the surrounding menu bar is. A
 /// value that suits one machine looks wrong on the next.
 public struct NotchAppearance: Codable, Equatable, Sendable {
-  /// How far the closed bar reaches past the notch on each side.
+  /// How far the closed bar reaches past the notch on each side, each on its own: the
+  /// bar is drawn, and answers the pointer, from `closedRect(around:)`.
   public var leadingExtension: CGFloat
   public var trailingExtension: CGFloat
   /// Added below the notch so the bar can be taller than the cutout.
@@ -24,9 +25,12 @@ public struct NotchAppearance: Codable, Equatable, Sendable {
   public var expandedBottomCornerRadius: CGFloat
   public var topCornerRadius: CGFloat
 
+  /// The side reaches are what the bar has always been drawn at. They read 76/52 once,
+  /// but the bar was centred on the cutout regardless, so what showed was 64 a side;
+  /// drawn per side now, the defaults say so outright rather than move the bar.
   public static let `default` = NotchAppearance(
-    leadingExtension: 76,
-    trailingExtension: 52,
+    leadingExtension: 64,
+    trailingExtension: 64,
     closedHeightIncrease: 0,
     restingHeight: restingHeightDefault,
     expandedWidth: 640,
@@ -84,6 +88,8 @@ public struct NotchAppearance: Codable, Equatable, Sendable {
     case closedBottomCornerRadius
     case expandedBottomCornerRadius
     case topCornerRadius
+    /// Written into every archive since the bar is drawn per side; see `init(from:)`.
+    case drawsSidesSeparately
   }
 
   /// Routed through the clamping initializer above. The stored archive is external
@@ -92,9 +98,15 @@ public struct NotchAppearance: Codable, Equatable, Sendable {
   /// to the properties, past the limits.
   public init(from decoder: any Decoder) throws {
     let values = try decoder.container(keyedBy: CodingKeys.self)
+    let sides = Self.sideReaches(
+      leading: try values.decode(CGFloat.self, forKey: .leadingExtension),
+      trailing: try values.decode(CGFloat.self, forKey: .trailingExtension),
+      drawnPerSide: try values.decodeIfPresent(Bool.self, forKey: .drawsSidesSeparately)
+        ?? false
+    )
     self.init(
-      leadingExtension: try values.decode(CGFloat.self, forKey: .leadingExtension),
-      trailingExtension: try values.decode(CGFloat.self, forKey: .trailingExtension),
+      leadingExtension: sides.leading,
+      trailingExtension: sides.trailing,
       closedHeightIncrease: try values.decode(CGFloat.self, forKey: .closedHeightIncrease),
       // Absent in archives predating this field: fill it rather than fail the whole
       // decode, so an upgrade keeps every other size the owner had already tuned.
@@ -108,6 +120,36 @@ public struct NotchAppearance: Codable, Equatable, Sendable {
       ),
       topCornerRadius: try values.decode(CGFloat.self, forKey: .topCornerRadius)
     )
+  }
+
+  /// Written by hand only to mark the archive as meaning each side reach as stated.
+  public func encode(to encoder: any Encoder) throws {
+    var values = encoder.container(keyedBy: CodingKeys.self)
+    try values.encode(leadingExtension, forKey: .leadingExtension)
+    try values.encode(trailingExtension, forKey: .trailingExtension)
+    try values.encode(closedHeightIncrease, forKey: .closedHeightIncrease)
+    try values.encode(restingHeight, forKey: .restingHeight)
+    try values.encode(expandedWidth, forKey: .expandedWidth)
+    try values.encode(expandedHeight, forKey: .expandedHeight)
+    try values.encode(closedBottomCornerRadius, forKey: .closedBottomCornerRadius)
+    try values.encode(expandedBottomCornerRadius, forKey: .expandedBottomCornerRadius)
+    try values.encode(topCornerRadius, forKey: .topCornerRadius)
+    try values.encode(true, forKey: .drawsSidesSeparately)
+  }
+
+  /// The side reaches an archive means. One written before the bar was drawn per side
+  /// showed both as the mean of the two, whatever they said: the view centred the bar
+  /// on the cutout. It is read back as what was seen, not what was typed — taken at its
+  /// word, the stored 76/52 of the old defaults would move the bar sideways on upgrade
+  /// and push a stacked left/right charge under the cutout. Clamped first, as the
+  /// initializer clamped before the view centred.
+  private static func sideReaches(
+    leading: CGFloat, trailing: CGFloat, drawnPerSide: Bool
+  ) -> (leading: CGFloat, trailing: CGFloat) {
+    guard !drawnPerSide else { return (leading, trailing) }
+    let range = Limits().sideExtension
+    let shown = (leading.clamped(to: range) + trailing.clamped(to: range)) / 2
+    return (shown, shown)
   }
 
   /// The thin sliver a virtual notch rests at, in screen coordinates: the top

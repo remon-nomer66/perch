@@ -63,7 +63,7 @@ struct DeviceSummary: Equatable {
       return .reading
     case .contended:
       return .takenByAnotherDevice
-    case .retryWaiting, .retryExhausted:
+    case .retryWaiting, .retryExhausted, .incompatible:
       return .unreachable
     case .unverified:
       return .unverified(caveat: Self.caveat(reason))

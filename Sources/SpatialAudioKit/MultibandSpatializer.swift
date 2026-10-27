@@ -77,10 +77,11 @@ public final class MultibandSpatializer: @unchecked Sendable {
   private struct SharedState {
     /// True once any capture callback has arrived at all.
     var receivedAudio = false
-    /// True once a non-silent sample has been captured. A denied system-audio
-    /// permission still fires callbacks, but with silence — so callbacks arriving is
-    /// not proof of capture. Real (non-zero) audio is.
-    var receivedSignal = false
+    /// Blocks that carried a non-silent sample. A denied system-audio permission still
+    /// fires callbacks, but with silence — so callbacks arriving is not proof of
+    /// capture. Real (non-zero) audio is. Counted rather than latched, so the watch
+    /// after turning on can tell whether audio is *still* arriving.
+    var audibleBlocks = 0
     // 耳合わせ用の可変ゲイン（メインが書き、オーディオが読む。autoBalance 時は
     // オーディオ側が書き戻す）。
     var lowGain: Float
@@ -105,9 +106,10 @@ public final class MultibandSpatializer: @unchecked Sendable {
   private let shared: OSAllocatedUnfairLock<SharedState>
 
   public var hasReceivedAudio: Bool { shared.withLock { $0.receivedAudio } }
-  public var hasAudioSignal: Bool { shared.withLock { $0.receivedSignal } }
-  /// 無音走査の打ち切りゲート。オーディオスレッドだけが触る（ロック不要）。
-  private var signalSeen = false
+  public var hasAudioSignal: Bool { audibleBlockCount > 0 }
+  /// 無音でないサンプルを含んだブロックの、開始からの累計。前回読んだ値から増えていれば、
+  /// その間にも音が届いている。
+  public var audibleBlockCount: Int { shared.withLock { $0.audibleBlocks } }
   private static let silenceThreshold: Float = 0.0005
 
   // 音源の基準位置（揺らぎはこれに加算する）と、ゆっくり漂わせる揺らぎ。
@@ -240,6 +242,21 @@ public final class MultibandSpatializer: @unchecked Sendable {
 
   public var captureFormat: AudioStreamBasicDescription {
     tap?.streamFormat ?? AudioStreamBasicDescription()
+  }
+
+  /// 空間化した音を出すエンジンが動いているか。止まっていても、タップは原音を消し続ける。
+  public var isOutputRunning: Bool { graph.isRunning }
+
+  /// システムオーディオ録音の許可を、取り込み中のタップに問い合わせる手立て
+  /// （`SystemAudioTap.permissionProbe`）。取り込んでいなければ nil。問い合わせは同期の
+  /// 往復なので、メインスレッドの外で `run()` すること。
+  public var capturePermissionProbe: SystemAudioTap.PermissionProbe? {
+    tap?.permissionProbe
+  }
+
+  /// `capturePermissionProbe` をその場で走らせる。取り込んでいなければ判定できない。
+  public func probeCapturePermission() -> SystemAudioPermission {
+    capturePermissionProbe?.run() ?? .unknown
   }
 
   /// 出力構成の変化でエンジンが止まった時の通知（PositionedSourceGraph へ転送）。
@@ -379,27 +396,22 @@ public final class MultibandSpatializer: @unchecked Sendable {
   }
 
   private func processStereo(left: [Float], right: [Float]) {
+    // Prove real capture, not just that the callback fired: a denied permission delivers
+    // silent buffers. Both channels count — hard-panned material may carry signal in
+    // only one. Every block is scanned, not just until the first signal, so the count
+    // keeps telling whether audio still arrives; the scan stops at the first audible
+    // sample, so playing material costs a few comparisons per block.
+    let audible = !left.isEmpty && !right.isEmpty
+      && (Self.containsSignal(left) || Self.containsSignal(right))
     // 共有ミラーはブロックあたり数回、ひとまとめに読む（レンダースレッドが
     // ロックを握るのはスカラのコピーの間だけ）。
     var (lowGain, midGain, sideWidth, distanceRatio) = shared.withLock {
       state -> (Float, Float, Float, Double) in
       state.receivedAudio = true
+      if audible { state.audibleBlocks &+= 1 }
       return (state.lowGain, state.midGain, state.sideWidth, state.listenerDistanceRatio)
     }
     guard !left.isEmpty, !right.isEmpty else { return }
-
-    // Prove real capture, not just that the callback fired: a denied permission delivers
-    // silent buffers. Both channels count — hard-panned material may carry signal in
-    // only one. Stop scanning once any signal has been seen.
-    if !signalSeen {
-      scan: for channel in [left, right] {
-        for sample in channel where abs(sample) > Self.silenceThreshold {
-          signalSeen = true
-          shared.withLock { $0.receivedSignal = true }
-          break scan
-        }
-      }
-    }
     let (lowLeft, splitHighLeft) = crossoverLeft.split(left)
     let (lowRight, splitHighRight) = crossoverRight.split(right)
 
@@ -534,6 +546,11 @@ public final class MultibandSpatializer: @unchecked Sendable {
       sideRight[index] = -side
     }
     return (bassLeft, bassRight, center, sideLeft, sideRight)
+  }
+
+  /// 無音とみなす閾値を超えるサンプルがあるか。最初に見つけた所で打ち切る。
+  static func containsSignal(_ samples: [Float]) -> Bool {
+    samples.contains { abs($0) > silenceThreshold }
   }
 
   /// (a+b)/2 の RMS（中央成分のレベル）。

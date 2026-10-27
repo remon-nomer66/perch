@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Coordinates exclusive access to the single RFCOMM control session.
+# Perch, perch-probe (Sony/Tandem), and bose-probe (Bose/BMAP) share this lock.
 # Never put addresses or other personal data in the owner, note, lock or log.
 #
 # Usage:
@@ -9,6 +10,8 @@
 #   control-lock.sh app-start <owner> [note]
 #   control-lock.sh app-stop <owner> [force]
 #   control-lock.sh probe <owner> <address> <outfile> [note]
+#   control-lock.sh bose-probe <owner> <outfile> [probe args...]
+#     All remaining arguments are forwarded unchanged to bose-probe.
 #
 # A reservation survives between launches. Even the same owner must release it
 # before acquiring again. Use force deliberately, after coordinating with its owner.
@@ -22,8 +25,11 @@ GATE="$LOCK.gate"
 LOG="$ROOT/.control-session.log"
 APP="$ROOT/.build/Perch.app"
 PROBE="$ROOT/.build/debug/perch-probe"
+BOSE_PROBE="$ROOT/.build/debug/bose-probe"
 APP_PATTERN='.build/Perch.app/Contents/MacOS/Perch'
 PROBE_PATTERN='perch-probe'
+# Match the binary, not the bare subcommand in this wrapper's command line.
+BOSE_PROBE_PATTERN='(^|/)bose-probe([[:space:]]|$)'
 TOKEN="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
 GATE_KEY="$$.$TOKEN"
 GATE_DEPTH=0
@@ -52,7 +58,11 @@ control_pids() {
 }
 
 holders() {
-  { control_pids "$APP_PATTERN"; control_pids "$PROBE_PATTERN"; } | tr '\n' ' '
+  {
+    control_pids "$APP_PATTERN"
+    control_pids "$PROBE_PATTERN"
+    control_pids "$BOSE_PROBE_PATTERN"
+  } | tr '\n' ' '
 }
 
 # A failed kill -0 may mean permission denied. Only ESRCH proves abandonment.
@@ -173,7 +183,7 @@ acquire() { # owner role note
     return 1
   fi
   if ! write_lock "$1" "$2" 0 "${3:-}" "$TOKEN" reserved; then leave_gate; return 1; fi
-  log "ACQUIRE owner=$1 role=$2"
+  log "ACQUIRE owner=$1 role=$2 note=${3:-}"
   leave_gate
 }
 
@@ -347,8 +357,15 @@ app_stop() {
   echo 'app stopped; released'
 }
 
-run_probe() {
-  local owner="$1" address="$2" out="$3" note="${4:-probe}" rc
+# Both probes use the same reservation, launch, PID and cleanup lifecycle.
+run_probe() { # binary label owner outfile note [probe args...]
+  local binary="$1" label="$2" owner="$3" out="$4" note="${5:-}" rc
+  shift 5
+  if [ ! -x "$binary" ]; then
+    echo "MISSING: $label is not built (swift build --product $label)" >&2
+    return 1
+  fi
+  note="$label${note:+: $note}"
   CLEANUP_OWNER="$owner"; CLEANUP_TOKEN="$TOKEN"
   acquire "$owner" probe "$note" || return 1
   enter_gate || return 1
@@ -356,7 +373,7 @@ run_probe() {
     leave_gate; return 1
   fi
   DEFER_SIGNAL=1
-  "$PROBE" "$address" > "$out" 2>&1 &
+  "$binary" "$@" > "$out" 2>&1 &
   CHILD_PID=$!
   DEFER_SIGNAL=0
   [ "$PENDING_SIGNAL" -eq 0 ] || exit "$PENDING_SIGNAL"
@@ -366,7 +383,7 @@ run_probe() {
   CHILD_PID=""
   cleanup_reservation "$owner" "$TOKEN" || true
   CLEANUP_TOKEN=""
-  echo "probe exit=$rc"
+  echo "$label exit=$rc"
   return "$rc"
 }
 
@@ -381,6 +398,7 @@ case "$cmd" in
   release) release "${2:?owner}" "${3:-}" ;;
   app-start) app_start "${2:?owner}" "${3:-}" ;;
   app-stop) app_stop "${2:?owner}" "${3:-}" ;;
-  probe) run_probe "${2:?owner}" "${3:?address}" "${4:?output file}" "${5:-probe}" ;;
+  probe) run_probe "$PROBE" perch-probe "${2:?owner}" "${4:?output file}" "${5:-}" "${3:?address}" ;;
+  bose-probe) run_probe "$BOSE_PROBE" bose-probe "${2:?owner}" "${3:?output file}" '' "${@:4}" ;;
   *) echo "unknown command: $cmd" >&2; exit 2 ;;
 esac
