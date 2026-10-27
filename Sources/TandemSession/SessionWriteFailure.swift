@@ -5,6 +5,8 @@ extension SessionCoordinator {
   public enum WriteFailure: Error, Equatable, Sendable {
     case notPermitted
     case unsupported
+    case invalidEqualizer(TandemEqualizerError)
+    case undeclaredEqualizerPreset(UInt8)
     /// The device answered, but with something other than what was asked for. The
     /// value in hand is what it actually holds.
     case notApplied(TandemNoiseControlState)

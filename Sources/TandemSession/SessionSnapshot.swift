@@ -8,6 +8,7 @@ extension SessionCoordinator {
   /// frame; with device-scoped rules that momentary nil model name unmatched a rule and
   /// set noise/EQ flapping. A single hop cannot be interrupted.
   public struct Snapshot: Sendable {
+    public let epoch: SessionEpoch
     public let phase: SessionState.Phase
     public let fingerprint: TandemDeviceFingerprint?
     public let unsupportedReason: TandemDeviceVerificationFailure?

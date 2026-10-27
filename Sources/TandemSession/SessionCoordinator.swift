@@ -69,6 +69,7 @@ public enum SessionRequestFailure: Error, Equatable, Sendable {
 /// actors, an invalidation could land after a request had already been admitted
 /// against the state it invalidated.
 public actor SessionCoordinator {
+
   private let policy: SessionPolicy
   private let opener: any TandemChannelOpening
   private let verifier: any DeviceVerifying
@@ -94,10 +95,11 @@ public actor SessionCoordinator {
   /// attribute interleaved traffic, so a second request never starts until the
   /// current one has resolved.
   private var inFlight: PendingRequest?
-  /// True from the moment a sender claims the wire until its request resolves.
-  private var isSending = false
+  /// The turn identity survives suspension, so a late old write cannot release a
+  /// successor's wire after invalidation.
+  private var sendTurn: SendTurn?
   /// Senders waiting for the wire, resumed strictly in arrival order.
-  private var sendWaiters: [CheckedContinuation<Void, Never>] = []
+  private var sendWaiters: [(SendTurn, CheckedContinuation<Void, Never>)] = []
   /// Whether the caveated write path is open for a device that failed verification.
   /// Decided once per verification from the failure and the fingerprint: an unknown
   /// model or firmware that passes the experimental gate may be written to behind
@@ -105,10 +107,12 @@ public actor SessionCoordinator {
   private var unverifiedWritesPermitted = false
   /// Alternates 0 and 1 across everything we send on a channel.
   private var outgoingSequence: UInt8 = 0
-  /// Every write on the channel, in the order the session made them.
+  /// Serializes transport writes, including acknowledgements, with a finite deadline.
   private var writeChain = ChannelWriteChain()
   private var notifications: AsyncStream<TandemFrame>.Continuation?
-  private var closeWasRequested = false
+  private var adoptedAttempt: ConnectionAttempt?
+  private var closeTask: Task<Void, Never>?
+  private var isShutdown = false
   /// Touch-panel gesture names heard over the session, added to the support report.
   /// They are announced, never readable, so the log is the only record of them.
   private var gestureLog = TandemGestureNotificationLog()
@@ -146,6 +150,7 @@ public actor SessionCoordinator {
   /// Everything a panel refresh needs, in one actor hop (see `Snapshot`).
   public var snapshot: Snapshot {
     Snapshot(
+      epoch: epoch,
       phase: state.phase,
       fingerprint: fingerprint,
       unsupportedReason: rejection,
@@ -165,12 +170,28 @@ public actor SessionCoordinator {
   // MARK: - Events
 
   public func handle(_ event: SessionEvent) async {
+    guard !isShutdown else { return }
+    transition(event)
+    await closeTask?.value
+  }
+
+  /// Terminal for this coordinator. Late system events and open completions may
+  /// not reopen it; ordinary manualRelease remains reusable.
+  public func shutdown() async {
+    if !isShutdown {
+      isShutdown = true
+      transition(.manualRelease)
+    }
+    await closeTask?.value
+  }
+
+  private func transition(_ event: SessionEvent) {
     let previous = state
     let (next, effects) = policy.reduce(state, event)
     SessionLog.transition(from: previous, to: next, on: event)
     state = next
     for effect in effects {
-      await run(effect)
+      run(effect)
     }
     reconcilePolling(from: previous.phase)
   }
@@ -192,7 +213,7 @@ public actor SessionCoordinator {
 
   // MARK: - Effects
 
-  private func run(_ effect: SessionEffect) async {
+  private func run(_ effect: SessionEffect) {
     switch effect {
     case .openChannel(let device, let attempt):
       startOpening(device, attempt: attempt)
@@ -202,10 +223,16 @@ public actor SessionCoordinator {
       openTask = nil
 
     case .closeChannel:
-      closeWasRequested = true
-      let closing = channel
+      guard let closing = channel else { break }
       channel = nil
-      await closing?.close()
+      adoptedAttempt = nil
+      inboundTask?.cancel()
+      inboundTask = nil
+      let previousClose = closeTask
+      closeTask = Task {
+        await previousClose?.value
+        await closing.close()
+      }
 
     case .invalidateSession:
       invalidate()
@@ -250,6 +277,11 @@ public actor SessionCoordinator {
   }
 
   private func invalidate() {
+    failPending(with: .sessionInvalidated)
+    sendTurn = nil
+    let waiting = sendWaiters
+    sendWaiters = []
+    for (_, continuation) in waiting { continuation.resume() }
     readingTask?.cancel()
     readingTask = nil
     latestReadings = DeviceReadings()
@@ -280,8 +312,12 @@ public actor SessionCoordinator {
 
   private func startOpening(_ device: DeviceIdentity, attempt: ConnectionAttempt) {
     openTask?.cancel()
-    closeWasRequested = false
+    let previousClose = closeTask
     openTask = Task {
+      await previousClose?.value
+      guard !Task.isCancelled, !isShutdown,
+        state.phase == .connecting || state.phase == .contended, state.attempt == attempt
+      else { return }
       do {
         let opened = try await opener.open(device)
         await self.channelOpened(opened, attempt: attempt)
@@ -301,46 +337,42 @@ public actor SessionCoordinator {
   }
 
   private func channelOpened(_ opened: OpenedChannel, attempt: ConnectionAttempt) async {
-    // Ask the policy first. It may have moved on, in which case it tells us to close
-    // rather than adopt the channel. It adopts a channel exactly when it starts
-    // verifying it; the phase alone cannot say so, because a stale completion leaves
-    // the phase where it was — `verifying`, when the live attempt already landed.
+    // The policy's verification effect is the acceptance decision. Merely ending
+    // in .verifying also happens when an older open lands during verification.
     let (next, effects) = policy.reduce(state, .channelOpened(attempt))
     SessionLog.transition(from: state, to: next, on: .channelOpened(attempt))
-    guard effects.contains(.startVerification) else {
-      state = next
+    guard !isShutdown, effects.contains(.startVerification) else {
       await opened.channel.close()
-      for effect in effects where !effect.isChannelClose { await run(effect) }
       return
     }
 
     channel = opened.channel
+    adoptedAttempt = attempt
+    epoch = epoch.next
     parser = FrameStreamParser()
     startReading(opened.inbound, attempt: attempt)
     state = next
-    for effect in effects { await run(effect) }
+    for effect in effects { run(effect) }
   }
 
   private func startReading(_ inbound: AsyncStream<Data>, attempt: ConnectionAttempt) {
     inboundTask?.cancel()
     inboundTask = Task {
       for await chunk in inbound {
-        await self.ingest(chunk)
+        guard !Task.isCancelled else { break }
+        await self.ingest(chunk, attempt: attempt)
       }
       await self.channelDidClose(attempt: attempt)
     }
   }
 
   private func channelDidClose(attempt: ConnectionAttempt) async {
-    if closeWasRequested {
-      closeWasRequested = false
-      await handle(.channelClosedByUs)
-    } else {
-      await handle(.channelClosedUnexpectedly(attempt))
-    }
+    guard adoptedAttempt == attempt else { return }
+    await handle(.channelClosedUnexpectedly(attempt))
   }
 
-  private func ingest(_ chunk: Data) async {
+  private func ingest(_ chunk: Data, attempt: ConnectionAttempt) async {
+    guard adoptedAttempt == attempt, let sourceChannel = channel else { return }
     let parsed = parser.append(chunk)
     if !parsed.discards.isEmpty {
       // Damaged input is survivable; a stream we can no longer interpret is not.
@@ -351,11 +383,10 @@ public actor SessionCoordinator {
     }
 
     let routed = router.route(parsed.frames)
-    // Queued, not awaited: a stalled write here would stop inbound processing, and
-    // with it the answer every waiting request depends on. Queueing still puts each
-    // acknowledgement ahead of any request the answers below go on to unblock.
+    // A stalled ACK must not stop inbound processing. Queue it on the originating
+    // channel before delivering replies that may unblock the next request.
     for ack in routed.acknowledgements {
-      if let channel { _ = enqueueWrite(ack.encoded(), on: channel) }
+      _ = enqueueWrite(ack.encoded(), on: sourceChannel)
     }
     for event in routed.events {
       deliver(event)
@@ -380,7 +411,7 @@ public actor SessionCoordinator {
       }
       request.lifecycle.handle(.responseReceived(frame))
       inFlight = nil
-      endSendTurn()
+      endSendTurn(request.turn)
       request.continuation.resume(returning: frame)
     }
   }
@@ -413,7 +444,7 @@ public actor SessionCoordinator {
     // comes and fails itself if the session has moved on underneath it.
     guard let request = inFlight else { return }
     inFlight = nil
-    endSendTurn()
+    endSendTurn(request.turn)
     request.continuation.resume(throwing: SessionRequestFailure.failed(failure))
   }
 
@@ -430,7 +461,7 @@ public actor SessionCoordinator {
     let admittedEpoch = epoch
     verificationTask = Task {
       do {
-        let outcome = try await self.verifier.verify(over: Requester(coordinator: self))
+        let outcome = try await self.verifier.verify(over: Requester(coordinator: self, expectedEpoch: admittedEpoch))
         await self.verificationFinished(outcome, from: admittedEpoch)
       } catch {
         // Failing to reach the device is worth retrying; an answer that does not
@@ -458,7 +489,7 @@ public actor SessionCoordinator {
       profile = verified
       rejection = nil
       unverifiedWritesPermitted = false
-      await handle(.verificationSucceeded)
+      transition(.verificationSucceeded)
     case .unsupported(let rejectedFingerprint, let reason):
       profile = nil
       rejection = reason
@@ -468,7 +499,7 @@ public actor SessionCoordinator {
       unverifiedWritesPermitted = TandemVerifiedDeviceRegistry.permitsUnverifiedWrites(
         for: rejectedFingerprint, rejectedWith: reason
       )
-      await handle(.verificationRejected)
+      transition(.verificationRejected)
     }
     // Reads follow from what the device declared, so they run whether or not it is
     // one this application may write to.
@@ -493,7 +524,7 @@ public actor SessionCoordinator {
         let readings = await reader.read(
           declaring: functions,
           dialect: dialect,
-          over: Requester(coordinator: self)
+          over: Requester(coordinator: self, expectedEpoch: admittedEpoch)
         )
         // A cancelled cycle must not store: pausing for `suspended` cancels this
         // task without moving the epoch, and the partial result of the interrupted
@@ -538,12 +569,14 @@ public actor SessionCoordinator {
 
   public func supportCaptures() async -> [TandemRawCapture] {
     guard let functions = fingerprint?.table1Functions else { return [] }
+    let admittedEpoch = epoch
     let read = await DeviceDiagnostics().rawCaptures(
       declaring: functions,
-      over: Requester(coordinator: self)
+      over: Requester(coordinator: self, expectedEpoch: admittedEpoch)
     )
     // The gesture names heard so far ride along: they show the touch vocabulary the
     // report cannot ask the device for.
+    guard admittedEpoch == epoch else { return [] }
     return read + gestureLog.captures
   }
 
@@ -558,58 +591,70 @@ public actor SessionCoordinator {
   /// listener hears the change as they move, but they are not read back: verifying
   /// every step would flood the channel and lag behind the finger. The read-back
   /// happens once, on the value the drag settles on.
-  public func apply(noiseControl target: TandemNoiseControlState, isFinal: Bool = true) async throws {
-    guard acceptsWrites else { throw WriteFailure.notPermitted }
-    let admittedEpoch = epoch
-    guard let reading = latestReadings.noiseControl else {
-      throw WriteFailure.unsupported
-    }
-    let inquiry = reading.inquiry
-    let fieldCount = reading.valueFieldCount
-    let windKind = reading.legacyWindKind
-
-    // Intermediate drag values are fired without waiting, so a step the device does
-    // not acknowledge cannot time out and fault the session.
-    guard isFinal else {
-      try? await writeWithoutReply {
-        try TandemNoiseControlProtocol.setParameterRequest(
-          sequence: $0,
-          inquiry: inquiry,
-          state: target,
-          isFinal: false,
-          valueFieldCount: fieldCount,
-          legacyWindKind: windKind
-        )
-      }
-      return
-    }
-
+  public func apply(
+    noiseControl target: TandemNoiseControlState, isFinal: Bool = true,
+    expectedEpoch: SessionEpoch? = nil
+  ) async throws {
     do {
-      _ = try await send(
-        {
+      let admittedEpoch = expectedEpoch ?? epoch
+      try checkEpoch(admittedEpoch)
+      try Task.checkCancellation()
+      guard acceptsWrites else { throw WriteFailure.notPermitted }
+      guard let reading = latestReadings.noiseControl else {
+        throw WriteFailure.unsupported
+      }
+      let inquiry = reading.inquiry
+      let fieldCount = reading.valueFieldCount
+      let windKind = reading.legacyWindKind
+
+      // Intermediate drag values are fired without waiting, so a step the device does
+      // not acknowledge cannot time out and fault the session.
+      guard isFinal else {
+        try await writeWithoutReply(expectedEpoch: admittedEpoch) {
           try TandemNoiseControlProtocol.setParameterRequest(
             sequence: $0,
             inquiry: inquiry,
             state: target,
-            isFinal: true,
+            isFinal: false,
             valueFieldCount: fieldCount,
             legacyWindKind: windKind
           )
-        },
-        // The headset answers a change with a notification rather than a reply.
-        matching: { frame in
-          let bytes = [UInt8](frame.payload)
-          return bytes.count >= 2 && (bytes[0] == 0x69 || bytes[0] == 0x67) && bytes[1] == inquiry
         }
-      )
+        return
+      }
+
+      do {
+        _ = try await send(
+          {
+            try TandemNoiseControlProtocol.setParameterRequest(
+              sequence: $0,
+              inquiry: inquiry,
+              state: target,
+              isFinal: true,
+              valueFieldCount: fieldCount,
+              legacyWindKind: windKind
+            )
+          },
+          // The headset answers a change with a notification rather than a reply.
+          matching: { frame in
+            let bytes = [UInt8](frame.payload)
+            return bytes.count >= 2 && (bytes[0] == 0x69 || bytes[0] == 0x67) && bytes[1] == inquiry
+          },
+          expectedEpoch: admittedEpoch
+        )
+      } catch let failure as SessionRequestFailure {
+        throw WriteFailure.failed(failure)
+      }
+
+      let confirmed = try await readNoiseControlNow(inquiry, expectedEpoch: admittedEpoch)
+      try checkEpoch(admittedEpoch)
+      settle(.noiseControl, from: admittedEpoch) { $0.noiseControl = confirmed }
+      guard confirmed.state == target else {
+        throw WriteFailure.notApplied(confirmed.state)
+      }
+
     } catch let failure as SessionRequestFailure {
       throw WriteFailure.failed(failure)
-    }
-
-    let confirmed = try await readNoiseControlNow(inquiry)
-    settle(.noiseControl, from: admittedEpoch) { $0.noiseControl = confirmed }
-    guard confirmed.state == target else {
-      throw WriteFailure.notApplied(confirmed.state)
     }
   }
 
@@ -619,33 +664,43 @@ public actor SessionCoordinator {
   /// a set cannot time out and fault the session; the read-back that follows is a plain
   /// parameter request, which every model answers. The features are only ever those the
   /// device declared, so a device without listening modes is never written to here.
-  public func apply(listeningSelection target: TandemListeningSelection) async throws {
-    guard acceptsWrites else { throw WriteFailure.notPermitted }
-    let admittedEpoch = epoch
-    guard let reading = latestReadings.listeningMode, !reading.features.isEmpty else {
-      throw WriteFailure.unsupported
-    }
-
-    let room: TandemListeningRoom
-    if case .backgroundMusic(let selected) = target { room = selected } else { room = reading.savedRoom }
-
-    // Turn off the modes that should be off before turning the target on, so the device
-    // is never briefly asked to hold two at once.
-    let ordered = reading.features.filter { !shouldBeOn($0, in: target) }
-      + reading.features.filter { shouldBeOn($0, in: target) }
-    for feature in ordered {
-      let on = shouldBeOn(feature, in: target)
-      try? await writeWithoutReply {
-        try TandemListeningModeProtocol.setRequest(
-          sequence: $0, feature: feature, on: on, room: room
-        )
+  public func apply(
+    listeningSelection target: TandemListeningSelection, expectedEpoch: SessionEpoch? = nil
+  ) async throws {
+    do {
+      let admittedEpoch = expectedEpoch ?? epoch
+      try checkEpoch(admittedEpoch)
+      try Task.checkCancellation()
+      guard acceptsWrites else { throw WriteFailure.notPermitted }
+      guard let reading = latestReadings.listeningMode, !reading.features.isEmpty else {
+        throw WriteFailure.unsupported
       }
-    }
 
-    let confirmed = try await readListeningNow(features: reading.features)
-    settle(.listeningMode, from: admittedEpoch) { $0.listeningMode = confirmed }
-    guard confirmed.selection == target else {
-      throw WriteFailure.notAppliedListening(confirmed.selection)
+      let room: TandemListeningRoom
+      if case .backgroundMusic(let selected) = target { room = selected } else { room = reading.savedRoom }
+
+      // Turn off the modes that should be off before turning the target on, so the device
+      // is never briefly asked to hold two at once.
+      let ordered = reading.features.filter { !shouldBeOn($0, in: target) }
+        + reading.features.filter { shouldBeOn($0, in: target) }
+      for feature in ordered {
+        let on = shouldBeOn(feature, in: target)
+        try await writeWithoutReply(expectedEpoch: admittedEpoch) {
+          try TandemListeningModeProtocol.setRequest(
+            sequence: $0, feature: feature, on: on, room: room
+          )
+        }
+      }
+
+      let confirmed = try await readListeningNow(features: reading.features, expectedEpoch: admittedEpoch)
+      try checkEpoch(admittedEpoch)
+      settle(.listeningMode, from: admittedEpoch) { $0.listeningMode = confirmed }
+      guard confirmed.selection == target else {
+        throw WriteFailure.notAppliedListening(confirmed.selection)
+      }
+
+    } catch let failure as SessionRequestFailure {
+      throw WriteFailure.failed(failure)
     }
   }
 
@@ -658,8 +713,9 @@ public actor SessionCoordinator {
   }
 
   private func readListeningNow(
-    features: [TandemListeningFeature]
+    features: [TandemListeningFeature], expectedEpoch: SessionEpoch
   ) async throws -> TandemListeningReading {
+    try checkEpoch(expectedEpoch)
     var states: [UInt8: TandemListeningFeatureState] = [:]
     for feature in features {
       let frame = try await send(
@@ -667,11 +723,13 @@ public actor SessionCoordinator {
         matching: { candidate in
           let bytes = [UInt8](candidate.payload)
           return bytes.count >= 2 && bytes[0] == 0xE7 && bytes[1] == feature.inquiry
-        }
+        },
+        expectedEpoch: expectedEpoch
       )
-      if let state = try? TandemListeningModeProtocol.parseParameterResponse(frame, feature: feature) {
-        states[feature.inquiry] = state
-      }
+      try checkEpoch(expectedEpoch)
+      states[feature.inquiry] = try TandemListeningModeProtocol.parseParameterResponse(
+        frame, feature: feature
+      )
     }
     return TandemListeningReading.resolve(features: features, states: states)
   }
@@ -684,45 +742,70 @@ public actor SessionCoordinator {
   public func apply(
     equalizerPreset presetIdentifier: UInt8,
     bandSteps: [UInt8],
-    isFinal: Bool = true
+    isFinal: Bool = true,
+    expectedEpoch: SessionEpoch? = nil
   ) async throws {
-    guard acceptsWrites else { throw WriteFailure.notPermitted }
-    let admittedEpoch = epoch
-    guard let reading = latestReadings.equalizer else { throw WriteFailure.unsupported }
-    let inquiry = TandemReadOnlyEqualizer.inquiry(for: fingerprint?.dialect ?? .current)
-    // The older generation writes band levels against "the current preset" (0xFF)
-    // rather than a named one; the preset itself was selected by an earlier write.
-    let presetByte: UInt8 =
-      inquiry == TandemReadOnlyEqualizer.legacyInquiry && !bandSteps.isEmpty
-      ? 0xFF : presetIdentifier
+    do {
+      let admittedEpoch = expectedEpoch ?? epoch
+      try checkEpoch(admittedEpoch)
+      try Task.checkCancellation()
+      guard acceptsWrites else { throw WriteFailure.notPermitted }
+      guard let reading = latestReadings.equalizer else { throw WriteFailure.unsupported }
+      guard reading.presets.contains(where: { $0.identifier == presetIdentifier }) else {
+        throw WriteFailure.undeclaredEqualizerPreset(presetIdentifier)
+      }
+      let capability = equalizerCapability(reading)
+      let inquiry = TandemReadOnlyEqualizer.inquiry(for: fingerprint?.dialect ?? .current)
+      // The older generation writes band levels against "the current preset" (0xFF)
+      // rather than a named one; the preset itself was selected by an earlier write.
+      let presetByte: UInt8 =
+        inquiry == TandemReadOnlyEqualizer.legacyInquiry && !bandSteps.isEmpty
+        ? 0xFF : presetIdentifier
 
-    // The set is fire-and-forget like the listening writes: a model that answers a
-    // set only with a notification must not time the session out. What the device
-    // actually did is established by the read-back below.
-    try? await writeWithoutReply {
-      try TandemReadOnlyEqualizer.setParameterRequest(
-        sequence: $0,
-        presetIdentifier: presetByte,
-        bandSteps: bandSteps,
-        inquiry: inquiry
-      )
-    }
-    guard isFinal else { return }
+      // Validate before joining the wire queue, preserving the device's declared
+      // shape and the precise validation failure even for intermediate drag writes.
+      do {
+        _ = try TandemReadOnlyEqualizer.setParameterRequest(
+          sequence: 0, presetIdentifier: presetByte, bandSteps: bandSteps,
+          inquiry: inquiry, capability: capability
+        )
+      } catch let failure as TandemEqualizerError {
+        throw WriteFailure.invalidEqualizer(failure)
+      }
 
-    let confirmed = try await readEqualizerParameterNow(reading)
-    settle(.equalizer, from: admittedEpoch) { $0.equalizer = confirmed }
-    // A preset selection is judged on the preset; a band write on the bands. The
-    // preset byte of a legacy band write is an addressing detail ("the current
-    // preset"), so the bands are the requested value there.
-    let applied =
-      bandSteps.isEmpty
-      ? confirmed.selectedPreset == presetIdentifier
-      : confirmed.bandSteps == bandSteps.map(Int.init)
-    guard applied else {
-      throw WriteFailure.notAppliedEqualizer(
-        selectedPreset: confirmed.selectedPreset,
-        bandSteps: confirmed.bandSteps
-      )
+      // The set is fire-and-forget like the listening writes: a model that answers a
+      // set only with a notification must not time the session out. What the device
+      // actually did is established by the read-back below.
+      try await writeWithoutReply(expectedEpoch: admittedEpoch) {
+        try TandemReadOnlyEqualizer.setParameterRequest(
+          sequence: $0,
+          presetIdentifier: presetByte,
+          bandSteps: bandSteps,
+          inquiry: inquiry,
+          capability: capability
+        )
+      }
+      guard isFinal else { return }
+
+      let confirmed = try await readEqualizerParameterNow(reading, expectedEpoch: admittedEpoch)
+      try checkEpoch(admittedEpoch)
+      settle(.equalizer, from: admittedEpoch) { $0.equalizer = confirmed }
+      // A preset selection is judged on the preset; a band write on the bands. The
+      // preset byte of a legacy band write is an addressing detail ("the current
+      // preset"), so the bands are the requested value there.
+      let applied =
+        bandSteps.isEmpty
+        ? confirmed.selectedPreset == presetIdentifier
+        : confirmed.bandSteps == bandSteps.map(Int.init)
+      guard applied else {
+        throw WriteFailure.notAppliedEqualizer(
+          selectedPreset: confirmed.selectedPreset,
+          bandSteps: confirmed.bandSteps
+        )
+      }
+
+    } catch let failure as SessionRequestFailure {
+      throw WriteFailure.failed(failure)
     }
   }
 
@@ -730,44 +813,63 @@ public actor SessionCoordinator {
   /// then reads back what it holds and reports a value that did not take. Only reached
   /// for a device that declared the feature. The set is fire-and-forget for the same
   /// reason as the listening writes; the read-back is the check.
-  public func apply(speakToChatEnabled isEnabled: Bool) async throws {
-    guard acceptsWrites else { throw WriteFailure.notPermitted }
-    let admittedEpoch = epoch
-    guard let reading = latestReadings.speakToChat else { throw WriteFailure.unsupported }
-    try? await writeWithoutReply {
-      try TandemSpeakToChatProtocol.setEnabledRequest(
-        sequence: $0,
-        inquiry: reading.inquiry,
-        isEnabled: isEnabled,
-        secondarySettingEnabled: reading.secondarySettingEnabled
-      )
-    }
-    let confirmed = try await readSpeakToChatNow(reading)
-    settle(.speakToChat, from: admittedEpoch) { $0.speakToChat = confirmed }
-    guard confirmed.isEnabled == isEnabled else {
-      throw WriteFailure.notAppliedSpeakToChat(confirmed)
+  public func apply(
+    speakToChatEnabled isEnabled: Bool, expectedEpoch: SessionEpoch? = nil
+  ) async throws {
+    do {
+      let admittedEpoch = expectedEpoch ?? epoch
+      try checkEpoch(admittedEpoch)
+      try Task.checkCancellation()
+      guard acceptsWrites else { throw WriteFailure.notPermitted }
+      guard let reading = latestReadings.speakToChat else { throw WriteFailure.unsupported }
+      try await writeWithoutReply(expectedEpoch: admittedEpoch) {
+        try TandemSpeakToChatProtocol.setEnabledRequest(
+          sequence: $0,
+          inquiry: reading.inquiry,
+          isEnabled: isEnabled,
+          secondarySettingEnabled: reading.secondarySettingEnabled
+        )
+      }
+      let confirmed = try await readSpeakToChatNow(reading, expectedEpoch: admittedEpoch)
+      try checkEpoch(admittedEpoch)
+      settle(.speakToChat, from: admittedEpoch) { $0.speakToChat = confirmed }
+      guard confirmed.isEnabled == isEnabled else {
+        throw WriteFailure.notAppliedSpeakToChat(confirmed)
+      }
+
+    } catch let failure as SessionRequestFailure {
+      throw WriteFailure.failed(failure)
     }
   }
 
   public func apply(
     speakToChatSensitivity sensitivity: TandemSpeakToChatSensitivity,
-    timeout: TandemSpeakToChatTimeout
+    timeout: TandemSpeakToChatTimeout,
+    expectedEpoch: SessionEpoch? = nil
   ) async throws {
-    guard acceptsWrites else { throw WriteFailure.notPermitted }
-    let admittedEpoch = epoch
-    guard let reading = latestReadings.speakToChat else { throw WriteFailure.unsupported }
-    try? await writeWithoutReply {
-      try TandemSpeakToChatProtocol.setDetailRequest(
-        sequence: $0,
-        inquiry: reading.inquiry,
-        sensitivity: sensitivity,
-        timeout: timeout
-      )
-    }
-    let confirmed = try await readSpeakToChatNow(reading)
-    settle(.speakToChat, from: admittedEpoch) { $0.speakToChat = confirmed }
-    guard confirmed.sensitivity == sensitivity, confirmed.timeout == timeout else {
-      throw WriteFailure.notAppliedSpeakToChat(confirmed)
+    do {
+      let admittedEpoch = expectedEpoch ?? epoch
+      try checkEpoch(admittedEpoch)
+      try Task.checkCancellation()
+      guard acceptsWrites else { throw WriteFailure.notPermitted }
+      guard let reading = latestReadings.speakToChat else { throw WriteFailure.unsupported }
+      try await writeWithoutReply(expectedEpoch: admittedEpoch) {
+        try TandemSpeakToChatProtocol.setDetailRequest(
+          sequence: $0,
+          inquiry: reading.inquiry,
+          sensitivity: sensitivity,
+          timeout: timeout
+        )
+      }
+      let confirmed = try await readSpeakToChatNow(reading, expectedEpoch: admittedEpoch)
+      try checkEpoch(admittedEpoch)
+      settle(.speakToChat, from: admittedEpoch) { $0.speakToChat = confirmed }
+      guard confirmed.sensitivity == sensitivity, confirmed.timeout == timeout else {
+        throw WriteFailure.notAppliedSpeakToChat(confirmed)
+      }
+
+    } catch let failure as SessionRequestFailure {
+      throw WriteFailure.failed(failure)
     }
   }
 
@@ -776,35 +878,48 @@ public actor SessionCoordinator {
   /// general-setting slot named sidetone — the slot itself came from the reading, so
   /// no slot number is assumed here. The set is fire-and-forget for the same reason
   /// as the listening writes; the read-back is the check.
-  public func apply(sidetoneEnabled isEnabled: Bool) async throws {
-    guard acceptsWrites else { throw WriteFailure.notPermitted }
-    let admittedEpoch = epoch
-    guard let reading = latestReadings.sidetone, reading.isEnabled != nil else {
-      throw WriteFailure.unsupported
-    }
-    try? await writeWithoutReply {
-      try TandemGeneralSettingProtocol.setParameterRequest(
-        sequence: $0,
-        slot: reading.slot,
-        value: .boolean(isEnabled)
-      )
-    }
-    let confirmed = try await readSidetoneNow(reading)
-    settle(.sidetone, from: admittedEpoch) { $0.sidetone = confirmed }
-    guard confirmed.isEnabled == isEnabled else {
-      throw WriteFailure.notAppliedSidetone(confirmed)
+  public func apply(
+    sidetoneEnabled isEnabled: Bool, expectedEpoch: SessionEpoch? = nil
+  ) async throws {
+    do {
+      let admittedEpoch = expectedEpoch ?? epoch
+      try checkEpoch(admittedEpoch)
+      try Task.checkCancellation()
+      guard acceptsWrites else { throw WriteFailure.notPermitted }
+      guard let reading = latestReadings.sidetone, reading.isEnabled != nil else {
+        throw WriteFailure.unsupported
+      }
+      try await writeWithoutReply(expectedEpoch: admittedEpoch) {
+        try TandemGeneralSettingProtocol.setParameterRequest(
+          sequence: $0,
+          slot: reading.slot,
+          value: .boolean(isEnabled)
+        )
+      }
+      let confirmed = try await readSidetoneNow(reading, expectedEpoch: admittedEpoch)
+      try checkEpoch(admittedEpoch)
+      settle(.sidetone, from: admittedEpoch) { $0.sidetone = confirmed }
+      guard confirmed.isEnabled == isEnabled else {
+        throw WriteFailure.notAppliedSidetone(confirmed)
+      }
+
+    } catch let failure as SessionRequestFailure {
+      throw WriteFailure.failed(failure)
     }
   }
 
-  private func readSidetoneNow(_ reading: SidetoneReading) async throws -> SidetoneReading {
+  private func readSidetoneNow(_ reading: SidetoneReading, expectedEpoch: SessionEpoch) async throws -> SidetoneReading {
+    try checkEpoch(expectedEpoch)
     let slot = reading.slot
     let frame = try await send(
       { try TandemGeneralSettingProtocol.parameterRequest(sequence: $0, slot: slot) },
       matching: { candidate in
         let bytes = [UInt8](candidate.payload)
         return bytes.count >= 2 && bytes[0] == 0xD7 && bytes[1] == slot.rawValue
-      }
+      },
+      expectedEpoch: expectedEpoch
     )
+    try checkEpoch(expectedEpoch)
     let value = try TandemGeneralSettingProtocol.parseParameterResponse(
       frame, capability: reading.snapshot.capability
     )
@@ -818,15 +933,18 @@ public actor SessionCoordinator {
     )
   }
 
-  private func readSpeakToChatNow(_ reading: SpeakToChatReading) async throws -> SpeakToChatReading {
+  private func readSpeakToChatNow(_ reading: SpeakToChatReading, expectedEpoch: SessionEpoch) async throws -> SpeakToChatReading {
+    try checkEpoch(expectedEpoch)
     let inquiry = reading.inquiry
     let parameterFrame = try await send(
       { try TandemSpeakToChatProtocol.parameterRequest(sequence: $0, inquiry: inquiry) },
       matching: { candidate in
         let bytes = [UInt8](candidate.payload)
         return bytes.count >= 2 && bytes[0] == 0xF7 && bytes[1] == inquiry
-      }
+      },
+      expectedEpoch: expectedEpoch
     )
+    try checkEpoch(expectedEpoch)
     let parameters = try TandemSpeakToChatProtocol.parseParameterResponse(parameterFrame, inquiry: inquiry)
 
     let detailFrame = try await send(
@@ -834,8 +952,10 @@ public actor SessionCoordinator {
       matching: { candidate in
         let bytes = [UInt8](candidate.payload)
         return bytes.count >= 2 && bytes[0] == 0xFB && bytes[1] == inquiry
-      }
+      },
+      expectedEpoch: expectedEpoch
     )
+    try checkEpoch(expectedEpoch)
     let detail = try TandemSpeakToChatProtocol.parseExtendedParameterResponse(detailFrame, inquiry: inquiry)
 
     return SpeakToChatReading(
@@ -848,20 +968,27 @@ public actor SessionCoordinator {
     )
   }
 
-  private func readEqualizerParameterNow(_ reading: EqualizerReading) async throws -> EqualizerReading {
-    let capability = TandemEqualizerCapability(
+  private func equalizerCapability(_ reading: EqualizerReading) -> TandemEqualizerCapability {
+    TandemEqualizerCapability(
       bandCount: reading.bandCount,
       levelStepCount: reading.levelStepCount,
       presets: reading.presets.map { TandemEqualizerPreset(identifier: $0.identifier, name: $0.name ?? "") }
     )
+  }
+
+  private func readEqualizerParameterNow(_ reading: EqualizerReading, expectedEpoch: SessionEpoch) async throws -> EqualizerReading {
+    try checkEpoch(expectedEpoch)
+    let capability = equalizerCapability(reading)
     let inquiry = TandemReadOnlyEqualizer.inquiry(for: fingerprint?.dialect ?? .current)
     let frame = try await send(
       { try TandemReadOnlyEqualizer.parameterRequest(sequence: $0, inquiry: inquiry) },
       matching: { candidate in
         let bytes = [UInt8](candidate.payload)
         return bytes.count >= 2 && bytes[0] == 0x57 && bytes[1] == inquiry
-      }
+      },
+      expectedEpoch: expectedEpoch
     )
+    try checkEpoch(expectedEpoch)
     let params = try TandemReadOnlyEqualizer.parseParameterResponse(
       frame, capability: capability, inquiry: inquiry
     )
@@ -875,14 +1002,17 @@ public actor SessionCoordinator {
     )
   }
 
-  private func readNoiseControlNow(_ inquiry: UInt8) async throws -> NoiseControlReading {
+  private func readNoiseControlNow(_ inquiry: UInt8, expectedEpoch: SessionEpoch) async throws -> NoiseControlReading {
+    try checkEpoch(expectedEpoch)
     let frame = try await send(
       { try TandemNoiseControlProtocol.parameterRequest(sequence: $0, inquiry: inquiry) },
       matching: { candidate in
         let bytes = [UInt8](candidate.payload)
         return bytes.count >= 2 && bytes[0] == 0x67 && bytes[1] == inquiry
-      }
+      },
+      expectedEpoch: expectedEpoch
     )
+    try checkEpoch(expectedEpoch)
     let confirmed = try TandemNoiseControlProtocol.parseParameterResponse(frame, inquiry: inquiry)
     let existing = latestReadings.noiseControl
     let bytes = [UInt8](frame.payload)
@@ -905,33 +1035,26 @@ public actor SessionCoordinator {
   /// change, so waiting for a reply on each step would time out, and a timeout is read
   /// as a session fault that tears the session down. The listener still hears the
   /// change; the settled value is what gets confirmed.
-  fileprivate func writeWithoutReply(
+  func writeWithoutReply(
+    expectedEpoch: SessionEpoch? = nil,
     _ build: @Sendable (UInt8) throws -> TandemFrame
   ) async throws {
-    // `suspended` is refused although the channel is open: the device is no longer
-    // the output, so nothing may be sent into the grace period — a write there
-    // would previously go out and then fail silently on the read-back.
-    switch state.phase {
-    case .verifying, .ready, .unverified:
-      break
-    default:
-      throw SessionRequestFailure.notReady
-    }
-    guard let channel else { throw SessionRequestFailure.channel(.closed) }
-
-    let frame: TandemFrame
-    do {
-      frame = try build(outgoingSequence)
-    } catch {
-      throw SessionRequestFailure.notReady
-    }
+    let admittedEpoch = expectedEpoch ?? epoch
+    try checkEpoch(admittedEpoch)
+    _ = try checkRequestAdmission()
+    let turn = await claimSendTurn(epoch: admittedEpoch)
+    defer { endSendTurn(turn) }
+    try checkEpoch(admittedEpoch)
+    try Task.checkCancellation()
+    let channel = try checkRequestAdmission()
+    let frame = try build(outgoingSequence)
     outgoingSequence ^= 1
-
-    // Bounded by the chain: with nothing to answer it, this write had no deadline at
-    // all, and a stalled one stopped the drag and every write behind it for good.
-    if case .failure(let failure) = await enqueueWrite(frame.encoded(), on: channel).value {
+    let result = await enqueueWrite(frame.encoded(), on: channel).value
+    if case .failure(let failure) = result {
       throw SessionRequestFailure.channel(failure)
     }
+    try checkEpoch(admittedEpoch)
+    try Task.checkCancellation()
   }
 
   /// Queues a write on the session's chain. A write that overruns its bound means the
@@ -957,30 +1080,53 @@ public actor SessionCoordinator {
     await handle(.sessionFault(.writeStalled))
   }
 
-  /// Internal rather than fileprivate so the serialization and attribution can be
-  /// exercised directly by tests; production callers still go through the features.
+  /// Internal so serialization can be exercised without a real device.
   func send(
     _ build: @Sendable (UInt8) throws -> TandemFrame,
     matching: @Sendable @escaping (TandemFrame) -> Bool,
-    faultsOnTimeout: Bool = true
+    faultsOnTimeout: Bool = true,
+    expectedEpoch: SessionEpoch? = nil
   ) async throws -> TandemFrame {
-    // Checked before queueing so a request against a session that is already gone
-    // fails now rather than after waiting its turn behind the request in flight.
+    let admittedEpoch = expectedEpoch ?? epoch
+    try checkEpoch(admittedEpoch)
     _ = try checkRequestAdmission()
-    let admittedEpoch = epoch
-    await claimSendTurn()
-    return try await performSend(
-      build,
-      matching: matching,
-      faultsOnTimeout: faultsOnTimeout,
-      admittedEpoch: admittedEpoch
-    )
+    let turn = await claimSendTurn(epoch: admittedEpoch)
+    defer { endSendTurn(turn) }
+    try checkEpoch(admittedEpoch)
+    try Task.checkCancellation()
+    let channel = try checkRequestAdmission()
+    let frame = try build(outgoingSequence)
+    outgoingSequence ^= 1
+
+    let result: TandemFrame = try await withCheckedThrowingContinuation { continuation in
+      inFlight = PendingRequest(
+        lifecycle: RequestLifecycle(id: turn.id),
+        epoch: admittedEpoch,
+        turn: turn,
+        matches: matching,
+        continuation: continuation,
+        faultsOnTimeout: faultsOnTimeout,
+        label: SessionLog.label(ofRequest: frame.payload)
+      )
+      scheduleResponseTimeout(turn.id)
+      let written = enqueueWrite(frame.encoded(), on: channel)
+      Task {
+        guard case .failure(let failure) = await written.value else { return }
+        await self.finish(turn.id, with: .channel(failure))
+      }
+    }
+    try checkEpoch(admittedEpoch)
+    try Task.checkCancellation()
+    return result
   }
 
-  /// Verification runs before `ready`, so it is admitted too; nothing else is.
-  /// `suspended` is refused although the channel is open: the grace period holds
-  /// the channel precisely so nothing has to travel on it, and admitting requests
-  /// there would keep the readings poll talking to a device nobody is listening to.
+  private func checkEpoch(_ expected: SessionEpoch) throws {
+    guard expected == epoch else {
+      throw SessionRequestFailure.failed(.sessionInvalidated)
+    }
+  }
+
+  /// Verification may request before ready; a suspended channel stays quiet.
   private func checkRequestAdmission() throws -> any TandemChannel {
     switch state.phase {
     case .verifying, .ready, .unverified:
@@ -988,89 +1134,43 @@ public actor SessionCoordinator {
     default:
       throw SessionRequestFailure.notReady
     }
-    guard let channel else { throw SessionRequestFailure.channel(.closed) }
+    guard !isShutdown, let channel else { throw SessionRequestFailure.channel(.closed) }
     return channel
   }
 
-  /// Waits until the wire is free. First come, first served: waiters are resumed in
-  /// arrival order, so requests reach the device in the order they were made.
-  private func claimSendTurn() async {
-    guard isSending else {
-      isSending = true
-      return
-    }
-    await withCheckedContinuation { sendWaiters.append($0) }
+  private struct SendTurn: Equatable {
+    let id: OperationID
+    let epoch: SessionEpoch
   }
 
-  /// Passes the wire to the next waiter, or frees it. Every terminal path of the
-  /// request in flight ends here; missing one would stall every later request.
-  private func endSendTurn() {
-    guard sendWaiters.isEmpty else {
-      // The turn passes directly, so `isSending` stays true for the successor.
-      sendWaiters.removeFirst().resume()
-      return
-    }
-    isSending = false
-  }
-
-  private func performSend(
-    _ build: @Sendable (UInt8) throws -> TandemFrame,
-    matching: @Sendable @escaping (TandemFrame) -> Bool,
-    faultsOnTimeout: Bool,
-    admittedEpoch: SessionEpoch
-  ) async throws -> TandemFrame {
-    // Everything is re-checked after the wait: the session may have been torn down
-    // or rebuilt while this request was queued, and a request admitted against the
-    // old session must not write into its successor.
-    let channel: any TandemChannel
-    do {
-      guard admittedEpoch == epoch else {
-        throw SessionRequestFailure.failed(.sessionInvalidated)
-      }
-      channel = try checkRequestAdmission()
-    } catch {
-      endSendTurn()
-      throw error
-    }
-
-    let frame: TandemFrame
-    do {
-      frame = try build(outgoingSequence)
-    } catch {
-      endSendTurn()
-      throw SessionRequestFailure.notReady
-    }
-    outgoingSequence ^= 1
-
-    let id = nextOperation
+  private func claimSendTurn(epoch: SessionEpoch) async -> SendTurn {
+    let turn = SendTurn(id: nextOperation, epoch: epoch)
     nextOperation = nextOperation.next
-
-    return try await withCheckedThrowingContinuation { continuation in
-      inFlight = PendingRequest(
-        lifecycle: RequestLifecycle(id: id),
-        epoch: admittedEpoch,
-        matches: matching,
-        continuation: continuation,
-        faultsOnTimeout: faultsOnTimeout,
-        label: SessionLog.label(ofRequest: frame.payload)
-      )
-      // Armed before the write, not after it: a write held by flow control never
-      // returns, and a deadline that waits for it left the request — and every one
-      // queued behind it — in flight for good.
-      scheduleResponseTimeout(id)
-      let written = enqueueWrite(frame.encoded(), on: channel)
-      Task {
-        guard case .failure(let failure) = await written.value else { return }
-        await self.finish(id, with: .channel(failure))
-      }
+    guard sendTurn != nil else {
+      sendTurn = turn
+      return turn
     }
+    await withCheckedContinuation { sendWaiters.append((turn, $0)) }
+    return turn
+  }
+
+  /// A completion owns only its original turn, even if teardown let a successor
+  /// progress while the transport was still returning from the old write.
+  private func endSendTurn(_ turn: SendTurn) {
+    guard sendTurn == turn else { return }
+    guard sendWaiters.isEmpty else {
+      let (next, continuation) = sendWaiters.removeFirst()
+      sendTurn = next
+      continuation.resume()
+      return
+    }
+    sendTurn = nil
   }
 
   /// Whether the request currently on the wire has been acknowledged. Exposed for
   /// tests: acknowledgement handling has no other observable surface.
   var inFlightAcknowledged: Bool? { inFlight?.lifecycle.isAcknowledged }
-  /// The failure budget spent so far. Exposed for tests: until it runs out, the
-  /// budget has no other observable surface.
+  var queuedSendCount: Int { sendWaiters.count }
   var failureCount: Int { state.failureCount }
 
   private func scheduleResponseTimeout(_ id: OperationID) {
@@ -1083,15 +1183,10 @@ public actor SessionCoordinator {
   private func responseTimedOut(_ id: OperationID) async {
     guard var request = inFlight, request.lifecycle.id == id else { return }
     inFlight = nil
-    endSendTurn()
+    endSendTurn(request.turn)
     request.lifecycle.handle(.responseTimedOut)
     guard case .failed(let failure) = request.lifecycle.outcome else { return }
     request.continuation.resume(throwing: SessionRequestFailure.failed(failure))
-    // An unanswered request leaves us unable to attribute anything that arrives
-    // later, so the session is rebuilt rather than continued. A probe opts out: it
-    // expects some functions to go unanswered and must not tear down a working
-    // session to discover that. Only the session the request was sent on is at
-    // fault; a request that outlived its session must not fault the next one.
     let faultsSession = request.faultsOnTimeout && request.epoch == epoch
     SessionLog.unanswered(request.label, faultsSession: faultsSession)
     guard faultsSession else { return }
@@ -1101,19 +1196,19 @@ public actor SessionCoordinator {
   private func finish(_ id: OperationID, with failure: SessionRequestFailure) async {
     guard let request = inFlight, request.lifecycle.id == id else { return }
     inFlight = nil
-    endSendTurn()
+    endSendTurn(request.turn)
     request.continuation.resume(throwing: failure)
   }
 
   private struct PendingRequest {
     var lifecycle: RequestLifecycle
     var epoch: SessionEpoch
+    let turn: SendTurn
     let matches: @Sendable (TandemFrame) -> Bool
     let continuation: CheckedContinuation<TandemFrame, Error>
     /// False for a probe, whose timeout fails only itself; true for a request, whose
     /// timeout rebuilds the session.
     let faultsOnTimeout: Bool
-    /// Command and inquiry, for the log when the request goes unanswered.
     let label: String
 
     func matches(_ frame: TandemFrame) -> Bool { matches(frame) }
@@ -1121,27 +1216,21 @@ public actor SessionCoordinator {
 
   private struct Requester: SessionRequesting {
     let coordinator: SessionCoordinator
+    let expectedEpoch: SessionEpoch
 
     func request(
       _ build: @Sendable (UInt8) throws -> TandemFrame,
       matching: @Sendable @escaping (TandemFrame) -> Bool
     ) async throws -> TandemFrame {
-      try await coordinator.send(build, matching: matching)
+      try await coordinator.send(build, matching: matching, expectedEpoch: expectedEpoch)
     }
 
     func probe(
       _ build: @Sendable (UInt8) throws -> TandemFrame,
       matching: @Sendable @escaping (TandemFrame) -> Bool
     ) async throws -> TandemFrame {
-      try await coordinator.send(build, matching: matching, faultsOnTimeout: false)
+      try await coordinator.send(build, matching: matching, faultsOnTimeout: false, expectedEpoch: expectedEpoch)
     }
-  }
-}
-
-extension SessionEffect {
-  fileprivate var isChannelClose: Bool {
-    if case .closeChannel = self { return true }
-    return false
   }
 }
 

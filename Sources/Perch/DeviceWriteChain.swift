@@ -51,6 +51,7 @@ struct DeviceWriteChain {
   /// a write ahead of it reaches the head, and never once `operation` has started.
   mutating func enqueue(
     whileQueued: (@MainActor () -> Void)? = nil,
+    onTimeout: (@MainActor () -> Void)? = nil,
     _ operation: @escaping @MainActor () async -> Void
   ) {
     let previous = tail
@@ -61,7 +62,7 @@ struct DeviceWriteChain {
     tail = Task { @MainActor in
       await previous?.value
       queued.reachHead(place)
-      await Self.run(operation, within: limit, sleep: sleep)
+      await Self.run(operation, within: limit, sleep: sleep, onTimeout: onTimeout)
     }
   }
 
@@ -75,7 +76,8 @@ struct DeviceWriteChain {
   private static func run(
     _ operation: @escaping @MainActor () async -> Void,
     within limit: Duration,
-    sleep: @escaping @MainActor (Duration) async -> Void
+    sleep: @escaping @MainActor (Duration) async -> Void,
+    onTimeout: (@MainActor () -> Void)?
   ) async {
     let finish = FirstFinish()
     Task { @MainActor in
@@ -87,6 +89,7 @@ struct DeviceWriteChain {
       await sleep(limit)
       guard !Task.isCancelled else { return }
       if finish.signal() {
+        onTimeout?()
         log.error(
           "A device write did not return within \(limit.components.seconds, privacy: .public) s; the writes behind it go ahead"
         )

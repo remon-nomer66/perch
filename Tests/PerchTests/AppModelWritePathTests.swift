@@ -65,6 +65,7 @@ private let ambientReading = NoiseControlReading(
 func writeReadBackKeepsTheTrack() async {
   let model = AppModel()
   let service = deviceLessService()
+  await model.refresh(from: service, cause: .deviceWrite)
   let track = PanelModel.NowPlaying(title: "T", artist: "A", isPlaying: true, artworkURL: nil)
   model.panel.nowPlaying = track
 
@@ -82,6 +83,7 @@ func onlyTheFinalLiftsADragsGuard() async {
   let timer = ManualTimer()
   let model = AppModel(dragSleep: timer.sleep)
   let service = deviceLessService()
+  await model.refresh(from: service, cause: .deviceWrite)
   model.panel.noiseControl = ambientReading
 
   model.dragNoiseLevel(level: 12, isFinal: false, using: service)
@@ -110,6 +112,7 @@ func skippedReleaseLeavesTheFieldUnguarded() async {
   let timer = ManualTimer()
   let model = AppModel(dragSleep: timer.sleep)
   let service = deviceLessService()
+  await model.refresh(from: service, cause: .deviceWrite)
   model.panel.noiseControl = ambientReading
 
   model.dragNoiseLevel(level: 12, isFinal: false, using: service)
@@ -135,6 +138,7 @@ func skippedReleaseLeavesTheFieldUnguarded() async {
 func switchWriteLiftsItsGuard() async {
   let model = AppModel()
   let service = deviceLessService()
+  await model.refresh(from: service, cause: .deviceWrite)
   let capability = TandemGeneralSettingCapability(
     slot: .one,
     type: .boolean,

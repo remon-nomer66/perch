@@ -56,9 +56,11 @@ private let laterSpeakToChatDetail: [UInt8] = [0xFB, speakToChat, 0x02, 0x00]
   #expect(await waitFor { await link.writes(withPrefix: [0xF0, speakToChat]) == 2 })
   await link.answer([0x56, 0x04], with: equalizerAfterWrite)
 
-  // The set goes out at once; its read-back queues behind the held read.
+  // The setting joins the same FIFO as the held read. Releasing that read lets
+  // the setting and the rest of the cycle proceed in their admitted order.
   let writer = Task { try await coordinator.apply(equalizerPreset: 0x00, bandSteps: []) }
-  #expect(await waitFor { await link.writes(withPrefix: [0x58, 0x04]) == 1 })
+  #expect(await waitFor { await coordinator.queuedSendCount == 1 })
+  #expect(await link.writes(withPrefix: [0x58, 0x04]) == 0)
   try await link.send(speakToChatCapability)
   try await writer.value
   #expect(await coordinator.readings.equalizer?.selectedPreset == 0x00)

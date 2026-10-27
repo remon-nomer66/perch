@@ -10,6 +10,10 @@ import TandemSession
 // control, listening mode, speak-to-chat, and call-time sidetone are all read from
 // the headset.
 
+private enum AppModelWriteContext {
+  @TaskLocal static var generation: UInt64?
+}
+
 @MainActor
 final class AppModel: ObservableObject {
   @Published var panel = PanelModel()
@@ -36,7 +40,11 @@ final class AppModel: ObservableObject {
   private var routeGate: AnyCancellable?
 
   /// `dragSleep` times the drag pacers' waits; tests pass one they advance by hand.
-  init(dragSleep: @escaping @MainActor (Duration) async -> Void = { try? await Task.sleep(for: $0) }) {
+  init(
+    dragSleep: @escaping @MainActor (Duration) async -> Void = { try? await Task.sleep(for: $0) },
+    writeSleep: @escaping @MainActor (Duration) async -> Void = { try? await Task.sleep(for: $0) }
+  ) {
+    deviceWrites = DeviceWriteChain(sleep: writeSleep)
     levelDrag = DragWritePacer(sleep: dragSleep)
     bandDrag = DragWritePacer(sleep: dragSleep)
     headTracking.applyPose = { [weak self] orientation, distanceRatio in
@@ -74,10 +82,32 @@ final class AppModel: ObservableObject {
 
   /// Device writes land in the order they were asked — tiles, pickers, switches and
   /// drags alike; see `DeviceWriteChain`.
-  private var deviceWrites = DeviceWriteChain()
+  private var deviceWrites: DeviceWriteChain
+  /// Captured at intent time, including before a drag's debounce or auto-final.
+  private var displayedEpoch: SessionEpoch?
+  private var writeGeneration: UInt64 = 0
+
+  /// A timed-out operation may eventually return. Its later automation steps and
+  /// ownership commits must not overtake the writes the bounded chain let through.
+  private func enqueueDeviceWrite(
+    whileQueued: (@MainActor () -> Void)? = nil,
+    onTimeout: (@MainActor () -> Void)? = nil,
+    _ operation: @escaping @MainActor () async -> Void
+  ) {
+    var runningGeneration: UInt64?
+    deviceWrites.enqueue(whileQueued: whileQueued, onTimeout: { [weak self] in
+      if let self, runningGeneration == writeGeneration { writeGeneration &+= 1 }
+      onTimeout?()
+    }) { [weak self] in
+      guard let self else { return }
+      writeGeneration &+= 1
+      runningGeneration = writeGeneration
+      await AppModelWriteContext.$generation.withValue(writeGeneration) { await operation() }
+    }
+  }
 
   /// Waits until every device write asked so far has landed or been given up on.
-  /// Exposed for tests; nothing in the app waits on the chain.
+  /// Used by tests and the bounded application termination sequence.
   func settleDeviceWrites() async {
     await deviceWrites.settled()
   }
@@ -98,11 +128,12 @@ final class AppModel: ObservableObject {
     send: @escaping @MainActor (SessionCoordinator) async -> Void
   ) {
     self[keyPath: field].renew(token)
-    deviceWrites.enqueue(whileQueued: { [weak self] in self?[keyPath: field].renew(token) }) {
+    enqueueDeviceWrite(whileQueued: { [weak self] in self?[keyPath: field].renew(token) }) {
       [weak self] in
       guard let self else { return }
       let step = GuardedWrite.step(isFinal: isFinal, isCurrent: self[keyPath: field].isCurrent(token))
       guard step.sends else { return }
+      defer { if step.liftsGuard { self[keyPath: field].end(token) } }
       self[keyPath: field].renew(token)
       await send(await service.session)
       guard step.liftsGuard else { return }
@@ -112,8 +143,13 @@ final class AppModel: ObservableObject {
     }
   }
 
+  /// Await the current tail without keeping the main actor blocked.
+  func waitForDeviceWrites() async {
+    await deviceWrites.settled()
+  }
+
   func applyListening(_ target: TandemListeningSelection, using service: SessionService) {
-    guard let current = panel.listeningMode else { return }
+    guard let current = panel.listeningMode, let expectedEpoch = displayedEpoch else { return }
     let savedRoom: TandemListeningRoom
     if case .backgroundMusic(let room) = target { savedRoom = room } else { savedRoom = current.savedRoom }
     let token = listeningAdjustment.begin()
@@ -123,16 +159,17 @@ final class AppModel: ObservableObject {
       savedRoom: savedRoom
     )
     enqueueGuardedWrite(\.listeningAdjustment, token: token, using: service) {
-      try? await $0.apply(listeningSelection: target)
+      try? await $0.apply(listeningSelection: target, expectedEpoch: expectedEpoch)
     }
   }
 
   func applyNoiseControl(_ target: TandemNoiseControlState, using service: SessionService) {
+    guard let expectedEpoch = displayedEpoch else { return }
     levelDrag.cancel()
     levelAdjustment.cancel()
-    deviceWrites.enqueue { [weak self] in
+    enqueueDeviceWrite { [weak self] in
       let session = await service.session
-      try? await session.apply(noiseControl: target)
+      try? await session.apply(noiseControl: target, expectedEpoch: expectedEpoch)
       await self?.refresh(from: service, cause: .deviceWrite)
     }
   }
@@ -145,7 +182,7 @@ final class AppModel: ObservableObject {
   /// should none come, the value the drag stopped on — is read back and reflected in
   /// the panel. See `DragWritePacer`.
   func dragNoiseLevel(level: Int, isFinal: Bool, using service: SessionService) {
-    guard let reading = panel.noiseControl else { return }
+    guard let reading = panel.noiseControl, let expectedEpoch = displayedEpoch else { return }
     let clamped = reading.quantizedLevel(level, mode: reading.state.ambientMode)
     let target = TandemNoiseControlState(
       isActive: true,
@@ -173,7 +210,7 @@ final class AppModel: ObservableObject {
     )
 
     levelDrag.report(isFinal: isFinal) { [weak self] isFinal in
-      self?.writeLevel(target, isFinal: isFinal, token: token, using: service)
+      self?.writeLevel(target, isFinal: isFinal, token: token, epoch: expectedEpoch, using: service)
     }
   }
 
@@ -181,10 +218,11 @@ final class AppModel: ObservableObject {
   /// it waited is dropped and a final always lands; why dropping is safe — every report
   /// that takes the token reaches the pacer, which writes it — is on `GuardedWrite`.
   private func writeLevel(
-    _ target: TandemNoiseControlState, isFinal: Bool, token: Int, using service: SessionService
+    _ target: TandemNoiseControlState, isFinal: Bool, token: Int, epoch: SessionEpoch,
+    using service: SessionService
   ) {
     enqueueGuardedWrite(\.levelAdjustment, token: token, isFinal: isFinal, using: service) {
-      try? await $0.apply(noiseControl: target, isFinal: isFinal)
+      try? await $0.apply(noiseControl: target, isFinal: isFinal, expectedEpoch: epoch)
     }
   }
 
@@ -198,7 +236,7 @@ final class AppModel: ObservableObject {
   func applyEqualizerPreset(
     _ identifier: UInt8, bandSteps: [UInt8] = [], using service: SessionService
   ) {
-    guard let reading = panel.equalizer else { return }
+    guard let reading = panel.equalizer, let expectedEpoch = displayedEpoch else { return }
     bandDrag.cancel()
     let token = equalizerAdjustment.begin()
     panel.equalizer = Self.equalizer(
@@ -207,14 +245,16 @@ final class AppModel: ObservableObject {
       bandSteps: bandSteps.isEmpty ? reading.bandSteps : bandSteps.map(Int.init)
     )
     enqueueGuardedWrite(\.equalizerAdjustment, token: token, using: service) {
-      try? await $0.apply(equalizerPreset: identifier, bandSteps: bandSteps)
+      try? await $0.apply(
+        equalizerPreset: identifier, bandSteps: bandSteps, expectedEpoch: expectedEpoch)
     }
   }
 
   /// Called while a band is dragged and once on release. Editing a band lands on the
   /// device's custom preset; a device without one cannot be edited and is guarded out.
   func dragEqualizerBand(index: Int, step: Int, isFinal: Bool, using service: SessionService) {
-    guard let reading = panel.equalizer, let presetIdentifier = reading.editablePresetIdentifier
+    guard let reading = panel.equalizer, let presetIdentifier = reading.editablePresetIdentifier,
+      let expectedEpoch = displayedEpoch
     else { return }
     let bands = reading.settingBand(index, toStep: step)
     let unchanged = reading.selectedPreset == presetIdentifier && reading.bandSteps == bands.map(Int.init)
@@ -229,19 +269,23 @@ final class AppModel: ObservableObject {
       bandSteps: bands.map(Int.init)
     )
     bandDrag.report(isFinal: isFinal) { [weak self] isFinal in
-      self?.writeBands(bands, preset: presetIdentifier, isFinal: isFinal, token: token, using: service)
+      self?.writeBands(
+        bands, preset: presetIdentifier, isFinal: isFinal, token: token,
+        epoch: expectedEpoch, using: service)
     }
   }
 
   /// Queues one band write, the way `writeLevel` queues a level.
   private func writeBands(
-    _ bands: [UInt8], preset: UInt8, isFinal: Bool, token: Int, using service: SessionService
+    _ bands: [UInt8], preset: UInt8, isFinal: Bool, token: Int, epoch: SessionEpoch,
+    using service: SessionService
   ) {
     // The settled curve is remembered app-side as well as by the device, so the
     // user's own shape survives the device being adjusted from elsewhere.
     if isFinal { onBandsCommitted?(preset, bands.map(Int.init)) }
     enqueueGuardedWrite(\.equalizerAdjustment, token: token, isFinal: isFinal, using: service) {
-      try? await $0.apply(equalizerPreset: preset, bandSteps: bands, isFinal: isFinal)
+      try? await $0.apply(
+        equalizerPreset: preset, bandSteps: bands, isFinal: isFinal, expectedEpoch: epoch)
     }
   }
 
@@ -278,7 +322,7 @@ final class AppModel: ObservableObject {
   /// Pulls what the session knows into the shape the panel draws. Only the periodic
   /// refresh asks the players; a write's read-back passes `.deviceWrite` and keeps the
   /// track shown — see `PanelRefreshCause`.
-  func refresh(from service: SessionService, cause: PanelRefreshCause) async {
+  func refresh(from service: SessionService, cause: PanelRefreshCause = .periodic) async {
     // Asked first: the Apple Events answer can take up to its deadline, and the
     // guarded panel fields below must be read and published without that wait
     // sitting between them.
@@ -290,6 +334,19 @@ final class AppModel: ObservableObject {
     // a ready phase with no model name for a frame — which device-scoped rules read as
     // "no rule", flapping the settings. See SessionCoordinator.Snapshot.
     let snap = await session.snapshot
+    if displayedEpoch != snap.epoch {
+      displayedEpoch = snap.epoch
+      previewHold = PreviewHold()
+      ruleHold = nil
+      pendingRuleRequest = nil
+      levelDrag.cancel()
+      bandDrag.cancel()
+      levelAdjustment.cancel()
+      equalizerAdjustment.cancel()
+      listeningAdjustment.cancel()
+      speakToChatAdjustment.cancel()
+      sidetoneAdjustment.cancel()
+    }
     let phase = snap.phase
     let fingerprint = snap.fingerprint
     let reason = snap.unsupportedReason
@@ -328,6 +385,7 @@ final class AppModel: ObservableObject {
       // The rule's undo dies with the device for the same reason: what reconnects
       // may be a different device, and the old restore values belong to the old one.
       ruleHold = nil
+      pendingRuleRequest = nil
     }
 
     // The same condition the bar widens by: its rising edge opens the five-second
@@ -431,11 +489,11 @@ final class AppModel: ObservableObject {
   private var speakToChatAdjustment = AdjustmentGuard()
 
   func applySpeakToChat(enabled: Bool, using service: SessionService) {
-    guard let current = panel.speakToChat else { return }
+    guard let current = panel.speakToChat, let expectedEpoch = displayedEpoch else { return }
     let token = speakToChatAdjustment.begin()
     panel.speakToChat = Self.speakToChat(current, isEnabled: enabled)
     enqueueGuardedWrite(\.speakToChatAdjustment, token: token, using: service) {
-      try? await $0.apply(speakToChatEnabled: enabled)
+      try? await $0.apply(speakToChatEnabled: enabled, expectedEpoch: expectedEpoch)
     }
   }
 
@@ -444,11 +502,12 @@ final class AppModel: ObservableObject {
     timeout: TandemSpeakToChatTimeout,
     using service: SessionService
   ) {
-    guard let current = panel.speakToChat else { return }
+    guard let current = panel.speakToChat, let expectedEpoch = displayedEpoch else { return }
     let token = speakToChatAdjustment.begin()
     panel.speakToChat = Self.speakToChat(current, sensitivity: sensitivity, timeout: timeout)
     enqueueGuardedWrite(\.speakToChatAdjustment, token: token, using: service) {
-      try? await $0.apply(speakToChatSensitivity: sensitivity, timeout: timeout)
+      try? await $0.apply(
+        speakToChatSensitivity: sensitivity, timeout: timeout, expectedEpoch: expectedEpoch)
     }
   }
 
@@ -473,7 +532,7 @@ final class AppModel: ObservableObject {
   private var sidetoneAdjustment = AdjustmentGuard()
 
   func applySidetone(enabled: Bool, using service: SessionService) {
-    guard let current = panel.sidetone else { return }
+    guard let current = panel.sidetone, let expectedEpoch = displayedEpoch else { return }
     let token = sidetoneAdjustment.begin()
     panel.sidetone = SidetoneReading(
       slot: current.slot,
@@ -484,7 +543,7 @@ final class AppModel: ObservableObject {
       )
     )
     enqueueGuardedWrite(\.sidetoneAdjustment, token: token, using: service) {
-      try? await $0.apply(sidetoneEnabled: enabled)
+      try? await $0.apply(sidetoneEnabled: enabled, expectedEpoch: expectedEpoch)
     }
   }
 
@@ -517,13 +576,22 @@ final class AppModel: ObservableObject {
 
   /// What the active rule changed, and what to put back. Restoration is per field and
   /// only while the value is still the rule's own: a manual change wins.
+  private enum RuleField: CaseIterable, Hashable { case noise, equalizer, listening }
   private struct RuleHold {
     let ruleID: UUID
-    var noise: (previous: TandemNoiseControlState, applied: TandemNoiseControlState)?
-    var equalizer: (previous: UInt8, applied: UInt8)?
-    var listening: (previous: TandemListeningSelection, applied: TandemListeningSelection)?
+    let epoch: SessionEpoch
+    var changes = PreviewHold()
+    /// Successful and no-op fields are evaluated once. Failed/missing fields may
+    /// retry without capturing later manual adjustments to the other fields.
+    var pending = Set(RuleField.allCases)
   }
   private var ruleHold: RuleHold?
+  private struct RuleRequest {
+    let sequence: UInt64
+    let ruleID: UUID?
+  }
+  private var nextRuleRequest: UInt64 = 0
+  private var pendingRuleRequest: RuleRequest?
 
   func playingNow() async -> NowPlayingService.PlayingAnswer { await nowPlayingService.playing() }
 
@@ -539,101 +607,161 @@ final class AppModel: ObservableObject {
   /// A hold is kept even when the rule changed nothing, so a source that is already
   /// set up right does not have later manual adjustments captured as its own.
   func applyRule(_ rule: SoundRule?, using service: SessionService) {
-    // A device without rule support is refused up front rather than falling through every
-    // branch below on nil readings: the outcome was the same silent no-op, but nothing in
-    // the code said so, and the editor happily wrote rules that could never fire. Any hold
-    // still standing is released first — the rule that set it applied to another device.
-    guard supportsRules else {
-      if let hold = ruleHold {
-        release(hold, using: service)
+    // Sony actions cannot address the Bose owner. A previous Sony hold is released
+    // through its epoch-bound transition, never interpreted as a Bose setting.
+    let rule = supportsRules ? rule : nil
+    if let pendingRuleRequest, pendingRuleRequest.ruleID == rule?.id { return }
+    if pendingRuleRequest == nil {
+      if rule == nil, ruleHold == nil { return }
+      if let hold = ruleHold, hold.ruleID == rule?.id, hold.pending.isEmpty { return }
+    }
+    guard let expectedEpoch = displayedEpoch else { return }
+    nextRuleRequest &+= 1
+    let request = RuleRequest(sequence: nextRuleRequest, ruleID: rule?.id)
+    pendingRuleRequest = request
+    enqueueDeviceWrite(onTimeout: { [weak self] in
+      if self?.pendingRuleRequest?.sequence == request.sequence { self?.pendingRuleRequest = nil }
+    }) { [weak self] in
+      guard let self else { return }
+      defer {
+        if pendingRuleRequest?.sequence == request.sequence { pendingRuleRequest = nil }
+      }
+      let session = await service.session
+      guard await confirmedSnapshot(session, epoch: expectedEpoch) != nil else {
+        await refresh(from: service, cause: .deviceWrite)
+        return
+      }
+      if ruleHold?.epoch != expectedEpoch { ruleHold = nil }
+      if let previous = ruleHold, previous.ruleID != rule?.id {
         ruleHold = nil
+        await restore(previous.changes, session: session, epoch: expectedEpoch)
       }
-      return
-    }
-    // The hold being replaced is kept around: its restore writes are still in
-    // flight, so for a field both rules touch the panel still shows the old rule's
-    // value — the true original lives only in the old hold.
-    var replaced: RuleHold?
-    if let hold = ruleHold, hold.ruleID != rule?.id {
-      release(hold, using: service)
-      replaced = hold
-      ruleHold = nil
-    }
-    guard let rule, ruleHold == nil else { return }
-
-    var hold = RuleHold(ruleID: rule.id)
-    // Whether any field the rule asks for had a reading to judge against. Right
-    // after a connect none has arrived yet; registering the hold then would count
-    // the rule as applied while nothing was, and the guard above would never let
-    // it try again.
-    var sawRequestedReading = false
-
-    if rule.noise != .keep, let reading = panel.noiseControl {
-      sawRequestedReading = true
-      if let target = Self.noiseTarget(rule.noise, reading) {
-        let previous = replaced?.noise?.previous ?? reading.state
-        if previous != target {
-          hold.noise = (previous, target)
-          applyNoiseControl(target, using: service)
+      if let rule {
+        var hold = ruleHold ?? RuleHold(ruleID: rule.id, epoch: expectedEpoch)
+        await applyRuleFields(rule, hold: &hold, session: session, epoch: expectedEpoch)
+        // An actor hop can replace the device at any stage, including the final
+        // read-back. Never publish ownership from an abandoned session.
+        if await confirmedSnapshot(session, epoch: expectedEpoch) != nil {
+          ruleHold = hold
         }
       }
+      await refresh(from: service, cause: .deviceWrite)
     }
+  }
 
-    if let preset = rule.equalizerPreset, let reading = panel.equalizer {
-      sawRequestedReading = true
-      if reading.presets.contains(where: { $0.identifier == preset }),
-        !equalizerBlocked(by: rule, replacing: replaced),
-        let previous = replaced?.equalizer?.previous ?? reading.selectedPreset,
-        previous != preset
+  private func confirmedSnapshot(
+    _ session: SessionCoordinator, epoch: SessionEpoch
+  ) async -> SessionCoordinator.Snapshot? {
+    let snapshot = await session.snapshot
+    return snapshot.epoch == epoch && snapshot.acceptsWrites
+      && AppModelWriteContext.generation == writeGeneration ? snapshot : nil
+  }
+
+  private static func equalizerAllowed(_ snapshot: SessionCoordinator.Snapshot) -> Bool {
+    let functions = Set(snapshot.fingerprint?.table1Functions.map(\.code) ?? [])
+    return TandemListeningCatalog.features(forDeclared: functions).isEmpty
+      || snapshot.readings.listeningMode?.selection == .standard
+  }
+
+  private func applyRuleFields(
+    _ rule: SoundRule, hold: inout RuleHold, session: SessionCoordinator, epoch: SessionEpoch
+  ) async {
+    if hold.pending.contains(.noise) {
+      if rule.noise == .keep { hold.pending.remove(.noise) }
+      else if let snapshot = await confirmedSnapshot(session, epoch: epoch),
+        let reading = snapshot.readings.noiseControl
       {
-        hold.equalizer = (previous, preset)
-        selectPreset(preset, from: reading, using: service)
+        if let target = Self.noiseTarget(rule.noise, reading), target != reading.state {
+          do {
+            try await session.apply(noiseControl: target, expectedEpoch: epoch)
+            hold.changes.noise = (reading.state, target)
+            hold.pending.remove(.noise)
+          } catch { /* A transient failure leaves this field retryable. */ }
+        } else { hold.pending.remove(.noise) }
       }
     }
 
-    if rule.listening != .keep, let reading = panel.listeningMode {
-      sawRequestedReading = true
-      if let target = Self.listeningTarget(rule.listening, reading) {
-        let previous = replaced?.listening?.previous ?? reading.selection
-        if previous != target {
-          hold.listening = (previous, target)
-          applyListening(target, using: service)
-        }
+    // Listening is established and read back before the dependent EQ action.
+    if hold.pending.contains(.listening) {
+      if rule.listening == .keep { hold.pending.remove(.listening) }
+      else if let snapshot = await confirmedSnapshot(session, epoch: epoch),
+        let reading = snapshot.readings.listeningMode
+      {
+        if let target = Self.listeningTarget(rule.listening, reading), target != reading.selection {
+          do {
+            try await session.apply(listeningSelection: target, expectedEpoch: epoch)
+            hold.changes.listening = (reading.selection, target)
+            hold.pending.remove(.listening)
+          } catch { /* Do not send EQ on the strength of the requested mode. */ }
+        } else { hold.pending.remove(.listening) }
       }
     }
 
-    guard sawRequestedReading else { return }
-    ruleHold = hold
+    if hold.pending.contains(.equalizer) {
+      guard let preset = rule.equalizerPreset else {
+        hold.pending.remove(.equalizer)
+        return
+      }
+      if rule.listening == .backgroundMusic || rule.listening == .cinema {
+        hold.pending.remove(.equalizer)
+        return
+      }
+      guard let snapshot = await confirmedSnapshot(session, epoch: epoch),
+        let reading = snapshot.readings.equalizer, let previous = reading.selectedPreset
+      else { return }
+      guard Self.equalizerAllowed(snapshot) else {
+        // A failed Standard request can be retried. Keeping a nonstandard mode
+        // intentionally blocks EQ for the lifetime of this rule.
+        if rule.listening == .keep { hold.pending.remove(.equalizer) }
+        return
+      }
+      guard reading.presets.contains(where: { $0.identifier == preset }), previous != preset else {
+        hold.pending.remove(.equalizer)
+        return
+      }
+      do {
+        try await selectPreset(preset, from: reading, session: session, epoch: epoch)
+        hold.changes.equalizer = (previous, preset)
+        hold.pending.remove(.equalizer)
+      } catch {
+        if Self.permanentPresetFailure(error) { hold.pending.remove(.equalizer) }
+      }
+    }
   }
 
-  private func release(_ hold: RuleHold, using service: SessionService) {
-    if let (previous, applied) = hold.noise, panel.noiseControl?.state == applied {
-      applyNoiseControl(previous, using: service)
+  /// Undo only fields still holding our last confirmed value. Standard must be
+  /// restored before EQ; when returning to Cinema/BGM, EQ must be restored first.
+  private func restore(
+    _ hold: PreviewHold, session: SessionCoordinator, epoch: SessionEpoch
+  ) async {
+    if let (previous, applied) = hold.noise,
+      let snapshot = await confirmedSnapshot(session, epoch: epoch),
+      snapshot.readings.noiseControl?.state == applied
+    {
+      try? await session.apply(noiseControl: previous, expectedEpoch: epoch)
     }
-    if let (previous, applied) = hold.equalizer, panel.equalizer?.selectedPreset == applied {
-      applyEqualizerPreset(previous, using: service)
+    if hold.listening?.previous == .standard {
+      await restoreListening(hold, session: session, epoch: epoch)
     }
-    if let (previous, applied) = hold.listening, panel.listeningMode?.selection == applied {
-      applyListening(previous, using: service)
+    if let (previous, applied) = hold.equalizer,
+      let snapshot = await confirmedSnapshot(session, epoch: epoch),
+      Self.equalizerAllowed(snapshot), snapshot.readings.equalizer?.selectedPreset == applied
+    {
+      try? await session.apply(equalizerPreset: previous, bandSteps: [], expectedEpoch: epoch)
+    }
+    if hold.listening?.previous != .standard {
+      await restoreListening(hold, session: session, epoch: epoch)
     }
   }
 
-  /// The device switches its equaliser off while a listening mode runs, so a rule's
-  /// preset only lands when the mode the rule leaves the device in is standard. The
-  /// editor refuses the combination; this also guards rules stored before it did.
-  ///
-  /// "Keep" is judged against the mode the device is *headed for*, not the one the
-  /// panel shows: when this rule replaces one that held the listening mode, the
-  /// restore write is still in flight, and judging by the panel's stale mode skips
-  /// the preset for the whole life of the new hold (a cinema site straight into a
-  /// music app was exactly the miss).
-  private func equalizerBlocked(by rule: SoundRule, replacing replaced: RuleHold?) -> Bool {
-    switch rule.listening {
-    case .backgroundMusic, .cinema: return true
-    case .standard: return false
-    case .keep:
-      let selection = replaced?.listening?.previous ?? panel.listeningMode?.selection
-      return selection.map { $0 != .standard } ?? false
+  private func restoreListening(
+    _ hold: PreviewHold, session: SessionCoordinator, epoch: SessionEpoch
+  ) async {
+    if let (previous, applied) = hold.listening,
+      let snapshot = await confirmedSnapshot(session, epoch: epoch),
+      snapshot.readings.listeningMode?.selection == applied
+    {
+      try? await session.apply(listeningSelection: previous, expectedEpoch: epoch)
     }
   }
 
@@ -691,13 +819,25 @@ final class AppModel: ObservableObject {
 
   /// Selects a preset the way a rule does: an editable preset carries the user's own
   /// remembered curve, so what is heard is the shape the rule will actually apply.
+  private enum PresetFailure: Error { case invalidRememberedBands }
   private func selectPreset(
-    _ preset: UInt8, from reading: EqualizerReading, using service: SessionService
-  ) {
+    _ preset: UInt8, from reading: EqualizerReading,
+    session: SessionCoordinator, epoch: SessionEpoch
+  ) async throws {
+    var bands: [UInt8] = []
     if reading.editablePresetIdentifier == preset, let steps = bandMemory?(preset) {
-      applyEqualizerPreset(preset, bandSteps: steps.map(UInt8.init), using: service)
-    } else {
-      applyEqualizerPreset(preset, using: service)
+      bands = steps.compactMap(UInt8.init(exactly:))
+      guard bands.count == steps.count else { throw PresetFailure.invalidRememberedBands }
+    }
+    try await session.apply(equalizerPreset: preset, bandSteps: bands, expectedEpoch: epoch)
+  }
+
+  private static func permanentPresetFailure(_ error: any Error) -> Bool {
+    if error is PresetFailure { return true }
+    guard let failure = error as? SessionCoordinator.WriteFailure else { return false }
+    switch failure {
+    case .invalidEqualizer, .undeclaredEqualizerPreset, .unsupported: return true
+    default: return false
     }
   }
 
@@ -715,81 +855,131 @@ final class AppModel: ObservableObject {
     var listening: (previous: TandemListeningSelection, applied: TandemListeningSelection)?
   }
   private var previewHold = PreviewHold()
+  private var pendingPreviewOperations = 0
 
   /// True while the audition holds anything. The rule watch loop reads this and
   /// stands down: a rule applied mid-preview would overwrite the value being judged
   /// and record it as the state to put back.
   var isPreviewing: Bool {
-    previewHold.noise != nil || previewHold.equalizer != nil || previewHold.listening != nil
+    pendingPreviewOperations > 0 || previewHold.noise != nil
+      || previewHold.equalizer != nil || previewHold.listening != nil
+  }
+
+  private func enqueuePreview(
+    using service: SessionService,
+    _ operation: @escaping @MainActor (AppModel, SessionCoordinator, SessionEpoch) async -> Void
+  ) {
+    guard let expectedEpoch = displayedEpoch else { return }
+    pendingPreviewOperations += 1
+    var pending = true
+    let finish: @MainActor () -> Void = { [weak self] in
+      guard pending else { return }
+      pending = false
+      self?.pendingPreviewOperations -= 1
+    }
+    enqueueDeviceWrite(onTimeout: finish) { [weak self] in
+      guard let self else { return }
+      defer { finish() }
+      let session = await service.session
+      // Keep/end must still relinquish their hold while temporarily suspended.
+      // Their restoration helper independently requires a writable session.
+      if await session.snapshot.epoch == expectedEpoch,
+        AppModelWriteContext.generation == writeGeneration
+      {
+        await operation(self, session, expectedEpoch)
+      }
+      await refresh(from: service, cause: .deviceWrite)
+    }
   }
 
   func previewNoise(_ action: SoundRule.NoiseAction, using service: SessionService) {
-    guard action != .keep else { return restorePreviewedNoise(using: service) }
-    guard let reading = panel.noiseControl, let target = Self.noiseTarget(action, reading)
-    else { return }
-    if previewHold.noise == nil {
-      guard reading.state != target else { return }
-      previewHold.noise = (reading.state, target)
-    } else {
-      previewHold.noise?.applied = target
+    enqueuePreview(using: service) { model, session, epoch in
+      if action == .keep {
+        let hold = PreviewHold(noise: model.previewHold.noise)
+        model.previewHold.noise = nil
+        await model.restore(hold, session: session, epoch: epoch)
+        return
+      }
+      guard let snapshot = await model.confirmedSnapshot(session, epoch: epoch),
+        let reading = snapshot.readings.noiseControl,
+        let target = Self.noiseTarget(action, reading), target != reading.state
+      else { return }
+      do {
+        try await session.apply(noiseControl: target, expectedEpoch: epoch)
+        guard await model.confirmedSnapshot(session, epoch: epoch) != nil else { return }
+        let previous = model.previewHold.noise.flatMap {
+          $0.applied == reading.state ? $0.previous : nil
+        } ?? reading.state
+        model.previewHold.noise = (previous, target)
+      } catch { /* Keep ownership of the last confirmed preview on failure. */ }
     }
-    applyNoiseControl(target, using: service)
   }
 
   func previewEqualizerPreset(_ identifier: Int, using service: SessionService) {
-    guard identifier >= 0 else { return restorePreviewedEqualizer(using: service) }
-    let preset = UInt8(clamping: identifier)
-    guard let reading = panel.equalizer, let current = reading.selectedPreset,
-      reading.presets.contains(where: { $0.identifier == preset })
-    else { return }
-    if previewHold.equalizer == nil {
-      guard current != preset else { return }
-      previewHold.equalizer = (current, preset)
-    } else {
-      previewHold.equalizer?.applied = preset
+    enqueuePreview(using: service) { model, session, epoch in
+      if identifier < 0 {
+        let hold = PreviewHold(equalizer: model.previewHold.equalizer)
+        model.previewHold.equalizer = nil
+        await model.restore(hold, session: session, epoch: epoch)
+        return
+      }
+      guard let preset = UInt8(exactly: identifier),
+        let snapshot = await model.confirmedSnapshot(session, epoch: epoch),
+        Self.equalizerAllowed(snapshot),
+        let reading = snapshot.readings.equalizer, let current = reading.selectedPreset,
+        reading.presets.contains(where: { $0.identifier == preset }), current != preset
+      else { return }
+      do {
+        try await model.selectPreset(preset, from: reading, session: session, epoch: epoch)
+        guard await model.confirmedSnapshot(session, epoch: epoch) != nil else { return }
+        let previous = model.previewHold.equalizer.flatMap {
+          $0.applied == current ? $0.previous : nil
+        } ?? current
+        model.previewHold.equalizer = (previous, preset)
+      } catch { /* Keep ownership of the last confirmed preview on failure. */ }
     }
-    selectPreset(preset, from: reading, using: service)
   }
 
   func previewListening(_ action: SoundRule.ListeningAction, using service: SessionService) {
-    guard action != .keep else { return restorePreviewedListening(using: service) }
-    guard let reading = panel.listeningMode, let target = Self.listeningTarget(action, reading)
-    else { return }
-    if previewHold.listening == nil {
-      guard reading.selection != target else { return }
-      previewHold.listening = (reading.selection, target)
-    } else {
-      previewHold.listening?.applied = target
+    enqueuePreview(using: service) { model, session, epoch in
+      if action == .keep {
+        let hold = PreviewHold(listening: model.previewHold.listening)
+        model.previewHold.listening = nil
+        await model.restore(hold, session: session, epoch: epoch)
+        return
+      }
+      guard let snapshot = await model.confirmedSnapshot(session, epoch: epoch),
+        let reading = snapshot.readings.listeningMode,
+        let target = Self.listeningTarget(action, reading), target != reading.selection
+      else { return }
+      if target != .standard {
+        // The editor resets EQ to Keep when selecting Cinema/BGM. Put its curve
+        // back while Standard is still confirmed, before disabling EQ.
+        let equalizer = PreviewHold(equalizer: model.previewHold.equalizer)
+        model.previewHold.equalizer = nil
+        await model.restore(equalizer, session: session, epoch: epoch)
+      }
+      guard await model.confirmedSnapshot(session, epoch: epoch) != nil else { return }
+      do {
+        try await session.apply(listeningSelection: target, expectedEpoch: epoch)
+        guard await model.confirmedSnapshot(session, epoch: epoch) != nil else { return }
+        let previous = model.previewHold.listening.flatMap {
+          $0.applied == reading.selection ? $0.previous : nil
+        } ?? reading.selection
+        model.previewHold.listening = (previous, target)
+      } catch { /* Keep ownership of the last confirmed preview on failure. */ }
     }
-    applyListening(target, using: service)
   }
 
   /// Ends the preview, putting back everything it changed — called when the rule is
   /// registered and when the editor goes away.
   func endPreview(using service: SessionService) {
-    restorePreviewedNoise(using: service)
-    restorePreviewedEqualizer(using: service)
-    restorePreviewedListening(using: service)
-  }
-
-  private func restorePreviewedNoise(using service: SessionService) {
-    guard let (previous, applied) = previewHold.noise else { return }
-    previewHold.noise = nil
-    if panel.noiseControl?.state == applied { applyNoiseControl(previous, using: service) }
-  }
-
-  private func restorePreviewedEqualizer(using service: SessionService) {
-    guard let (previous, applied) = previewHold.equalizer else { return }
-    previewHold.equalizer = nil
-    if panel.equalizer?.selectedPreset == applied {
-      applyEqualizerPreset(previous, using: service)
+    guard isPreviewing else { return }
+    enqueuePreview(using: service) { model, session, epoch in
+      let hold = model.previewHold
+      model.previewHold = PreviewHold()
+      await model.restore(hold, session: session, epoch: epoch)
     }
-  }
-
-  private func restorePreviewedListening(using service: SessionService) {
-    guard let (previous, applied) = previewHold.listening else { return }
-    previewHold.listening = nil
-    if panel.listeningMode?.selection == applied { applyListening(previous, using: service) }
   }
 
   func scroll(_ event: NSEvent) {
@@ -830,6 +1020,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   private var scrollMonitor: Any?
   private var cancellables: Set<AnyCancellable> = []
   private var mediaGestures: MediaGestureForwarder?
+  private var refreshTask: Task<Void, Never>?
+  private var permissionTask: Task<Void, Never>?
+  private var rulesTask: Task<Void, Never>?
+  private let termination = TerminationSequence()
   private let fullScreen = FullScreenMonitor()
   /// Looks for a newer release on GitHub. Lazy because it reads `settingsStore`; a bare
   /// `swift run` binary carries no version, so `SemanticVersion` is nil there and the
@@ -993,7 +1187,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       .store(in: &cancellables)
     updateChecker.begin()
 
-    Task {
+    refreshTask = Task {
       await service.start()
       while !Task.isCancelled {
         await model.refresh(from: service, cause: .periodic)
@@ -1006,11 +1200,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // another. Bluetooth (the session) goes first alone; the Apple-Events side — the
     // now-playing readout and the rule engine's queries — waits until the session
     // has a controllable device or ten seconds pass, whichever comes first.
-    Task { [model] in
+    permissionTask = Task { [model] in
       let deadline = ContinuousClock.now.advanced(by: .seconds(10))
-      while ContinuousClock.now < deadline, !model.panel.summary.isControllable {
+      while !Task.isCancelled, ContinuousClock.now < deadline,
+        !model.panel.summary.isControllable
+      {
         try? await Task.sleep(for: .milliseconds(250))
       }
+      guard !Task.isCancelled else { return }
       model.playerQueriesAllowed = true
     }
 
@@ -1033,7 +1230,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // trip every two seconds, and only while rules exist and are switched on.
     model.bandMemory = { preset in settingsStore.customBandSteps["\(preset)"] }
     model.onBandsCommitted = { preset, steps in settingsStore.customBandSteps["\(preset)"] = steps }
-    Task {
+    rulesTask = Task {
       while !Task.isCancelled {
         if !model.playerQueriesAllowed {
           // The launch-time permission serialisation above has not lifted the gate
@@ -1078,6 +1275,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             idle && hasArtistRule
             ? await SiteWatcher.visibleTabTitles(audible: AudibleProcesses.outputtingBundleIDs())
             : []
+          guard !Task.isCancelled else { return }
           let context = RuleMatcher.Context(
             deviceModel: model.panel.summary.modelName,
             playingBundleID: playing?.bundleID,
@@ -1105,15 +1303,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     return false
   }
 
-  func applicationWillTerminate(_ notification: Notification) {
-    // A live preview must not outlive the app: whatever the rule editor changed goes
-    // back before the session below is stopped. The restore writes are queued as
-    // main-actor tasks, so the run loop gets a brief beat to start them here — once
-    // they hop onto the session's actor they run ahead of the stop that follows.
-    // Blocking on the semaphore below first would leave them queued forever.
-    model.endPreview(using: service)
-    RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
+  func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+    if termination.hasCompleted { return .terminateNow }
+    if !termination.hasStarted {
+      refreshTask?.cancel()
+      permissionTask?.cancel()
+      rulesTask?.cancel()
+      mediaGestures?.stop()
+      model.playerQueriesAllowed = false
+      model.endPreview(using: service)
+      termination.begin(
+        restore: { [model] in await model.waitForDeviceWrites() },
+        stop: { [service, model] in
+          // The main actor remains available during terminateLater, so Bose can
+          // cancel and await its in-flight tick before closing its session too.
+          async let sonyStop: Void = service.stop()
+          await model.bose.stop()
+          await sonyStop
+        },
+        completion: { sender.reply(toApplicationShouldTerminate: true) }
+      )
+    }
+    return .terminateLater
+  }
 
+  func applicationWillTerminate(_ notification: Notification) {
+    refreshTask?.cancel()
+    permissionTask?.cancel()
+    rulesTask?.cancel()
     if let scrollMonitor { NSEvent.removeMonitor(scrollMonitor) }
     mediaGestures?.stop()
     updateChecker.stop()
@@ -1125,23 +1342,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // tears the tap down synchronously.
     model.spatial.setEnabled(false)
     controller?.stop()
-    // The process dies when this returns, and a fire-and-forget task has no
-    // guarantee of running before it does. Wait for the session to actually stop —
-    // the RFCOMM control channel must close for the headset to serve the next
-    // connection — but with a bound, so a wedged session cannot hold quitting
-    // hostage. Detached, because this wait blocks the main thread the plain Task
-    // would have needed.
-    let service = self.service
-    // Hand off the Bose session synchronously (main-actor here) so the detached task can
-    // close its RFCOMM channel too — the earbuds need it released to serve the next host.
-    let boseSession = model.bose.detachForTermination()
-    let stopped = DispatchSemaphore(value: 0)
-    Task.detached(priority: .userInitiated) {
-      await service.stop()
-      await boseSession?.close()
-      stopped.signal()
-    }
-    _ = stopped.wait(timeout: .now() + .seconds(2))
   }
 
   private func updateStatusItem(notchAvailable: Bool) {

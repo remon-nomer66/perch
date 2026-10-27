@@ -448,7 +448,7 @@ public struct SessionPolicy: Sendable {
       )
 
     case (.suspended, .channelClosedUnexpectedly):
-      return (state.releasing(), [.cancelGrace, .invalidateSession, .failPendingRequests])
+      return (state.releasing(), [.cancelGrace, .closeChannel, .invalidateSession, .failPendingRequests])
 
     // The grace exists to resume onto a working channel. One that faulted — a write
     // that stalled, an answer that never came — would be resumed broken, so it is
