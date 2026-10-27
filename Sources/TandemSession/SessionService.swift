@@ -14,6 +14,9 @@ public actor SessionService {
 
   private var pumps: [Task<Void, Never>] = []
   private var currentTarget: DeviceIdentity?
+  private var isStarted = false
+  private var isStopped = false
+  private var stopTask: Task<Void, Never>?
 
   // The observers are protocol-typed so the translation below — which output
   // becomes which session event — can be tested without Core Audio, IOBluetooth,
@@ -47,19 +50,30 @@ public actor SessionService {
   public var session: SessionCoordinator { coordinator }
 
   public func start() async {
+    guard !isStarted, !isStopped else { return }
+    isStarted = true
     let audioChanges = audio.changes
     let bluetoothChanges = bluetooth.changes
     let powerChanges = power.changes
 
     pumps = [
       Task { [weak self] in
-        for await output in audioChanges { await self?.audioOutputChanged(output) }
+        for await output in audioChanges {
+          guard !Task.isCancelled else { return }
+          await self?.audioOutputChanged(output)
+        }
       },
       Task { [weak self] in
-        for await change in bluetoothChanges { await self?.bluetoothChanged(change) }
+        for await change in bluetoothChanges {
+          guard !Task.isCancelled else { return }
+          await self?.bluetoothChanged(change)
+        }
       },
       Task { [weak self] in
-        for await change in powerChanges { await self?.powerChanged(change) }
+        for await change in powerChanges {
+          guard !Task.isCancelled else { return }
+          await self?.powerChanged(change)
+        }
       },
     ]
 
@@ -68,17 +82,35 @@ public actor SessionService {
     power.start()
   }
 
-  public func stop() {
-    pumps.forEach { $0.cancel() }
+  /// Terminal for this instance: cancelling an observer stream also ends that
+  /// stream. Create a new service to start another observation lifetime.
+  public func stop() async {
+    if let stopTask {
+      await stopTask.value
+      return
+    }
+    isStopped = true
+    currentTarget = nil
+    let stoppingPumps = pumps
+    stoppingPumps.forEach { $0.cancel() }
     pumps = []
-    audio.stop()
-    bluetooth.stop()
-    power.stop()
+    let stopping = Task {
+      // A pump can already have sent an event to the coordinator. Drain it before
+      // terminal shutdown so that event cannot race the final release.
+      for pump in stoppingPumps { await pump.value }
+      audio.stop()
+      bluetooth.stop()
+      power.stop()
+      await coordinator.shutdown()
+    }
+    stopTask = stopping
+    await stopping.value
   }
 
   // MARK: - Translation
 
   private func audioOutputChanged(_ output: AudioOutput) async {
+    guard !isStopped else { return }
     switch output {
     case .identified(let device):
       currentTarget = device
@@ -93,6 +125,7 @@ public actor SessionService {
   }
 
   private func bluetoothChanged(_ change: BluetoothConnectionObserver.Change) async {
+    guard !isStopped else { return }
     switch change {
     case .disconnected(let device) where device == currentTarget:
       await coordinator.handle(.bluetoothDisconnected)
@@ -104,6 +137,7 @@ public actor SessionService {
   }
 
   private func powerChanged(_ change: PowerObserver.Change) async {
+    guard !isStopped else { return }
     switch change {
     case .willSleep:
       await coordinator.handle(.willSleep)

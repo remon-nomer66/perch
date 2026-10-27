@@ -195,7 +195,7 @@ public struct SessionPolicy: Sendable {
       )
     case .manualRelease:
       guard state.phase != .released else { return (state, []) }
-      return (.released, teardown(from: state))
+      return (SessionState(attempt: state.attempt), teardown(from: state))
     default:
       break
     }
@@ -207,7 +207,7 @@ public struct SessionPolicy: Sendable {
 
     if case .bluetoothDisconnected = event {
       guard state.target != nil else { return (state, []) }
-      return (.released, teardown(from: state))
+      return (SessionState(attempt: state.attempt), teardown(from: state))
     }
 
     if let outcome = reduceTargetChange(state, event) { return outcome }
@@ -281,7 +281,7 @@ public struct SessionPolicy: Sendable {
       // what is being listened to, so release and let the output notification
       // reconnect — the same path a verified device takes.
       if blocked == .unverified {
-        guard let device else { return (.released, []) }
+        guard let device else { return (SessionState(attempt: state.attempt), []) }
         return start(connectingTo: device, from: state)
       }
       let restored: SessionState.Phase =
@@ -300,7 +300,7 @@ public struct SessionPolicy: Sendable {
       return (state.moved(to: restored, isTargetDefaultOutput: device != nil), effects)
     }
 
-    guard let device else { return (.released, []) }
+    guard let device else { return (SessionState(attempt: state.attempt), []) }
     return start(connectingTo: device, from: state)
   }
 
@@ -339,7 +339,7 @@ public struct SessionPolicy: Sendable {
       return failed(state)
 
     case (.connecting, .defaultOutputChanged(nil)):
-      return (.released, [.cancelOpen, .closeChannel])
+      return (SessionState(attempt: state.attempt), [.cancelOpen, .closeChannel])
 
     case (.verifying, .verificationSucceeded):
       return (state.moved(to: .ready, failureCount: 0), [])
@@ -357,7 +357,7 @@ public struct SessionPolicy: Sendable {
     // An unfinished session must not survive into `suspended`: resuming from there
     // would reach `ready` without completing verification or recovery.
     case (.verifying, .defaultOutputChanged(nil)), (.recovering, .defaultOutputChanged(nil)):
-      return (.released, [.closeChannel, .invalidateSession, .failPendingRequests])
+      return (SessionState(attempt: state.attempt), [.closeChannel, .invalidateSession, .failPendingRequests])
 
     case (.ready, .defaultOutputChanged(nil)):
       return (
@@ -381,10 +381,10 @@ public struct SessionPolicy: Sendable {
       }
 
     case (.suspended, .graceExpired):
-      return (.released, [.cancelGrace, .closeChannel, .invalidateSession])
+      return (SessionState(attempt: state.attempt), [.cancelGrace, .closeChannel, .invalidateSession])
 
     case (.suspended, .channelClosedUnexpectedly):
-      return (.released, [.cancelGrace, .invalidateSession, .failPendingRequests])
+      return (SessionState(attempt: state.attempt), [.cancelGrace, .closeChannel, .invalidateSession, .failPendingRequests])
 
     case (.connecting, .controlContended):
       // The open hung until its timeout against a device the transport had already
@@ -419,7 +419,7 @@ public struct SessionPolicy: Sendable {
       return failed(state)
 
     case (.retryWaiting, .backoffExpired):
-      guard let target = state.target else { return (.released, [.cancelBackoff]) }
+      guard let target = state.target else { return (SessionState(attempt: state.attempt), [.cancelBackoff]) }
       let (next, open) = start(
         connectingTo: target,
         from: state,
@@ -428,10 +428,10 @@ public struct SessionPolicy: Sendable {
       return (next, [.cancelBackoff] + open)
 
     case (.retryWaiting, .defaultOutputChanged(nil)):
-      return (.released, [.cancelBackoff])
+      return (SessionState(attempt: state.attempt), [.cancelBackoff])
 
     case (.contended, .defaultOutputChanged(nil)), (.retryExhausted, .defaultOutputChanged(nil)):
-      return (.released, teardown(from: state))
+      return (SessionState(attempt: state.attempt), teardown(from: state))
 
     case (.contended, .manualRetry), (.retryExhausted, .manualRetry):
       // Seizing the session for a device the user is not listening to would take

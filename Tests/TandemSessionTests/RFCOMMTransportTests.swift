@@ -28,3 +28,20 @@ import Testing
   host.close()
   host.close()
 }
+
+@Test func awaitingCloseWithoutOpeningCompletesAndRemainsIdempotent() async {
+  let host = RFCOMMChannelHost(address: "synthetic-unopened-target")
+  async let first: Void = host.closeAndWait()
+  async let second: Void = host.closeAndWait()
+  _ = await (first, second)
+  await host.closeAndWait()
+}
+
+@Test func aClosedHostRejectsAnOpenWithoutCreatingAControlSession() async {
+  let host = RFCOMMChannelHost(address: "synthetic-unopened-target")
+  await host.closeAndWait()
+  await #expect(throws: ChannelFailure.closed) {
+    _ = try await host.open(timeout: .seconds(5))
+  }
+  await host.closeAndWait()
+}

@@ -69,6 +69,8 @@ final class RFCOMMChannelHost: NSObject, @unchecked Sendable {
   private var inboundContinuation: AsyncStream<Data>.Continuation?
   private var openContinuation: CheckedContinuation<Int, Error>?
   private var isClosed = false
+  private var closeCompleted = false
+  private var closeWaiters: [CheckedContinuation<Void, Never>] = []
 
   private var thread: Thread?
   private let threadReady = DispatchSemaphore(value: 0)
@@ -81,12 +83,20 @@ final class RFCOMMChannelHost: NSObject, @unchecked Sendable {
   // MARK: - Opening
 
   func open(timeout: Duration) async throws -> OpenedChannel {
-    startThread()
+    guard lock.withLock({ !isClosed }), startThread() else { throw ChannelFailure.closed }
 
     let (stream, continuation) = AsyncStream<Data>.makeStream(
       bufferingPolicy: .bufferingNewest(RFCOMMChannelHost.inboundBufferLimit)
     )
-    lock.withLock { inboundContinuation = continuation }
+    let adoptedStream = lock.withLock {
+      guard !isClosed else { return false }
+      inboundContinuation = continuation
+      return true
+    }
+    guard adoptedStream else {
+      continuation.finish()
+      throw ChannelFailure.closed
+    }
 
     do {
       let mtu = try await withThrowingTaskGroup(of: Int.self) { group in
@@ -247,30 +257,58 @@ final class RFCOMMChannelHost: NSObject, @unchecked Sendable {
     teardown()
   }
 
+  /// Waits until the run-loop thread has invoked channel.close(), rather than
+  /// merely posting it. This does not wait for acknowledgement by the peer.
+  func closeAndWait() async {
+    teardown()
+    await withCheckedContinuation { continuation in
+      let completed = lock.withLock {
+        guard !closeCompleted else { return true }
+        closeWaiters.append(continuation)
+        return false
+      }
+      if completed { continuation.resume() }
+    }
+  }
+
+  private func finishClose() {
+    let waiting = lock.withLock {
+      closeCompleted = true
+      defer { closeWaiters = [] }
+      return closeWaiters
+    }
+    for waiter in waiting { waiter.resume() }
+  }
+
   /// Releases everything the host owns: the channel, a still-pending open, the
   /// inbound stream, and the thread. Safe to call more than once and from any path —
   /// a failed open, a caller's close, and a remote close all end here — because the
   /// state is taken under the lock exactly once.
   private func teardown() {
-    let (channel, running) = lock.withLock { () -> (IOBluetoothRFCOMMChannel?, Thread?) in
+    let resources = lock.withLock { () -> (IOBluetoothRFCOMMChannel?, Thread?)? in
+      guard !isClosed else { return nil }
       defer {
         isClosed = true
         self.channel = nil
         thread = nil
       }
-      return (isClosed ? nil : self.channel, thread)
+      return (self.channel, thread)
     }
+    guard let (channel, running) = resources else { return }
 
     if let running {
-      // Both blocks run on the channel's thread, in order: the close first, then
-      // the cancel that lets the run loop wind down. Cancelling any other way can
+      // Close runs before the cancel that lets the run loop wind down. Cancelling any other way can
       // miss a parked run loop — the flag alone never wakes it — or race the
       // thread's exit; a posted cancel is its own wake-up, and the thread cannot
       // exit before it runs because only this block sets the flag.
-      if let channel {
-        run(on: running) { _ = channel.close() }
+      run(on: running) { [self] in
+        _ = channel?.close()
+        running.cancel()
+        finishClose()
       }
-      run(on: running) { running.cancel() }
+    } else {
+      _ = channel?.close()
+      finishClose()
     }
     // An open still in flight has to be failed, or its caller waits forever.
     finishOpen(.failure(ChannelFailure.closed))
@@ -287,7 +325,7 @@ final class RFCOMMChannelHost: NSObject, @unchecked Sendable {
 
   // MARK: - Thread
 
-  private func startThread() {
+  private func startThread() -> Bool {
     let thread = Thread { [threadReady] in
       // A run loop with no sources returns immediately, so hold one open.
       let source = Port()
@@ -301,7 +339,13 @@ final class RFCOMMChannelHost: NSObject, @unchecked Sendable {
     thread.qualityOfService = .userInitiated
     thread.start()
     threadReady.wait()
-    lock.withLock { self.thread = thread }
+    let adopted = lock.withLock {
+      guard !isClosed else { return false }
+      self.thread = thread
+      return true
+    }
+    if !adopted { run(on: thread) { thread.cancel() } }
+    return adopted
   }
 
   /// Runs on the channel's thread while it exists, inline once it is gone. The
@@ -437,6 +481,6 @@ private struct RFCOMMChannel: TandemChannel {
   }
 
   func close() async {
-    host.close()
+    await host.closeAndWait()
   }
 }
