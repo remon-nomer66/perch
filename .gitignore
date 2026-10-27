@@ -6,6 +6,14 @@ DerivedData/
 .DS_Store
 .ruff_cache/
 CLAUDE.md
+.claude/
+
+# Working notes kept on each developer's machine, outside the published tree:
+# agent conventions, design plans and handoffs, and icon source artwork. Design
+# files can carry the author's details in their metadata.
+/AGENTS.md
+/docs/*.md
+*.ai
 
 # Runtime coordination for the single headset control channel (never committed)
 .control-session.lock
