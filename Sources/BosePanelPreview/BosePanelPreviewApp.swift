@@ -166,7 +166,7 @@ struct BosePanelPreviewApp {
   }
 
   static let defaultOutputDirectory =
-    "/private/tmp/claude-501/-Users-lemon1366-Development-sound-connect-mac/9934d141-6495-4dc1-8abc-8e83bcd54db6/tmp"
+    (NSTemporaryDirectory() as NSString).appendingPathComponent("bose-panel-preview")
 }
 
 // MARK: - Closed bar convenience
